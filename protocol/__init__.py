@@ -1,1 +1,206 @@
-"""Frozen cross-module contracts. Implemented by HUB-010."""
+"""Frozen v1 cross-module contracts (HUB-010).
+
+This package is the single source of truth for the Agent Hub data contract.
+All models inherit :class:`~protocol.common.StrictModel` (``extra="forbid"``).
+After the ``contracts-frozen-v1`` tag, core IDs, statuses, snapshot shapes and
+compiler-only field boundaries may only change via an accepted ADR.
+
+Import the concrete symbol from this package root; submodule layout mirrors the
+project directory structure but is an implementation detail.
+"""
+
+from __future__ import annotations
+
+from protocol.api import (
+    ApprovalDecisionRequest,
+    ApprovalRenewRequest,
+    AssignAgentRequest,
+    LayoutSaveRequest,
+    LayoutSaveResponse,
+    LockNodeRequest,
+    MutationVersionResponse,
+    PageInfo,
+    PlanRequest,
+    PlanResponse,
+    RecoverWorkspaceRequest,
+    RiskFinding,
+    RunRequest,
+    RunResponse,
+    ValidateRequest,
+    ValidateResponse,
+    ValidationIssue,
+    WorkflowSaveRequest,
+    WorkflowSaveResponse,
+    WsTicketResponse,
+)
+from protocol.change_set import ChangeSet, ChangeSetStatus
+from protocol.common import (
+    CONTRACT_VERSION,
+    ActorType,
+    ArgvToken,
+    ArtifactRef,
+    ArtifactType,
+    AssignmentMode,
+    CapabilityType,
+    ConsoleOwnerType,
+    ConsoleStreamKind,
+    DescriptionText,
+    EdgeCondition,
+    EntityId,
+    GitObjectId,
+    GoalText,
+    IfOperator,
+    InstructionText,
+    NodeOutcome,
+    NodeRunStatus,
+    NodeType,
+    PlannerRunStatus,
+    PlannerType,
+    PrivilegeAction,
+    ReasonText,
+    RepoRelativePath,
+    RiskLevel,
+    SecuritySeverity,
+    SessionStatus,
+    Sha256Hex,
+    ShortReasonText,
+    StrictModel,
+    SummaryText,
+    TaskKind,
+    TaskStatus,
+    TestKind,
+    TitleText,
+    WorkflowRunStatus,
+    canonical_json,
+)
+from protocol.console import ConsoleChunk
+from protocol.context import ContextPack, NodeSummary
+from protocol.event import Artifact, EventEnvelope, PayloadT
+from protocol.privilege import (
+    AgentOutputEnvelope,
+    Approval,
+    ApprovalBase,
+    ApprovalStatus,
+    CapabilityGrant,
+    ChangeSetApproval,
+    PrivilegeApproval,
+    PrivilegeRequest,
+    PrivilegeRequestProposal,
+    PrivilegeRequestStatus,
+)
+from protocol.result import AgentResult, AgentResultStatus, NextSuggestion
+from protocol.task import TaskPackage
+from protocol.workflow import (
+    AgentRecommendation,
+    AuthorGraph,
+    CompiledGraph,
+    IfCondition,
+    NodeLayout,
+    NodePosition,
+    WorkflowDraft,
+    WorkflowEdge,
+    WorkflowLayout,
+    WorkflowNode,
+)
+
+__all__ = [
+    "CONTRACT_VERSION",
+    # common: enums
+    "ActorType",
+    # privilege / approval
+    "AgentOutputEnvelope",
+    # workflow graph
+    "AgentRecommendation",
+    "AgentResult",
+    "AgentResultStatus",
+    "Approval",
+    "ApprovalBase",
+    # api DTOs
+    "ApprovalDecisionRequest",
+    "ApprovalRenewRequest",
+    "ApprovalStatus",
+    # common: scalar aliases
+    "ArgvToken",
+    # event / artifact / console
+    "Artifact",
+    # common: shared value object
+    "ArtifactRef",
+    "ArtifactType",
+    "AssignAgentRequest",
+    "AssignmentMode",
+    "AuthorGraph",
+    "CapabilityGrant",
+    "CapabilityType",
+    # change set
+    "ChangeSet",
+    "ChangeSetApproval",
+    "ChangeSetStatus",
+    "CompiledGraph",
+    "ConsoleChunk",
+    "ConsoleOwnerType",
+    "ConsoleStreamKind",
+    "ContextPack",
+    "DescriptionText",
+    "EdgeCondition",
+    "EntityId",
+    "EventEnvelope",
+    "GitObjectId",
+    "GoalText",
+    "IfCondition",
+    "IfOperator",
+    "InstructionText",
+    "LayoutSaveRequest",
+    "LayoutSaveResponse",
+    "LockNodeRequest",
+    "MutationVersionResponse",
+    "NextSuggestion",
+    "NodeLayout",
+    "NodeOutcome",
+    "NodePosition",
+    "NodeRunStatus",
+    "NodeSummary",
+    "NodeType",
+    "PageInfo",
+    "PayloadT",
+    "PlanRequest",
+    "PlanResponse",
+    "PlannerRunStatus",
+    "PlannerType",
+    "PrivilegeAction",
+    "PrivilegeApproval",
+    "PrivilegeRequest",
+    "PrivilegeRequestProposal",
+    "PrivilegeRequestStatus",
+    "ReasonText",
+    "RecoverWorkspaceRequest",
+    "RepoRelativePath",
+    "RiskFinding",
+    "RiskLevel",
+    "RunRequest",
+    "RunResponse",
+    "SecuritySeverity",
+    "SessionStatus",
+    "Sha256Hex",
+    "ShortReasonText",
+    # common: base + helpers
+    "StrictModel",
+    "SummaryText",
+    "TaskKind",
+    # task / context / result
+    "TaskPackage",
+    "TaskStatus",
+    "TestKind",
+    "TitleText",
+    "ValidateRequest",
+    "ValidateResponse",
+    "ValidationIssue",
+    "WorkflowDraft",
+    "WorkflowEdge",
+    "WorkflowLayout",
+    "WorkflowNode",
+    "WorkflowRunStatus",
+    "WorkflowSaveRequest",
+    "WorkflowSaveResponse",
+    "WsTicketResponse",
+    "canonical_json",
+]
