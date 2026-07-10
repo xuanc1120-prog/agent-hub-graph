@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# JavaScript
+node_modules/
+web/frontend/dist/
+web/frontend/coverage/
+web/frontend/playwright-report/
+web/frontend/test-results/
+
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+.agent-hub/
+artifacts/
+workspaces/
+agent-hub.db*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Unrelated local artifacts retained from earlier document work
+.docx_qa_original/
+resume_source.docx
+replace_resume_project2.py

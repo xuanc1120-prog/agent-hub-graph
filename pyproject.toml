@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-hub"
+version = "0.1.0"
+description = "Local visual orchestration for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Agent Hub Contributors" }]
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "fastapi>=0.116,<1",
+    "psutil>=7,<8",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.10,<3",
+    "typer>=0.16,<1",
+    "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pip-audit>=2.9,<3",
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.1,<2",
+    "pytest-cov>=6.2,<8",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+agent-hub = "app.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "app*",
+    "master*",
+    "workflow*",
+    "protocol*",
+    "adapters*",
+    "context*",
+    "console*",
+    "security*",
+    "workspace*",
+    "storage*",
+    "web.backend*",
+]
+exclude = ["tests*", "web.frontend*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers -q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+cache_dir = ".venv/.pytest_cache"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["web/frontend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
