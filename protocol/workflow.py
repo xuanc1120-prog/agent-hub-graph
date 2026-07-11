@@ -28,6 +28,7 @@ from protocol.common import (
     GitObjectId,
     GoalText,
     IfOperator,
+    IfValueList,
     IfValueToken,
     InstructionText,
     NodeType,
@@ -77,7 +78,7 @@ class IfCondition(StrictModel):
     # Scalar operands (eq/ne) and each ``in`` list member are short enum-like
     # tokens; both the scalar and the list are length/count bounded so a draft
     # cannot smuggle unbounded text through a condition value.
-    value: IfValueToken | bool | list[IfValueToken] | None = Field(default=None, max_length=50)
+    value: IfValueToken | bool | IfValueList | None = None
 
 
 class WorkflowNode(StrictModel):

@@ -3,7 +3,7 @@
 The committed ``docs/contracts/openapi.draft.json`` is generated from the frozen
 ``protocol/api.py`` DTOs. This test regenerates the document in memory and
 asserts byte-equality with the committed file, so the draft cannot silently
-drift from the contract. Regenerate with ``python scripts/generate_openapi.py
+drift from the contract. Regenerate with ``python -m scripts.generate_openapi
 --write`` when the DTOs intentionally change (which, post-freeze, requires an
 ADR).
 """
@@ -21,7 +21,7 @@ def test_committed_openapi_draft_matches_generated() -> None:
     committed = OPENAPI_DRAFT_PATH.read_text(encoding="utf-8")
     assert committed == generated, (
         "docs/contracts/openapi.draft.json is stale; "
-        "run `python scripts/generate_openapi.py --write`"
+        "run `python -m scripts.generate_openapi --write`"
     )
 
 

@@ -39,6 +39,11 @@ ArgvToken = Annotated[str, Field(min_length=1, max_length=4_096)]
 # A short enum-like operand used in an if-node condition value.
 IfValueToken = Annotated[str, Field(min_length=1, max_length=256)]
 
+# A bounded set of operands used by the ``in`` condition operator. Keeping the
+# list constraint on this alias avoids applying ``max_length`` to scalar/bool
+# members of the IfCondition value union.
+IfValueList = Annotated[list[IfValueToken], Field(min_length=1, max_length=50)]
+
 # A whitelisted command template: a bounded argv vector (e.g. ["pytest", "-q"]).
 # Both the token length (via ArgvToken) and the token count are constrained so
 # neither the vector nor a single token can grow without bound. Must have at

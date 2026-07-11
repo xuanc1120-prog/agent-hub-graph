@@ -5,7 +5,7 @@ The FastAPI routes (``web/backend/``) do not exist yet, so this draft has no
 JSON schemas of every request/response model in :mod:`protocol.api` plus the
 graph/domain models they embed.
 
-Run ``python scripts/generate_openapi.py`` to print the document, or
+Run ``python -m scripts.generate_openapi`` to print the document, or
 ``--write`` to (re)write ``docs/contracts/openapi.draft.json``. The drift test
 ``tests/test_openapi_draft.py`` regenerates in memory and asserts byte-equality
 with the committed file.

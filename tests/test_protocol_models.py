@@ -658,11 +658,31 @@ def test_context_pack_effective_commands_are_bounded_templates() -> None:
 def test_if_condition_value_token_is_bounded() -> None:
     ok = IfCondition(upstream_node_id="n1", field="status", operator="eq", value="completed")
     assert ok.value == "completed"
+    max_size = IfCondition(upstream_node_id="n1", field="status", operator="eq", value="x" * 256)
+    assert max_size.value == "x" * 256
     with pytest.raises(ValidationError):
         IfCondition(upstream_node_id="n1", field="status", operator="eq", value="x" * 257)
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_if_condition_accepts_boolean_values(value: bool) -> None:
+    condition = IfCondition(
+        upstream_node_id="n1",
+        field="tests_passed",
+        operator="eq",
+        value=value,
+    )
+    assert condition.value is value
+
+
 def test_if_condition_value_list_count_is_bounded() -> None:
+    valid = IfCondition(
+        upstream_node_id="n1",
+        field="status",
+        operator="in",
+        value=["ok"] * 50,
+    )
+    assert len(valid.value) == 50
     with pytest.raises(ValidationError):
         IfCondition(
             upstream_node_id="n1",

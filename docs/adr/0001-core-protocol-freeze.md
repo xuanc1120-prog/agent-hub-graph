@@ -147,13 +147,13 @@ directly from those models:
   `components.schemas` are the JSON schemas of every `protocol/api.py` DTO plus
   the graph models they embed. It emits no `paths` — those are added by HUB-400
   when the routes exist. The document carries an `x-agent-hub-contract-version`
-  extension equal to `CONTRACT_VERSION`. Run `python scripts/generate_openapi.py`
+  extension equal to `CONTRACT_VERSION`. Run `python -m scripts.generate_openapi`
   to print it or `--write` to rewrite the committed file.
 - The generated document is committed at `docs/contracts/openapi.draft.json`.
 - `tests/test_openapi_draft.py` regenerates in-memory and asserts byte-equality
   with the committed file, so the draft cannot drift from the frozen DTOs
   without the test failing (regenerate with
-  `python scripts/generate_openapi.py --write`).
+  `python -m scripts.generate_openapi --write`).
 
 This is the verifiable phase-0 boundary: the data contract half of the API is
 frozen and machine-checked now; the path/security half is added by the route
