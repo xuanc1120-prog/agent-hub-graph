@@ -1,6 +1,6 @@
 # ADR 0001: Core Protocol Freeze (v1)
 
-- Status: Accepted (proposed by Claude Code, pending Codex ratification via `contracts-frozen-v1` tag)
+- Status: Accepted and ratified by Codex via the `contracts-frozen-v1` tag
 - Date: 2026-07-11
 - Task: HUB-010
 - Deciders: Claude Code (architecture owner), Codex (integration owner / reviewer)
