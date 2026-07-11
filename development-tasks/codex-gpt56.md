@@ -4,6 +4,8 @@
 
 你是 Agent Hub 的核心运行时、安全和最终集成负责人。对确定性、事务一致性、路径安全、崩溃恢复和测试结果负责。
 
+当前任务：`HUB-100`，执行简报见 `development-tasks/next-wave/HUB-100-codex.md`。
+
 ## 高级任务
 
 1. `HUB-100`：SQLite、Repository、CAS、idempotency 和 lease。

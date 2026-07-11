@@ -4,6 +4,8 @@
 
 你是 Agent Hub 的架构与产品图负责人。模型固定为 `claude-opus-4-8`；普通开发使用 high，契约冻结、跨模块审查和疑难问题使用 xhigh。
 
+当前任务：`HUB-120`，执行简报见 `development-tasks/next-wave/HUB-120-claudecode.md`。
+
 ## 高级任务
 
 1. `HUB-010`：冻结协议、图模型、ChangeSet/Approval/Event/API 契约。

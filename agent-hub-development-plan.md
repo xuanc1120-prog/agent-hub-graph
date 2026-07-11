@@ -1,5 +1,36 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
+## 当前执行基线（2026-07-12）
+
+协议基线为提交 `ec0d9c8`，已打标签 `contracts-frozen-v1`；项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| HUB-000 | completed | Git、Python/Vite、配置、锁文件和基础测试已提交 |
+| HUB-010 | completed | v1 核心协议已冻结并打 `contracts-frozen-v1` 标签 |
+| HUB-020 | ready | Hermes 完成 CI、Playwright 基线和 fixture 收尾 |
+| HUB-030 | ready | OpenCode 完成本机 CLI capability spike |
+| HUB-100 | ready | Codex 实现 SQLite、Repository、CAS、idempotency 和 lease |
+| HUB-120 | ready | Claude Code 实现 Planner、Router、lineage/fallback 和 fixture contract smoke |
+| HUB-110 | blocked | 等待 HUB-100；最终集成还需要 HUB-120/HUB-130 输出 |
+| HUB-130 | blocked | 等待 HUB-100 的 DB/Artifact 元数据边界 |
+
+下一开发波次同时启动 `HUB-020 / HUB-030 / HUB-100 / HUB-120`。所有任务必须从本次 next-wave preparation commit 建立独立 worktree，并记录实际 base commit；不得直接在 `main` 开发。推荐合并顺序为：
+
+```text
+HUB-020 / HUB-030
+        ↓
+HUB-100
+        ↓
+HUB-120 / HUB-130
+        ↓
+HUB-110
+        ↓
+阶段 1 CLI + Mock workflow 集成验收
+```
+
+本波次可执行任务简报位于 `development-tasks/next-wave/`。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+
 ## 1. 项目定位
 
 项目名：`agent-hub`
@@ -3056,27 +3087,28 @@ GUI 权威边界：
 1. 初始化 Agent Hub git 仓库、pyproject、Vite React、lint/test 命令。
 2. 建立 config、目录、artifact 根目录和专用 fixture source repo。
 3. 完成 StrictModel、Enums、AuthorGraph / CompiledGraph / ChangeSet / Approval schema。
-4. 完成 `init.sql`、schema version、FK/CHECK/partial index、idempotency repository 和 Repository 状态 CAS。
-5. 完成 singleton Master lease 的原子获取、heartbeat、release、fencing 校验和重复实例 fail-fast 启动保护。
-6. 输出 OpenAPI 草案和前端 TypeScript 类型。
-7. 生成并提交 Python hash lock 与 package-lock，记录必要 install script；CI 运行 `pip-audit` 和 `npm audit`，发现未豁免的 high/critical advisory 时失败，豁免必须包含 advisory、影响判断和到期日。
+4. 输出 schema-only OpenAPI 草案和前端 TypeScript 类型，并用漂移测试保持同步。
+5. 生成并提交 Python hash lock 与 package-lock，建立 lint、pytest、Vitest、Playwright 和依赖审计基线。
+6. 验证本机 OpenCode CLI 的 version/help/JSON 输出和 pure/legacy capability，产出兼容性 manifest，不在源码仓库执行真实写任务。
 
-完成标准：后端模型与数据库可初始化，第二个 Master 无法在有效租约期间启动，前端能用 fixture graph 编译通过；后续阶段不得再随意改变核心 ID、状态和 snapshot 契约。
+完成标准：工程骨架和冻结协议可安装、测试、生成 OpenAPI 与前端类型；CI/fixture 和 OpenCode capability 报告可复现。后续阶段不得再随意改变核心 ID、状态和 snapshot 契约。数据库初始化、CAS 和 singleton lease 明确移入阶段 1 的 `HUB-100`，避免与任务分配表冲突。
 
 ### 阶段 1：确定性 Workflow 纵向切片（6-8 个开发日）
 
 实现：
 
-1. RuleBasedPlanner 的 bugfix / feature / refactor / docs 模板。
-2. DraftValidator、WorkflowCompiler、PolicyInjector、ExecutableValidator。
-3. NodeRegistry 和无副作用 NodeHandler 基础接口。
-4. workflow semantic/layout version、三类 snapshot、node_run/event 状态机。
-5. DurableScheduler + GraphExecutor 完成数据库轮询、DAG 顺序执行、条件边、skipped 和失败路径。
-6. MockAgentAdapter 先支持只读/结构化结果。
-7. CLI 完成 create-session、plan、validate、show-workflow、run-workflow。
-8. React Flow 使用 fixture 实现 Author/Compiled 切换、节点拖动和 Agent 拖拽原型，提前验证图数据契约。
+1. 完成 `init.sql`、schema version、FK/CHECK/partial index、Repository 状态 CAS 和 idempotency repository。
+2. 完成 singleton Master/workspace lease 的原子获取、heartbeat、release、fencing 校验和重复实例 fail-fast。
+3. RuleBasedPlanner 的 bugfix / feature / refactor / docs 模板、AgentRouter、lineage 和 fallback。
+4. DraftValidator、WorkflowCompiler、PolicyInjector、ExecutableValidator。
+5. NodeRegistry 和无副作用 NodeHandler 基础接口。
+6. workflow semantic/layout version、三类 snapshot、node_run/event 状态机。
+7. DurableScheduler + GraphExecutor 完成数据库轮询、DAG 顺序执行、条件边、skipped 和失败路径。
+8. MockAgentAdapter 先支持只读/结构化结果。
+9. CLI 完成 create-session、plan、validate、show-workflow、run-workflow。
+10. 使用冻结 TypeScript 契约和 fixture graph 做 Author/Compiled 数据 smoke；完整 React Flow 编辑器仍由 HUB-410 实现。
 
-完成标准：CLI 可运行无真实写入的 Mock workflow，所有 node_run/event 可回放，snapshot 不受后续编辑影响；GUI 原型能编辑 AuthorGraph 并展示系统节点预览。
+完成标准：数据库可幂等初始化，第二个 Master 无法在有效租约期间启动；CLI 可运行无真实写入的 Mock workflow，所有 node_run/event 可回放，snapshot 不受后续编辑影响；前端 fixture 可通过冻结 TypeScript 契约编译。
 
 ### 阶段 2：共享工作区、安全链和审批（8-12 个开发日）
 

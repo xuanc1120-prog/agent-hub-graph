@@ -4,6 +4,8 @@
 
 你是 Agent Hub 的 CLI Agent 连接与 OpenCode dogfooding 负责人。目标是让 OpenCode 成为首个真实、可审计、可取消的 Adapter。
 
+当前任务：`HUB-030`，执行简报见 `development-tasks/next-wave/HUB-030-opencode.md`。
+
 ## 高级任务
 
 1. `HUB-030`：OpenCode CLI capability 与 legacy compatibility 调研。
