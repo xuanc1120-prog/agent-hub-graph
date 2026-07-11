@@ -36,6 +36,16 @@ RepoRelativePath = Annotated[str, Field(min_length=1, max_length=1_024)]
 # Single argv token inside an allowed command template.
 ArgvToken = Annotated[str, Field(min_length=1, max_length=4_096)]
 
+# A short enum-like operand used in an if-node condition value.
+IfValueToken = Annotated[str, Field(min_length=1, max_length=256)]
+
+# A whitelisted command template: a bounded argv vector (e.g. ["pytest", "-q"]).
+# Both the token length (via ArgvToken) and the token count are constrained so
+# neither the vector nor a single token can grow without bound. Must have at
+# least one token (the executable). The outer list of templates is capped at the
+# field level where the template list is declared.
+CommandTemplate = Annotated[list[ArgvToken], Field(min_length=1, max_length=64)]
+
 # --- User-visible text aliases (length-bounded) --------------------------------
 
 TitleText = Annotated[str, Field(min_length=1, max_length=500)]
@@ -59,6 +69,23 @@ class StrictModel(BaseModel):
         validate_assignment=True,
         allow_inf_nan=False,
     )
+
+
+class FrozenStrictModel(StrictModel):
+    """Strict base for immutable record/audit models.
+
+    Any model that enforces a cross-field invariant with a
+    ``model_validator(mode="after")`` must inherit from this base rather than
+    :class:`StrictModel`. Pydantic runs after-validators *after* mutating the
+    target field on assignment, so with ``validate_assignment`` a single-field
+    assignment that violates the invariant would raise yet still leave the
+    object mutated and illegal. ``frozen=True`` blocks assignment entirely, so
+    the invariant established at construction can never be broken in place;
+    state transitions reconstruct a new instance through the validating
+    constructor. See ADR 0001.
+    """
+
+    model_config = ConfigDict(frozen=True)
 
 
 def canonical_json(model: BaseModel) -> bytes:
@@ -257,8 +284,15 @@ class EdgeCondition(StrEnum):
     REJECTED = "rejected"
 
 
-class ArtifactRef(StrictModel):
-    """Content-addressed pointer to an artifact stored outside the DB."""
+class ArtifactRef(FrozenStrictModel):
+    """Content-addressed pointer to an artifact stored outside the DB.
+
+    Frozen: it is a content-addressed value object (its ``sha256``/``size_bytes``
+    identify fixed bytes) and it is embedded in frozen records like
+    :class:`~protocol.console.ConsoleChunk` whose invariants read these fields.
+    Freezing it closes the nested-mutation hole where a parent record is frozen
+    but a mutable child could still break the parent's cross-field invariant.
+    """
 
     artifact_id: EntityId
     artifact_type: ArtifactType

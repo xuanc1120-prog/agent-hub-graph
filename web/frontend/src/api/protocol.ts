@@ -7,6 +7,11 @@
 //
 // After the `contracts-frozen-v1` tag, these shapes may only change via an
 // accepted ADR, in lockstep with the Python models.
+//
+// Artifact, EventEnvelope, ConsoleChunk and CapabilityGrant are immutable audit
+// records: the Python models are `frozen=True` and carry cross-field
+// invariants. Treat these as read-only on the frontend; construct a new object
+// rather than mutating a field in place.
 
 export const CONTRACT_VERSION = '1'
 
@@ -177,6 +182,9 @@ export interface ArtifactRef {
 
 // --- Workflow graph ------------------------------------------------------------
 
+// A whitelisted command: a non-empty argv vector (e.g. ['pytest', '-q']). The
+// Python contract bounds this to 1..64 tokens, each token <=4096 chars. The
+// backend rejects out-of-bound values; the GUI should apply the same limits.
 export type CommandTemplate = string[]
 
 export interface NodePosition {
@@ -203,6 +211,8 @@ export interface IfCondition {
   upstream_node_id: string
   field: 'status' | 'outcome' | 'effective_risk' | 'tests_passed'
   operator: IfOperator
+  // Scalar operands and each `in`-list member are short enum-like tokens
+  // (<=256 chars); the list holds at most 50 members in the Python contract.
   value?: string | boolean | string[] | null
 }
 

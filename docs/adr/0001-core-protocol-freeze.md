@@ -63,7 +63,7 @@ Rejection on author/Planner/API input is a DraftValidator responsibility
 larger node/edge ceilings (300/600 vs 100/300) to accommodate injected system
 security nodes.
 
-### 4. Cross-field invariants as model validators
+### 4. Cross-field invariants as model validators, on frozen models
 
 - `CapabilityGrant`: `consumed_at`/`consumed_fencing_token` set together;
   `revoked_at`/`revocation_reason` set together; consumed and revoked mutually
@@ -74,9 +74,45 @@ security nodes.
 - `ConsoleChunk`: `artifact_ref.artifact_type` must be `console` and its
   `size_bytes` must match the chunk's declared size.
 
+**These four models are frozen (`FrozenStrictModel`, `frozen=True`).** Reason
+(this is the fix for the first-round review): the strict base sets
+`validate_assignment=True`, and Pydantic v2 mutates the target field *before*
+running `model_validator(mode="after")`. A single-field assignment that breaks a
+cross-field invariant therefore raises **but leaves the object mutated and
+illegal** — the assignment is not rolled back. Freezing blocks assignment
+outright, so an invariant established at construction can never be broken in
+place; state transitions reconstruct a new instance through the validating
+constructor (the runtime records are immutable audit rows anyway).
+
+`ArtifactRef` is **also** frozen. It is a nested value object referenced by
+`ConsoleChunk`'s size/type invariant; if it stayed mutable, the invariant could
+be broken from underneath the frozen chunk by mutating the nested ref. Freezing
+the leaf value object closes that nested-mutation hole. Freezing preserves the
+strict config (`extra="forbid"` etc.) — verified by test.
+
 Registry-level rules (event_type → payload class mapping, 64 KiB canonical
 payload cap) are runtime concerns and are intentionally *not* enforced in the
 model; the model provides the `canonical_json` helper the runtime uses.
+
+### 4a. Required vs defaulted text fields
+
+Per the first-round review, `NodeSummary.summary`, `NextSuggestion.reason`,
+`PrivilegeRequestProposal.reason` and `AgentOutputEnvelope.summary` are
+**required** (no `= ""` default): the spec declares them as plain
+length-bounded text, and an empty planner/agent reason or summary is a producer
+bug we want surfaced at construction, not silently accepted. `AgentResult.summary`
+keeps its `""` default because chapter 18.4 declares it `default=""`.
+
+### 4b. Bounded command templates and condition values
+
+`CommandTemplate` is `Annotated[list[ArgvToken], Field(min_length=1, max_length=64)]`:
+a template must have at least the executable token and is capped at 64 tokens,
+so neither a single token (`ArgvToken` ≤ 4096 chars) nor the vector can grow
+unbounded. `TaskPackage.effective_allowed_commands` and
+`ContextPack.effective_allowed_commands` use this alias instead of the previous
+untyped `list[list[str]]`. `IfCondition.value` scalars and `in`-list members use
+`IfValueToken` (≤ 256 chars) and the list is capped at 50 members, so a draft
+cannot smuggle unbounded text through a branch condition.
 
 ### 5. `Approval` discriminated union
 
@@ -99,6 +135,30 @@ string-literal union types, **not** TS `enum`, because the frontend tsconfig
 sets `erasableSyntaxOnly` (TS `enum` emits runtime code and would fail the
 build). The `Approval` union is discriminated on `subject_type`.
 
+### 8. Phase-0 OpenAPI draft (scoped to frozen DTOs)
+
+Chapter 25 phase-0 asks for an OpenAPI draft. The FastAPI routes live in
+`web/backend/` (Codex, HUB-400) and do not exist yet, so a full route-level
+spec is deliberately deferred. What *is* frozen now is the set of
+request/response DTOs in `protocol/api.py`, so the phase-0 draft is generated
+directly from those models:
+
+- `scripts/generate_openapi.py` builds an OpenAPI 3.1 document whose
+  `components.schemas` are the JSON schemas of every `protocol/api.py` DTO plus
+  the graph models they embed. It emits no `paths` — those are added by HUB-400
+  when the routes exist. The document carries an `x-agent-hub-contract-version`
+  extension equal to `CONTRACT_VERSION`. Run `python scripts/generate_openapi.py`
+  to print it or `--write` to rewrite the committed file.
+- The generated document is committed at `docs/contracts/openapi.draft.json`.
+- `tests/test_openapi_draft.py` regenerates in-memory and asserts byte-equality
+  with the committed file, so the draft cannot drift from the frozen DTOs
+  without the test failing (regenerate with
+  `python scripts/generate_openapi.py --write`).
+
+This is the verifiable phase-0 boundary: the data contract half of the API is
+frozen and machine-checked now; the path/security half is added by the route
+owner without changing these schemas.
+
 ## Deviations from the plan's literal field types
 
 These are type *tightenings* consistent with the chapter 18.1 directive, not
@@ -114,6 +174,31 @@ semantic field changes. They are called out here for Codex review:
    No field's *presence*, *name*, *default*, or *semantics* was changed.
 3. `error_code`, `planner_model`, and `revocation_reason` were given length
    caps (200) consistent with the "strings set length limits" rule.
+4. `CommandTemplate` is frozen as `Annotated[list[ArgvToken], Field(min_length=1,
+   max_length=64)]`: a command has at least one token (the executable) and at
+   most 64. `IfCondition.value` uses a bounded `IfValueToken` (<=256 chars) and
+   the list form is capped at 50 members, so a draft cannot smuggle unbounded
+   text through a condition. `TaskPackage`/`ContextPack.effective_allowed_commands`
+   now use `CommandTemplate` instead of bare `list[list[str]]`.
+
+## Corrections applied after the first freeze review (Codex on `f08fccf`)
+
+1. **Required text restored.** `NodeSummary.summary`,
+   `NextSuggestion.reason`, `PrivilegeRequestProposal.reason` and
+   `AgentOutputEnvelope.summary` had been given `= ""` defaults in the first
+   pass; the spec treats them as required. They are required again in Python,
+   in the TS mirror, and asserted in tests. (`AgentResult.summary` keeps its
+   `""` default, which is explicit in chapter 18.4.)
+2. **Assignment can no longer corrupt an invariant-bearing model.** With
+   `validate_assignment=True`, Pydantic mutates the field *then* runs the
+   after-validator and does not roll back on failure, so a rejected assignment
+   left the object mutated and illegal. Every model with a cross-field
+   after-validator (`CapabilityGrant`, `Artifact`, `EventEnvelope`,
+   `ConsoleChunk`) and the value object embedded in one of those invariants
+   (`ArtifactRef`) now inherit `FrozenStrictModel` (`frozen=True`). Assignment
+   is blocked outright and nested mutation of the embedded `ArtifactRef` can no
+   longer break `ConsoleChunk`'s size/type invariant. Regression tests cover
+   both top-level assignment and nested mutation.
 
 No core field was renamed, added, removed, or had its type's meaning changed.
 If Codex considers any collection ceiling wrong, that is a one-line change

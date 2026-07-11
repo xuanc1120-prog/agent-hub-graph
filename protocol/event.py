@@ -19,13 +19,17 @@ from protocol.common import (
     ActorType,
     ArtifactType,
     EntityId,
+    FrozenStrictModel,
     RepoRelativePath,
     Sha256Hex,
     StrictModel,
 )
 
 
-class Artifact(StrictModel):
+class Artifact(FrozenStrictModel):
+    # Frozen: cross-field validator + Pydantic's assign-then-validate order means
+    # a failed assignment could otherwise leave the record illegal. Artifacts are
+    # immutable audit records anyway. See ADR 0001.
     artifact_id: EntityId
     session_id: EntityId
     task_id: EntityId | None = None
@@ -47,7 +51,8 @@ class Artifact(StrictModel):
 PayloadT = TypeVar("PayloadT", bound=StrictModel)
 
 
-class EventEnvelope(StrictModel, Generic[PayloadT]):
+class EventEnvelope(FrozenStrictModel, Generic[PayloadT]):
+    # Frozen: see Artifact / ADR 0001. Events are immutable, append-only records.
     event_id: int = Field(ge=1)
     session_id: EntityId
     workflow_id: EntityId | None = None

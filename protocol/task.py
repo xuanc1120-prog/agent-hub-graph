@@ -17,6 +17,7 @@ from pydantic import Field
 
 from protocol.common import (
     ArtifactRef,
+    CommandTemplate,
     EntityId,
     GitObjectId,
     InstructionText,
@@ -45,7 +46,7 @@ class TaskPackage(StrictModel):
     active_capability_grant_id: EntityId | None = None
     granted_existing_files: list[RepoRelativePath] = Field(default_factory=list, max_length=1)
     readonly_files: list[RepoRelativePath] = Field(default_factory=list, max_length=2_000)
-    effective_allowed_commands: list[list[str]] = Field(default_factory=list, max_length=20)
+    effective_allowed_commands: list[CommandTemplate] = Field(default_factory=list, max_length=20)
     workspace_ephemeral_paths: list[RepoRelativePath] = Field(default_factory=list, max_length=100)
     forbidden_actions: list[ShortReasonText] = Field(default_factory=list, max_length=100)
     acceptance_criteria: list[ShortReasonText] = Field(default_factory=list, max_length=100)

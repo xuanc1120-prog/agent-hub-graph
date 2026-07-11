@@ -48,4 +48,4 @@ class AgentResult(StrictModel):
 
 class NextSuggestion(StrictModel):
     suggested_agent: EntityId | None = None
-    reason: ShortReasonText = ""
+    reason: ShortReasonText

@@ -21,12 +21,14 @@ from protocol.common import (
     CONTRACT_VERSION,
     ArgvToken,
     AssignmentMode,
+    CommandTemplate,
     DescriptionText,
     EdgeCondition,
     EntityId,
     GitObjectId,
     GoalText,
     IfOperator,
+    IfValueToken,
     InstructionText,
     NodeType,
     PlannerType,
@@ -39,8 +41,6 @@ from protocol.common import (
     TestKind,
     TitleText,
 )
-
-CommandTemplate = list[ArgvToken]
 
 
 class NodePosition(StrictModel):
@@ -74,7 +74,10 @@ class IfCondition(StrictModel):
     upstream_node_id: EntityId
     field: str = Field(pattern=r"^(status|outcome|effective_risk|tests_passed)$")
     operator: IfOperator
-    value: str | bool | list[str] | None = None
+    # Scalar operands (eq/ne) and each ``in`` list member are short enum-like
+    # tokens; both the scalar and the list are length/count bounded so a draft
+    # cannot smuggle unbounded text through a condition value.
+    value: IfValueToken | bool | list[IfValueToken] | None = Field(default=None, max_length=50)
 
 
 class WorkflowNode(StrictModel):

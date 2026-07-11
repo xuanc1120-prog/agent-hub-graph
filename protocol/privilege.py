@@ -18,6 +18,7 @@ from pydantic import Field, model_validator
 from protocol.common import (
     CapabilityType,
     EntityId,
+    FrozenStrictModel,
     GitObjectId,
     PrivilegeAction,
     ReasonText,
@@ -85,7 +86,7 @@ class PrivilegeRequestProposal(StrictModel):
     requested_capability: CapabilityType
     requested_action: PrivilegeAction
     requested_resource: RepoRelativePath | None = None
-    reason: ReasonText = ""
+    reason: ReasonText
     expected_impact: list[ShortReasonText] = Field(default_factory=list, max_length=50)
     related_files: list[RepoRelativePath] = Field(default_factory=list, max_length=100)
     rollback_plan: ReasonText | None = None
@@ -104,13 +105,13 @@ class PrivilegeRequest(PrivilegeRequestProposal):
 
 
 class AgentOutputEnvelope(StrictModel):
-    summary: SummaryText = ""
+    summary: SummaryText
     risk_hints: list[ShortReasonText] = Field(default_factory=list, max_length=50)
     next_suggestion: NextSuggestion | None = None
     privilege_requests: list[PrivilegeRequestProposal] = Field(default_factory=list, max_length=1)
 
 
-class CapabilityGrant(StrictModel):
+class CapabilityGrant(FrozenStrictModel):
     grant_id: EntityId
     request_id: EntityId
     target_task_id: EntityId

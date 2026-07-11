@@ -18,11 +18,14 @@ from protocol.common import (
     ArtifactType,
     ConsoleStreamKind,
     EntityId,
-    StrictModel,
+    FrozenStrictModel,
 )
 
 
-class ConsoleChunk(StrictModel):
+class ConsoleChunk(FrozenStrictModel):
+    # Frozen: cross-field validator + Pydantic's assign-then-validate order means
+    # a failed assignment could otherwise leave the record illegal. Console chunks
+    # are immutable append-only records. See ADR 0001.
     console_session_id: EntityId
     seq: int = Field(ge=1)
     stream: ConsoleStreamKind

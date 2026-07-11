@@ -39,6 +39,18 @@ cross-module data contract:
 6. Compiler-only node fields exist on the shared node but are author-rejected
    downstream (DraftValidator, HUB-110).
 7. `canonical_json` produces order-independent bytes for hashing.
+8. Models with a cross-field `model_validator` (`CapabilityGrant`, `Artifact`,
+   `EventEnvelope`, `ConsoleChunk`) and the value object they embed
+   (`ArtifactRef`) are `frozen=True`: a rejected assignment can never leave a
+   record in an illegal state, and nested mutation cannot bypass the invariant.
+9. Command templates are bounded in both token length and token count;
+   `IfCondition.value` operands are short bounded tokens with a bounded list.
+
+## Phase-0 OpenAPI draft
+
+`docs/contracts/openapi.draft.json` is generated from the frozen `protocol/api.py`
+DTOs (`scripts/generate_openapi.py`). It has no `paths` — the FastAPI routes are
+added by HUB-400. `tests/test_openapi_draft.py` guards it against drift.
 
 ## `schema_version` fields
 

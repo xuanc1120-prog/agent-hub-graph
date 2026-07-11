@@ -16,6 +16,7 @@ from pydantic import TypeAdapter, ValidationError
 from protocol import (
     CONTRACT_VERSION,
     ActorType,
+    AgentOutputEnvelope,
     AgentResultStatus,
     Approval,
     ApprovalStatus,
@@ -27,9 +28,14 @@ from protocol import (
     ChangeSetStatus,
     CompiledGraph,
     ConsoleChunk,
+    ContextPack,
     EventEnvelope,
+    IfCondition,
+    NextSuggestion,
     NodeRunStatus,
+    NodeSummary,
     PrivilegeApproval,
+    PrivilegeRequestProposal,
     PrivilegeRequestStatus,
     RiskLevel,
     StrictModel,
@@ -450,3 +456,217 @@ def test_canonical_json_round_trips_through_model() -> None:
 def test_contract_version_is_frozen() -> None:
     assert CONTRACT_VERSION == "1"
     assert AuthorGraph().schema_version == CONTRACT_VERSION
+
+
+# --- Required-text semantics (regression for over-defaulting) -------------------
+
+
+def test_node_summary_summary_is_required() -> None:
+    assert NodeSummary.model_fields["summary"].is_required()
+    with pytest.raises(ValidationError):
+        NodeSummary(node_run_id="nr1", status=NodeRunStatus.COMPLETED)
+
+
+def test_next_suggestion_reason_is_required() -> None:
+    assert NextSuggestion.model_fields["reason"].is_required()
+    with pytest.raises(ValidationError):
+        NextSuggestion(suggested_agent="agent-1")
+
+
+def test_privilege_proposal_reason_is_required() -> None:
+    assert PrivilegeRequestProposal.model_fields["reason"].is_required()
+    with pytest.raises(ValidationError):
+        PrivilegeRequestProposal(
+            requested_capability="modify_config",
+            requested_action="edit_project_config",
+        )
+
+
+def test_agent_output_envelope_summary_is_required() -> None:
+    assert AgentOutputEnvelope.model_fields["summary"].is_required()
+    with pytest.raises(ValidationError):
+        AgentOutputEnvelope()
+
+
+# --- Frozen models: assignment can never corrupt state --------------------------
+#
+# Regression for the validate_assignment bug: Pydantic runs after-model-validators
+# *after* mutating the field, and does not roll back on failure. Models carrying a
+# cross-field validator are frozen, so a rejected assignment leaves the original,
+# still-valid object untouched (and any assignment raises).
+
+
+def _valid_grant() -> CapabilityGrant:
+    return CapabilityGrant(
+        grant_id="g1",
+        request_id="r1",
+        target_task_id="t1",
+        action="edit_project_config",
+        resource="pyproject.toml",
+        expires_at=_now(),
+    )
+
+
+def test_capability_grant_is_frozen() -> None:
+    grant = _valid_grant()
+    with pytest.raises(ValidationError):
+        grant.consumed_at = _now()
+    # The rejected assignment must not have mutated the object.
+    assert grant.consumed_at is None
+    assert grant.consumed_fencing_token is None
+
+
+def test_artifact_is_frozen_and_uncorrupted_after_failed_assignment() -> None:
+    artifact = Artifact(
+        artifact_id="a1",
+        session_id="s1",
+        task_id="t1",
+        artifact_type=ArtifactType.LOG,
+        relative_path="artifacts/log-1.txt",
+        sha256=PLACEHOLDER_SHA,
+        size_bytes=1,
+        redacted=True,
+        created_at=_now(),
+    )
+    with pytest.raises(ValidationError):
+        artifact.planner_run_id = "p1"  # would break owner exclusivity
+    assert artifact.planner_run_id is None
+    assert artifact.task_id == "t1"
+
+
+def test_event_envelope_is_frozen() -> None:
+    event = EventEnvelope[_Payload](
+        event_id=1,
+        session_id="s1",
+        event_type="session.created",
+        actor_type=ActorType.USER,
+        payload=_Payload(detail="ok"),
+        created_at=_now(),
+    )
+    with pytest.raises(ValidationError):
+        event.workflow_run_id = "run1"  # would break run-field pairing
+    assert event.workflow_run_id is None
+
+
+def test_console_chunk_is_frozen() -> None:
+    chunk = ConsoleChunk(
+        console_session_id="c1",
+        seq=1,
+        stream="stdout",
+        artifact_ref=_artifact_ref(ArtifactType.CONSOLE),
+        size_bytes=10,
+        created_at=_now(),
+    )
+    with pytest.raises(ValidationError):
+        chunk.size_bytes = 999
+    assert chunk.size_bytes == 10
+
+
+def test_frozen_models_keep_extra_forbid() -> None:
+    # Freezing must not weaken the strict base config.
+    for model in (CapabilityGrant, Artifact, EventEnvelope, ConsoleChunk):
+        assert model.model_config["extra"] == "forbid"
+        assert model.model_config["frozen"] is True
+
+
+def test_artifact_ref_is_frozen() -> None:
+    # ArtifactRef is a content-addressed value object; it must be immutable so a
+    # frozen owner (e.g. ConsoleChunk) cannot have its invariant broken via a
+    # nested mutation of the ref it holds.
+    ref = _artifact_ref(ArtifactType.CONSOLE)
+    with pytest.raises(ValidationError):
+        ref.size_bytes = 999
+    assert ref.size_bytes == 10
+
+
+def test_console_chunk_invariant_survives_nested_ref_mutation() -> None:
+    # Regression for the nested-mutation hole: freezing ConsoleChunk alone is not
+    # enough; its artifact_ref must also be immutable or the size/type invariant
+    # could be broken from underneath.
+    chunk = ConsoleChunk(
+        console_session_id="c1",
+        seq=1,
+        stream="stdout",
+        artifact_ref=_artifact_ref(ArtifactType.CONSOLE),
+        size_bytes=10,
+        created_at=_now(),
+    )
+    with pytest.raises(ValidationError):
+        chunk.artifact_ref.size_bytes = 999
+    with pytest.raises(ValidationError):
+        chunk.artifact_ref.artifact_type = ArtifactType.LOG
+    assert chunk.artifact_ref.size_bytes == 10
+    assert chunk.artifact_ref.artifact_type is ArtifactType.CONSOLE
+
+
+# --- Bounded collections / tokens -----------------------------------------------
+
+
+def test_command_template_token_count_is_bounded() -> None:
+    node = WorkflowNode(
+        id="n1",
+        node_type="agent_task",
+        task_kind="implement",
+        title="t",
+        allowed_commands_candidate=[["pytest", "-q"]],
+    )
+    assert node.allowed_commands_candidate == [["pytest", "-q"]]
+    with pytest.raises(ValidationError):
+        WorkflowNode(
+            id="n1",
+            node_type="agent_task",
+            task_kind="implement",
+            title="t",
+            allowed_commands_candidate=[["x"] * 65],  # exceeds 64-token cap
+        )
+
+
+def test_command_template_rejects_empty_vector() -> None:
+    with pytest.raises(ValidationError):
+        WorkflowNode(
+            id="n1",
+            node_type="agent_task",
+            task_kind="implement",
+            title="t",
+            allowed_commands_candidate=[[]],  # a template needs at least the executable
+        )
+
+
+def test_context_pack_effective_commands_are_bounded_templates() -> None:
+    pack = ContextPack(
+        task_id="t1",
+        node_id="n1",
+        task_kind="implement",
+        session_goal="g",
+        current_node_title="title",
+        current_task="do it",
+        effective_allowed_commands=[["pytest"]],
+    )
+    assert pack.effective_allowed_commands == [["pytest"]]
+    with pytest.raises(ValidationError):
+        ContextPack(
+            task_id="t1",
+            node_id="n1",
+            task_kind="implement",
+            session_goal="g",
+            current_node_title="title",
+            current_task="do it",
+            effective_allowed_commands=[["x"] * 65],
+        )
+
+
+def test_if_condition_value_token_is_bounded() -> None:
+    ok = IfCondition(upstream_node_id="n1", field="status", operator="eq", value="completed")
+    assert ok.value == "completed"
+    with pytest.raises(ValidationError):
+        IfCondition(upstream_node_id="n1", field="status", operator="eq", value="x" * 257)
+
+
+def test_if_condition_value_list_count_is_bounded() -> None:
+    with pytest.raises(ValidationError):
+        IfCondition(
+            upstream_node_id="n1",
+            field="status",
+            operator="in",
+            value=["ok"] * 51,  # exceeds max_length=50
+        )

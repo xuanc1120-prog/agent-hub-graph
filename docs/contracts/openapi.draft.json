@@ -1,0 +1,1251 @@
+{
+  "components": {
+    "schemas": {
+      "AgentRecommendation": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "title": "Reason",
+            "type": "string"
+          },
+          "score": {
+            "maximum": 100,
+            "minimum": 0,
+            "title": "Score",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "score",
+          "reason"
+        ],
+        "title": "AgentRecommendation",
+        "type": "object"
+      },
+      "ApprovalDecisionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "approval_version": {
+            "minimum": 1,
+            "title": "Approval Version",
+            "type": "integer"
+          },
+          "confirm_subject_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Confirm Subject Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_version",
+          "confirm_subject_hash"
+        ],
+        "title": "ApprovalDecisionRequest",
+        "type": "object"
+      },
+      "ApprovalRenewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "approval_version": {
+            "minimum": 1,
+            "title": "Approval Version",
+            "type": "integer"
+          },
+          "confirm_subject_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Confirm Subject Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_version",
+          "confirm_subject_hash"
+        ],
+        "title": "ApprovalRenewRequest",
+        "type": "object"
+      },
+      "AssignAgentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "expected_semantic_version": {
+            "minimum": 1,
+            "title": "Expected Semantic Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "expected_semantic_version"
+        ],
+        "title": "AssignAgentRequest",
+        "type": "object"
+      },
+      "AssignmentMode": {
+        "enum": [
+          "auto",
+          "manual",
+          "locked"
+        ],
+        "title": "AssignmentMode",
+        "type": "string"
+      },
+      "AuthorGraph": {
+        "additionalProperties": false,
+        "description": "User/Planner-editable graph. May be persisted while structurally\nincomplete; it cannot be executed directly.",
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowEdge"
+            },
+            "maxItems": 300,
+            "title": "Edges",
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowNode"
+            },
+            "maxItems": 100,
+            "title": "Nodes",
+            "type": "array"
+          },
+          "schema_version": {
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          }
+        },
+        "title": "AuthorGraph",
+        "type": "object"
+      },
+      "CompiledGraph": {
+        "additionalProperties": false,
+        "description": "Deterministic executable graph. Constructed only by the\n``WorkflowCompiler``; the API never accepts a client-submitted\n``CompiledGraph``. Larger node/edge ceilings account for injected system\nsecurity nodes.",
+        "properties": {
+          "agent_catalog_snapshot_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Agent Catalog Snapshot Hash",
+            "type": "string"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowEdge"
+            },
+            "maxItems": 600,
+            "title": "Edges",
+            "type": "array"
+          },
+          "integration_base_commit": {
+            "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+            "title": "Integration Base Commit",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowNode"
+            },
+            "maxItems": 300,
+            "title": "Nodes",
+            "type": "array"
+          },
+          "policy_version": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "source_author_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Author Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_author_hash",
+          "integration_base_commit",
+          "policy_version",
+          "agent_catalog_snapshot_hash"
+        ],
+        "title": "CompiledGraph",
+        "type": "object"
+      },
+      "EdgeCondition": {
+        "enum": [
+          "success",
+          "failure",
+          "matched",
+          "not_matched",
+          "approved",
+          "rejected"
+        ],
+        "title": "EdgeCondition",
+        "type": "string"
+      },
+      "IfCondition": {
+        "additionalProperties": false,
+        "description": "Structured branch predicate for an ``if`` node. Only whitelisted\nupstream fields and a limited operator set are permitted; script or\nnatural-language conditions are rejected by construction.",
+        "properties": {
+          "field": {
+            "pattern": "^(status|outcome|effective_risk|tests_passed)$",
+            "title": "Field",
+            "type": "string"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/IfOperator"
+          },
+          "upstream_node_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Upstream Node Id",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "items": {
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                ],
+                "maxLength": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Value"
+          }
+        },
+        "required": [
+          "upstream_node_id",
+          "field",
+          "operator"
+        ],
+        "title": "IfCondition",
+        "type": "object"
+      },
+      "IfOperator": {
+        "enum": [
+          "eq",
+          "ne",
+          "in",
+          "is_true",
+          "is_false"
+        ],
+        "title": "IfOperator",
+        "type": "string"
+      },
+      "LayoutSaveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_layout_version": {
+            "minimum": 0,
+            "title": "Expected Layout Version",
+            "type": "integer"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/WorkflowLayout"
+          }
+        },
+        "required": [
+          "layout",
+          "expected_layout_version"
+        ],
+        "title": "LayoutSaveRequest",
+        "type": "object"
+      },
+      "LayoutSaveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "layout_version": {
+            "minimum": 1,
+            "title": "Layout Version",
+            "type": "integer"
+          },
+          "workflow_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id",
+          "layout_version"
+        ],
+        "title": "LayoutSaveResponse",
+        "type": "object"
+      },
+      "LockNodeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_semantic_version": {
+            "minimum": 1,
+            "title": "Expected Semantic Version",
+            "type": "integer"
+          },
+          "locked": {
+            "title": "Locked",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "locked",
+          "expected_semantic_version"
+        ],
+        "title": "LockNodeRequest",
+        "type": "object"
+      },
+      "MutationVersionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "semantic_version": {
+            "minimum": 1,
+            "title": "Semantic Version",
+            "type": "integer"
+          },
+          "workflow_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id",
+          "semantic_version"
+        ],
+        "title": "MutationVersionResponse",
+        "type": "object"
+      },
+      "NodeLayout": {
+        "additionalProperties": false,
+        "properties": {
+          "node_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Node Id",
+            "type": "string"
+          },
+          "position": {
+            "$ref": "#/components/schemas/NodePosition"
+          }
+        },
+        "required": [
+          "node_id",
+          "position"
+        ],
+        "title": "NodeLayout",
+        "type": "object"
+      },
+      "NodePosition": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "maximum": 1000000,
+            "minimum": -1000000,
+            "title": "X",
+            "type": "number"
+          },
+          "y": {
+            "maximum": 1000000,
+            "minimum": -1000000,
+            "title": "Y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "title": "NodePosition",
+        "type": "object"
+      },
+      "NodeType": {
+        "enum": [
+          "input",
+          "agent_task",
+          "context_builder",
+          "patch_guard",
+          "command_guard",
+          "test",
+          "risk_classifier",
+          "approval",
+          "merge_patch",
+          "output",
+          "if"
+        ],
+        "title": "NodeType",
+        "type": "string"
+      },
+      "PageInfo": {
+        "additionalProperties": false,
+        "description": "Cursor pagination envelope shared by all list responses.",
+        "properties": {
+          "limit": {
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "limit"
+        ],
+        "title": "PageInfo",
+        "type": "object"
+      },
+      "PlanRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "parent_workflow_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Workflow Id"
+          },
+          "planner_mode": {
+            "pattern": "^(open_code|rule_based)$",
+            "title": "Planner Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "planner_mode"
+        ],
+        "title": "PlanRequest",
+        "type": "object"
+      },
+      "PlanResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "planner_run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Planner Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "planner_run_id"
+        ],
+        "title": "PlanResponse",
+        "type": "object"
+      },
+      "RecoverWorkspaceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_fencing_token": {
+            "minimum": 1,
+            "title": "Expected Fencing Token",
+            "type": "integer"
+          },
+          "resolution": {
+            "pattern": "^(retry|cancel)$",
+            "title": "Resolution",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_fencing_token",
+          "resolution"
+        ],
+        "title": "RecoverWorkspaceRequest",
+        "type": "object"
+      },
+      "RiskFinding": {
+        "additionalProperties": false,
+        "description": "De-identified risk summary shown in the review panel.",
+        "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "title": "Reason",
+            "type": "string"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          }
+        },
+        "required": [
+          "risk_level",
+          "reason"
+        ],
+        "title": "RiskFinding",
+        "type": "object"
+      },
+      "RiskLevel": {
+        "enum": [
+          "L0",
+          "L1",
+          "L2",
+          "L3",
+          "L4"
+        ],
+        "title": "RiskLevel",
+        "type": "string"
+      },
+      "RunRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmed_compiled_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Confirmed Compiled Hash",
+            "type": "string"
+          },
+          "expected_semantic_version": {
+            "minimum": 1,
+            "title": "Expected Semantic Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_semantic_version",
+          "confirmed_compiled_hash"
+        ],
+        "title": "RunRequest",
+        "type": "object"
+      },
+      "RunResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "workflow_run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Workflow Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "RunResponse",
+        "type": "object"
+      },
+      "TaskKind": {
+        "enum": [
+          "analyze",
+          "implement",
+          "review",
+          "docs",
+          "test_fix"
+        ],
+        "title": "TaskKind",
+        "type": "string"
+      },
+      "TestKind": {
+        "enum": [
+          "command",
+          "docs_static"
+        ],
+        "title": "TestKind",
+        "type": "string"
+      },
+      "ValidateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_semantic_version": {
+            "minimum": 0,
+            "title": "Expected Semantic Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_semantic_version"
+        ],
+        "title": "ValidateRequest",
+        "type": "object"
+      },
+      "ValidateResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_catalog_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Catalog Hash"
+          },
+          "compiled_graph": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompiledGraph"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "compiled_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compiled Hash"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationIssue"
+            },
+            "maxItems": 500,
+            "title": "Errors",
+            "type": "array"
+          },
+          "integration_base_commit": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Integration Base Commit"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "policy_version": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Policy Version"
+          },
+          "source_semantic_version": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Semantic Version"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationIssue"
+            },
+            "maxItems": 500,
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "ValidateResponse",
+        "type": "object"
+      },
+      "ValidationIssue": {
+        "additionalProperties": false,
+        "description": "A single error or warning surfaced by validate/compile.",
+        "properties": {
+          "code": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "edge_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Edge Id"
+          },
+          "message": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Id"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ValidationIssue",
+        "type": "object"
+      },
+      "WorkflowEdge": {
+        "additionalProperties": false,
+        "properties": {
+          "condition": {
+            "$ref": "#/components/schemas/EdgeCondition",
+            "default": "success"
+          },
+          "from_node": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "From Node",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "system_managed": {
+            "default": false,
+            "title": "System Managed",
+            "type": "boolean"
+          },
+          "to_node": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "To Node",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "from_node",
+          "to_node"
+        ],
+        "title": "WorkflowEdge",
+        "type": "object"
+      },
+      "WorkflowLayout": {
+        "additionalProperties": false,
+        "description": "AuthorGraph canvas coordinates only. CompiledGraph system-node\npositions are never persisted and never hashed.",
+        "properties": {
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeLayout"
+            },
+            "maxItems": 100,
+            "title": "Nodes",
+            "type": "array"
+          }
+        },
+        "title": "WorkflowLayout",
+        "type": "object"
+      },
+      "WorkflowNode": {
+        "additionalProperties": false,
+        "description": "Node definition shared by AuthorGraph and CompiledGraph.\n\nCarries no run status and no canvas position. ``candidate`` fields are\nauthor-editable proposals; ``effective_*`` / ``policy_risk_floor`` /\n``requires_changeset_approval`` / ``test_kind`` / ``test_argv`` are\ncompiler-only and are rejected by DraftValidator on author input.",
+        "properties": {
+          "allowed_commands_candidate": {
+            "items": {
+              "items": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            },
+            "maxItems": 50,
+            "title": "Allowed Commands Candidate",
+            "type": "array"
+          },
+          "allowed_files_candidate": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 500,
+            "title": "Allowed Files Candidate",
+            "type": "array"
+          },
+          "assigned_agent": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Assigned Agent"
+          },
+          "assignment_mode": {
+            "$ref": "#/components/schemas/AssignmentMode",
+            "default": "auto"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "effective_allowed_commands": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Effective Allowed Commands"
+          },
+          "effective_allowed_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Effective Allowed Files"
+          },
+          "effective_new_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Effective New Files"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "if_condition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IfCondition"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "instruction": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Instruction"
+          },
+          "new_files_candidate": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "New Files Candidate",
+            "type": "array"
+          },
+          "node_type": {
+            "$ref": "#/components/schemas/NodeType"
+          },
+          "policy_risk_floor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RiskLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "recommended_agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentRecommendation"
+            },
+            "maxItems": 50,
+            "title": "Recommended Agents",
+            "type": "array"
+          },
+          "requires_changeset_approval": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Requires Changeset Approval"
+          },
+          "requires_write": {
+            "default": false,
+            "title": "Requires Write",
+            "type": "boolean"
+          },
+          "resolved_agent_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resolved Agent Id"
+          },
+          "resolved_agent_spec_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resolved Agent Spec Sha256"
+          },
+          "risk_level_hint": {
+            "$ref": "#/components/schemas/RiskLevel",
+            "default": "L1"
+          },
+          "source_node_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Node Id"
+          },
+          "system_managed": {
+            "default": false,
+            "title": "System Managed",
+            "type": "boolean"
+          },
+          "system_rule_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "System Rule Id"
+          },
+          "task_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "test_argv": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 4096,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Test Argv"
+          },
+          "test_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TestKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "title": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "node_type",
+          "title"
+        ],
+        "title": "WorkflowNode",
+        "type": "object"
+      },
+      "WorkflowSaveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "author_graph": {
+            "$ref": "#/components/schemas/AuthorGraph"
+          },
+          "expected_semantic_version": {
+            "minimum": 0,
+            "title": "Expected Semantic Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "author_graph",
+          "expected_semantic_version"
+        ],
+        "title": "WorkflowSaveRequest",
+        "type": "object"
+      },
+      "WorkflowSaveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "semantic_version": {
+            "minimum": 1,
+            "title": "Semantic Version",
+            "type": "integer"
+          },
+          "workflow_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id",
+          "semantic_version"
+        ],
+        "title": "WorkflowSaveResponse",
+        "type": "object"
+      },
+      "WsTicketResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_in_seconds": {
+            "maximum": 300,
+            "minimum": 1,
+            "title": "Expires In Seconds",
+            "type": "integer"
+          },
+          "ticket": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Ticket",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket",
+          "expires_in_seconds"
+        ],
+        "title": "WsTicketResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Frozen v1 request/response data contracts (HUB-010). Paths and security schemes are added by HUB-400 when the FastAPI routes exist; only component schemas are frozen here.",
+    "title": "Agent Hub API (phase-0 data contract draft)",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {},
+  "x-agent-hub-contract-version": "1"
+}
