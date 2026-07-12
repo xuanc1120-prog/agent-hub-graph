@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Create venv
+        run: uv venv .venv --python ${{ matrix.python-version }}
+
+      - name: Sync locked dependencies
+        run: uv pip sync requirements.lock --python .venv
+
+      - name: Install project (editable, no-deps)
+        run: uv pip install -e . --no-deps --python .venv
+
+      - name: Ruff check
+        run: .venv/bin/python -m ruff check .
+
+      - name: Ruff format
+        run: .venv/bin/python -m ruff format --check .
+
+      - name: Pytest
+        run: .venv/bin/python -m pytest
+
+      - name: pip-audit
+        run: .venv/bin/python -m pip_audit -r requirements.lock --strict --desc
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: npm audit
+        run: npm audit --audit-level=high
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright smoke tests
+        run: npx playwright test --project=smoke

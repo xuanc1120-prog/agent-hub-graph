@@ -31,14 +31,40 @@ npm run dev
 
 ## Verification
 
+Run the full CI suite locally (creates `.venv`, does not modify your environment):
+
 ```powershell
+# Windows (PowerShell) — default
+scripts\ci.ps1
+
+# WSL / macOS / Linux
+bash scripts/ci.sh
+```
+
+Or run individual checks manually:
+
+```powershell
+# Python (inside activated .venv)
+uv pip sync requirements.lock
+uv pip install -e . --no-deps
+python -m ruff check .
+python -m ruff format --check .
 python -m pytest
-ruff check .
-ruff format --check .
+python -m pip_audit -r requirements.lock --strict --desc
+
+# Frontend
 cd web\frontend
+npm ci
 npm run lint
 npm run test
 npm run build
+npm audit --audit-level=high
+npx playwright install chromium
+npx playwright test --project=smoke
 ```
+
+The CI script and `.github/workflows/ci.yml` run the same checks. Both create
+an isolated venv with `uv venv`, sync dependencies from `requirements.lock`,
+and install the project with `--no-deps` to avoid re-resolving.
 
 See `agent-hub-development-plan.md` for the architecture and `agent-hub-task-allocation.md` for task ownership.
