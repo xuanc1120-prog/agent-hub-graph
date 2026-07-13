@@ -18,7 +18,7 @@ $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 
 # ── Python ──────────────────────────────────────────────────────────────────
 Write-Host "=== Create project venv (.venv) ==="
-Invoke-Checked { uv venv $VenvDir --python $Python --force }
+Invoke-Checked { uv venv $VenvDir --python $Python --clear }
 
 Write-Host "=== Sync locked dependencies ==="
 Invoke-Checked { uv pip sync requirements.lock --python $VenvPython }
