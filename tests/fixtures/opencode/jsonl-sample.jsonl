@@ -1,0 +1,5 @@
+{"_metadata": {"is_synthetic": true, "schema_unverified": true, "description": "Generic JSONL parser fixture - NOT verified against OpenCode 1.2.27 event schema"}}
+{"event_type": "session_start", "timestamp": "2026-07-12T00:00:00Z", "data": {"session_id": "test-session-001", "model": "gpt-4", "mode": "legacy"}}
+{"event_type": "message", "timestamp": "2026-07-12T00:00:01Z", "data": {"role": "user", "content": "Hello, this is a test message"}}
+{"event_type": "message", "timestamp": "2026-07-12T00:00:02Z", "data": {"role": "assistant", "content": "Hello! I'm here to help."}}
+{"event_type": "session_end", "timestamp": "2026-07-12T00:00:03Z", "data": {"session_id": "test-session-001", "status": "completed"}}

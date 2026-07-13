@@ -1,0 +1,358 @@
+{
+  "version": "1.0.0",
+  "tool": "opencode",
+  "binary": {
+    "name": "opencode (npm global)",
+    "version": "1.2.27",
+    "launcher_sha256": "20de2c645b49ea89e8e9448932e8fcdfadf978f2b00bb661d6f6b1fbadb8a2a7",
+    "entrypoint_sha256": "3ab08cfdb3cf1213eaeae45f557fb3220e0999862d8dc90eb17ba4cacf97c57b",
+    "native_binary_sha256": "dc9c7a2f97101329459fc46500913cc0c9d6514c39a6820fc720423ad04823b4",
+    "startup_chain_complete": true,
+    "probe_status": {
+      "binary_found": true,
+      "version_detected": true,
+      "success_rate": 0.8571428571428571
+    }
+  },
+  "capabilities": {
+    "json_output": true,
+    "pure_mode": false,
+    "directory_selection": true,
+    "legacy_mode": true,
+    "requires_explicit_opt_in": true,
+    "probe_status": {
+      "binary_found": true,
+      "version_detected": true,
+      "help_parsed": true,
+      "run_help_parsed": true,
+      "json_support_detected": true,
+      "pure_support_detected": false,
+      "dir_support_detected": true
+    }
+  },
+  "commands": [
+    {
+      "command": "completion",
+      "description": "generate shell completion script"
+    },
+    {
+      "command": "acp",
+      "description": "start ACP (Agent Client Protocol) server"
+    },
+    {
+      "command": "mcp",
+      "description": "manage MCP (Model Context Protocol) servers"
+    },
+    {
+      "command": "[project]",
+      "description": "start opencode tui"
+    },
+    {
+      "command": "attach",
+      "description": "<url>        attach to a running opencode server"
+    },
+    {
+      "command": "run",
+      "description": "[message..]     run opencode with a message"
+    },
+    {
+      "command": "debug",
+      "description": "debugging and troubleshooting tools"
+    },
+    {
+      "command": "providers",
+      "description": "manage AI providers and credentials"
+    },
+    {
+      "command": "agent",
+      "description": "manage agents"
+    },
+    {
+      "command": "upgrade",
+      "description": "[target]    upgrade opencode to the latest or a specific version"
+    },
+    {
+      "command": "uninstall",
+      "description": "uninstall opencode and remove all related files"
+    },
+    {
+      "command": "serve",
+      "description": "starts a headless opencode server"
+    },
+    {
+      "command": "web",
+      "description": "start opencode server and open web interface"
+    },
+    {
+      "command": "models",
+      "description": "[provider]   list all available models"
+    },
+    {
+      "command": "stats",
+      "description": "show token usage and cost statistics"
+    },
+    {
+      "command": "export",
+      "description": "[sessionID]  export session data as JSON"
+    },
+    {
+      "command": "import",
+      "description": "<file>       import session data from JSON file or URL"
+    },
+    {
+      "command": "github",
+      "description": "manage GitHub agent"
+    },
+    {
+      "command": "pr",
+      "description": "<number>         fetch and checkout a GitHub PR branch, then run opencode"
+    },
+    {
+      "command": "session",
+      "description": "manage sessions"
+    },
+    {
+      "command": "db",
+      "description": "database tools"
+    }
+  ],
+  "options": {
+    "global": [
+      {
+        "option": "--help",
+        "description": "show help",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--version",
+        "description": "show version number",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--print-logs",
+        "description": "print logs to stderr",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--log-level",
+        "description": "log level  [choices: \"DEBUG\", \"INFO\", \"WARN\", \"ERROR\"]",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--port",
+        "description": "port to listen on",
+        "type": "number",
+        "default": " 0"
+      },
+      {
+        "option": "--hostname",
+        "description": "hostname to listen on",
+        "type": "string",
+        "default": " \"127.0.0.1\""
+      },
+      {
+        "option": "--mdns",
+        "description": "enable mDNS service discovery (defaults hostname to 0.0.0.0)",
+        "type": "",
+        "default": ""
+      },
+      {
+        "option": "--mdns-domain",
+        "description": "custom domain name for mDNS service (default: opencode.local)",
+        "type": "",
+        "default": ""
+      },
+      {
+        "option": "--cors",
+        "description": "additional domains to allow for CORS  ]",
+        "type": "array",
+        "default": " ["
+      },
+      {
+        "option": "--model",
+        "description": "model to use in the format of provider/model",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--continue",
+        "description": "continue the last session",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--session",
+        "description": "session id to continue",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--fork",
+        "description": "fork the session when continuing (use with --continue or --session)",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--prompt",
+        "description": "prompt to use",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--agent",
+        "description": "agent to use",
+        "type": "string",
+        "default": ""
+      }
+    ],
+    "run": [
+      {
+        "option": "--help",
+        "description": "show help",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--version",
+        "description": "show version number",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--print-logs",
+        "description": "print logs to stderr",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--log-level",
+        "description": "log level  [choices: \"DEBUG\", \"INFO\", \"WARN\", \"ERROR\"]",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--command",
+        "description": "the command to run, use message for args",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--continue",
+        "description": "continue the last session",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--session",
+        "description": "session id to continue",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--fork",
+        "description": "fork the session before continuing (requires --continue or --session)",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--share",
+        "description": "share the session",
+        "type": "boolean",
+        "default": ""
+      },
+      {
+        "option": "--model",
+        "description": "model to use in the format of provider/model",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--agent",
+        "description": "agent to use",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--format",
+        "description": "format: default (formatted) or json (raw JSON events)",
+        "type": "",
+        "default": ""
+      },
+      {
+        "option": "--file",
+        "description": "file(s) to attach to message",
+        "type": "array",
+        "default": ""
+      },
+      {
+        "option": "--title",
+        "description": "title for the session (uses truncated prompt if no value provided)",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--attach",
+        "description": "attach to a running opencode server (e.g., http://localhost:4096)",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--password",
+        "description": "basic auth password (defaults to OPENCODE_SERVER_PASSWORD)",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--dir",
+        "description": "directory to run in, path on remote server if attaching",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "option": "--port",
+        "description": "port for the local server (defaults to random port if no value provided)",
+        "type": "number",
+        "default": ""
+      },
+      {
+        "option": "--variant",
+        "description": "model variant (provider-specific reasoning effort, e.g., high, max, minimal)",
+        "type": "",
+        "default": ""
+      },
+      {
+        "option": "--thinking",
+        "description": "show thinking blocks",
+        "type": "boolean",
+        "default": " false"
+      }
+    ]
+  },
+  "output_framing": {
+    "json_events": true,
+    "default_format": "formatted"
+  },
+  "exit_behavior": {
+    "timeout_seconds": 300,
+    "cancel_support": "unverified",
+    "process_tree_kill": "unverified"
+  },
+  "json_run_evidence": {
+    "attempted": false,
+    "success": false,
+    "skip_reason": "JSON run not attempted (use attempt_json_run=True for integration)",
+    "is_synthetic": true,
+    "event_count": 0
+  },
+  "compatibility": {
+    "version": "1.2.27",
+    "pure_support": false,
+    "legacy_support": true,
+    "recommended_mode": "none",
+    "requires_explicit_opt_in": true
+  }
+}

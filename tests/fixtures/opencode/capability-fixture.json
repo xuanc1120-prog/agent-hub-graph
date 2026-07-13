@@ -1,0 +1,133 @@
+{
+  "metadata": {
+    "generated_by": "HUB-030 capability spike",
+    "generated_at": "2026-07-12T00:00:00Z",
+    "is_synthetic": true,
+    "description": "Synthetic fixture for OpenCode CLI capability testing",
+    "version": "1.1.0"
+  },
+  "version_check": {
+    "command": ["opencode", "--version"],
+    "exit_code": 0,
+    "output": "1.2.27",
+    "notes": "Version 1.2.27 lacks --pure mode support"
+  },
+  "help_check": {
+    "command": ["opencode", "--help"],
+    "exit_code": 0,
+    "output_contains": [
+      "Commands:",
+      "Options:",
+      "opencode run [message..]",
+      "--format",
+      "json"
+    ],
+    "notes": "Help text shows available commands and options"
+  },
+  "run_help_check": {
+    "command": ["opencode", "run", "--help"],
+    "exit_code": 0,
+    "output_contains": [
+      "--format",
+      "json",
+      "--dir",
+      "--continue",
+      "--session"
+    ],
+    "notes": "Run command supports JSON output and directory selection"
+  },
+  "json_output_support": {
+    "supported": true,
+    "format_flag": "--format",
+    "json_value": "json",
+    "notes": "JSON output is supported via --format json flag"
+  },
+  "pure_mode_support": {
+    "supported": false,
+    "notes": "Version 1.2.27 does not support --pure mode, legacy mode is default"
+  },
+  "directory_selection": {
+    "supported": true,
+    "flag": "--dir",
+    "notes": "Can specify working directory with --dir flag"
+  },
+  "json_run_attempt": {
+    "attempted": true,
+    "success": false,
+    "skip_reason": "No API credentials found in environment",
+    "is_synthetic": false,
+    "notes": "Actual run attempted but skipped due to missing credentials"
+  },
+  "json_event_samples": {
+    "is_synthetic": true,
+    "samples": [
+      {
+        "event_type": "session_start",
+        "timestamp": "2026-07-12T00:00:00Z",
+        "data": {
+          "session_id": "test-session-001",
+          "model": "gpt-4",
+          "mode": "legacy"
+        }
+      },
+      {
+        "event_type": "message",
+        "timestamp": "2026-07-12T00:00:01Z",
+        "data": {
+          "role": "user",
+          "content": "Hello, this is a test message"
+        }
+      },
+      {
+        "event_type": "message",
+        "timestamp": "2026-07-12T00:00:02Z",
+        "data": {
+          "role": "assistant",
+          "content": "Hello! I'm here to help."
+        }
+      },
+      {
+        "event_type": "session_end",
+        "timestamp": "2026-07-12T00:00:03Z",
+        "data": {
+          "session_id": "test-session-001",
+          "status": "completed"
+        }
+      }
+    ],
+    "notes": "Synthetic JSON event samples for parsing validation"
+  },
+  "json_parsing_test": {
+    "is_synthetic": true,
+    "test_cases": [
+      {
+        "input": "{\"event_type\": \"test\", \"data\": {}}",
+        "expected": true,
+        "description": "Valid JSON object"
+      },
+      {
+        "input": "not json",
+        "expected": false,
+        "description": "Invalid JSON"
+      },
+      {
+        "input": "{\"event_type\": \"message\", \"content\": \"Hello\"}",
+        "expected": true,
+        "description": "JSON with nested data"
+      }
+    ],
+    "notes": "Test cases for JSON parsing validation"
+  },
+  "compatibility_verdict": {
+    "version": "1.2.27",
+    "legacy_mode_required": true,
+    "pure_mode_available": false,
+    "recommended_configuration": {
+      "mode": "none",
+      "format": "json",
+      "timeout_seconds": 300
+    },
+    "requires_explicit_opt_in": true,
+    "notes": "Legacy mode available but requires explicit opt-in, never recommended"
+  }
+}
