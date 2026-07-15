@@ -1,6 +1,18 @@
 # Agent Hub
 
-Agent Hub is a local visual orchestration demo for coding agents. The repository currently contains the `HUB-000` project baseline; core protocol schemas are intentionally reserved for `HUB-010`.
+Agent Hub is a local visual orchestration demo for coding agents. It combines deterministic workflow execution with a visual AuthorGraph/CompiledGraph model, bounded planner input, auditable agent routing, and local-first storage.
+
+## Project Status
+
+Development is in stage 1. The repository currently includes:
+
+- frozen v1 protocol contracts for workflows, tasks, events, approvals, and artifacts;
+- SQLite migrations, compare-and-swap repositories, idempotency, and fenced leases;
+- deterministic bugfix, feature, refactor, and docs planners with explicit fallback evidence;
+- capability-based agent routing and workflow lineage metadata;
+- CI, dependency audits, frontend contract fixtures, and Playwright smoke coverage.
+
+The Compiler/Executor/MockAgent vertical slice and the full React Flow experience are not implemented yet. See `agent-hub-task-allocation.md` for the live task board.
 
 ## Prerequisites
 

@@ -30,6 +30,7 @@ agent-hub.db*
 # Editors and operating systems
 .idea/
 .vscode/
+.claude/worktrees/
 .DS_Store
 Thumbs.db
 
