@@ -2,7 +2,7 @@
 
 ## 当前执行基线（2026-07-12）
 
-协议基线为提交 `ec0d9c8`，已打标签 `contracts-frozen-v1`；项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
+协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
 | 任务 | 状态 | 说明 |
 |---|---|---|

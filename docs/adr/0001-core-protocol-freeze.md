@@ -181,7 +181,7 @@ semantic field changes. They are called out here for Codex review:
    text through a condition. `TaskPackage`/`ContextPack.effective_allowed_commands`
    now use `CommandTemplate` instead of bare `list[list[str]]`.
 
-## Corrections applied after the first freeze review (Codex on `f08fccf`)
+## Corrections applied after the first HUB-010 freeze review by Codex
 
 1. **Required text restored.** `NodeSummary.summary`,
    `NextSuggestion.reason`, `PrivilegeRequestProposal.reason` and
