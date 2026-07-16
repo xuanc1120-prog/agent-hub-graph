@@ -1,6 +1,6 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
-## 当前执行基线（2026-07-12）
+## 当前执行基线（2026-07-16）
 
 协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
@@ -8,28 +8,24 @@
 |---|---|---|
 | HUB-000 | completed | Git、Python/Vite、配置、锁文件和基础测试已提交 |
 | HUB-010 | completed | v1 核心协议已冻结并打 `contracts-frozen-v1` 标签 |
-| HUB-020 | ready | Hermes 完成 CI、Playwright 基线和 fixture 收尾 |
-| HUB-030 | ready | OpenCode 完成本机 CLI capability spike |
-| HUB-100 | ready | Codex 实现 SQLite、Repository、CAS、idempotency 和 lease |
-| HUB-120 | ready | Claude Code 实现 Planner、Router、lineage/fallback 和 fixture contract smoke |
-| HUB-110 | blocked | 等待 HUB-100；最终集成还需要 HUB-120/HUB-130 输出 |
-| HUB-130 | blocked | 等待 HUB-100 的 DB/Artifact 元数据边界 |
+| HUB-020 | completed | CI、Playwright、锁文件和依赖审计已集成 |
+| HUB-030 | completed | OpenCode 1.2.27 capability spike 和兼容性 manifest 已集成 |
+| HUB-100 | completed | SQLite、Repository、CAS、idempotency 和 fencing lease 已集成 |
+| HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
+| HUB-130 | ready | Hermes 的 Context/Artifact/Event 独立简报、分支和 worktree 已准备 |
+| HUB-110 | blocked | 等待 HUB-130 审查合并后冻结其消费接口 |
 
-下一开发波次同时启动 `HUB-020 / HUB-030 / HUB-100 / HUB-120`。所有任务必须从本次 next-wave preparation commit 建立独立 worktree，并记录实际 base commit；不得直接在 `main` 开发。推荐合并顺序为：
+当前开发波次只启动 `HUB-130`。它必须从最新 `main` 建立新的 task-specific worktree 并记录实际 base commit；历史重写前的旧 Agent worktree 只保留任务证据，不得继续开发。后续顺序为：
 
 ```text
-HUB-020 / HUB-030
-        ↓
-HUB-100
-        ↓
-HUB-120 / HUB-130
-        ↓
-HUB-110
+HUB-130（Hermes）
+        ↓ Codex 审查并集成
+HUB-110（Codex）
         ↓
 阶段 1 CLI + Mock workflow 集成验收
 ```
 
-本波次可执行任务简报位于 `development-tasks/next-wave/`。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+本波次可执行任务简报位于 `development-tasks/next-wave/HUB-130-hermes.md`，可复制提示词位于 `development-tasks/handoffs/HUB-130-hermes-prompt.md`。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。`HUB-110` 不提前创建实现分支，必须等待 `HUB-130` 的 API 和失败语义通过审查。
 
 ## 1. 项目定位
 

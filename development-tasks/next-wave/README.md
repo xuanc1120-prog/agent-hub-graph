@@ -1,29 +1,28 @@
-# Next Wave Execution
+# 当前开发波次
 
-## Baseline
+## 基线
 
-- Protocol tag: `contracts-frozen-v1`
-- Preparation base: use the pre-created worktree HEAD and record `git rev-parse HEAD`
-- Integration branch: `main`
-- Agents do not merge or push
+- 集成分支：`main`
+- 冻结协议：`contracts-frozen-v1`
+- 当前已完成：`HUB-000/010/020/030/100/120`
+- 当前任务：`HUB-130`
+- 后续任务：`HUB-110`，必须等待 `HUB-130` 审查合并
+- Agent 不直接 merge 或 push
 
-## Parallel Start
+## 当前分配
 
-| Task | Agent | Branch | Worktree |
-|---|---|---|---|
-| HUB-020 | Hermes + MiMo-V2.5-Pro | `agent/hermes-qa-support` | `E:\agent_hub_worktrees\hermes-qa-support` |
-| HUB-030 | OpenCode + MiMo-V2.5-Pro | `agent/opencode-adapter` | `E:\agent_hub_worktrees\opencode-adapter` |
-| HUB-100 | Codex + GPT-5.6 xhigh | `agent/codex-runtime-security` | `E:\agent_hub_worktrees\codex-runtime-security` |
-| HUB-120 | Claude Code + Claude Opus 4.8 | `agent/claude-architecture-ui` | `E:\agent_hub_worktrees\claude-architecture-ui` |
+| 任务 | Agent | 状态 | 分支 | Worktree | 简报 |
+|---|---|---|---|---|---|
+| `HUB-130` | Hermes + MiMo-V2.5-Pro | ready | `agent/hermes-context-artifacts` | `E:\agent_hub_worktrees\hermes-context-artifacts` | [HUB-130-hermes.md](HUB-130-hermes.md) |
+| `HUB-110` | Codex + GPT-5.6 xhigh | blocked | 合并 HUB-130 后新建 | 合并 HUB-130 后新建 | 待 HUB-130 API 审查后冻结 |
 
-Each Agent receives only its matching brief. Before editing it must confirm the branch, clean worktree, base commit, owned paths and frozen tag.
+可直接发送给 Hermes 的提示词见 [HUB-130 handoff](../handoffs/HUB-130-hermes-prompt.md)。
 
-## Integration Order
+## 执行顺序
 
-1. Review and merge HUB-020/HUB-030 independently.
-2. Claude Code reviews HUB-100 concurrency and lease behavior; Codex merges it.
-3. Start HUB-130 from the merged HUB-100 base.
-4. Codex reviews and merges HUB-120/HUB-130.
-5. Start HUB-110 and run the stage 1 CLI/Mock vertical-slice gate.
+1. Hermes 在独立 worktree 完成 `HUB-130`，只提交一次，不 push。
+2. Codex 审查 Artifact/Event 原子性、Context 权限不扩张和平台文件权限。
+3. Codex 将通过审查的提交集成到 `main` 并运行组合 CI。
+4. 依据已集成 API 编写并启动 `HUB-110`，完成阶段 1 CLI/Mock 纵向闭环。
 
-Do not start HUB-110 or HUB-130 from an older base. Do not modify `protocol/` after the freeze tag without a new accepted ADR.
+历史上的 `agent/*` worktree 基于公开历史重写前的提交，只作为旧任务证据，不能直接用于新开发。新任务必须从最新 `main` 创建 task-specific branch/worktree，并在交付报告中记录实际 base commit。

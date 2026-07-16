@@ -57,7 +57,7 @@ flowchart LR
 | `HUB-030` | 已完成 | OpenCode 1.2.27 capability manifest 与兼容性报告 |
 | `HUB-100` | 已完成 | SQLite、Repository、CAS、幂等与 fencing lease |
 | `HUB-120` | 已完成 | RuleBasedPlanner、AgentRouter、fallback 与 lineage |
-| `HUB-130` | 下一项 | ContextPack、ArtifactStore 与 EventRegistry |
+| `HUB-130` | 已准备 | ContextPack、ArtifactStore 与 EventRegistry；[执行简报](development-tasks/next-wave/HUB-130-hermes.md) |
 | `HUB-110` | 待执行 | Compiler、Executor 与 MockAgent 纵向闭环 |
 
 当前仓库已经具备协议、存储、规划、路由和工程验证基础，但以下部分尚未完成：
@@ -68,7 +68,7 @@ flowchart LR
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。当前可直接发送给 Hermes 的 [HUB-130 交接提示词](development-tasks/handoffs/HUB-130-hermes-prompt.md) 已准备完成。
 
 ## 技术栈
 
