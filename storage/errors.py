@@ -29,3 +29,31 @@ class LeaseLost(StorageError):
 
 class UnsupportedSchemaVersion(StorageError):
     """The database schema is newer than this process understands."""
+
+
+class PathEscapeError(StorageError):
+    """A path attempted to escape the allowed containment directory."""
+
+
+class QuotaExceeded(StorageError):
+    """A storage quota (per-artifact or per-session) would be exceeded."""
+
+
+class ArtifactNotFound(StorageError):
+    """The requested artifact does not exist in the repository."""
+
+
+class ContainmentViolation(StorageError):
+    """An artifact fails containment, hash, size, or redaction checks."""
+
+
+class PermissionError_(StorageError):
+    """Platform file permission enforcement failed."""
+
+
+class EventPayloadError(StorageError):
+    """An event payload failed registry validation or size checks."""
+
+
+class BundleError(StorageError):
+    """A TaskContextBundle operation failed."""
