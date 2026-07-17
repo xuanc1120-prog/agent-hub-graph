@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的测试、Context/Artifact 和交付保障负责人。重点是把计划中的安全与恢复承诺变成可重复测试。
 
-当前任务：`HUB-130`，执行简报见 `development-tasks/next-wave/HUB-130-hermes.md`，可直接发送的交接提示词见 `development-tasks/handoffs/HUB-130-hermes-prompt.md`。
+`HUB-130` 已完成并集成。下一任务为 `HUB-220`，需等待 `HUB-200` 的 Workspace/Guard 实现后启动。
 
 ## 高级任务
 
