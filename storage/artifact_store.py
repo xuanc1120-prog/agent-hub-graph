@@ -28,7 +28,12 @@ from pathlib import Path
 from pydantic import TypeAdapter
 
 from protocol import ArtifactType, EntityId
-from storage.errors import PathEscapeError, PermissionError_, QuotaExceeded
+from storage.errors import (
+    ArtifactCleanupRequired,
+    PathEscapeError,
+    PermissionError_,
+    QuotaExceeded,
+)
 
 _ENTITY_ID = TypeAdapter(EntityId)
 _ARTIFACT_TYPE = TypeAdapter(ArtifactType)
@@ -45,6 +50,7 @@ _PUBLISHED = 1
 _ROLLED_BACK = 2
 _DISCARDED = 3
 _FINALIZED = 4
+_CLEANUP_REQUIRED = 5
 
 
 def _validate_entity_id(value: str, label: str) -> str:
@@ -155,6 +161,24 @@ def _write_fully(fd: int, content: bytes) -> None:
         offset += written
 
 
+def _unlink_path_entry(path: Path) -> bool:
+    """Remove one path entry without following a symlink or reparse point."""
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+
+    if _is_reparse_or_symlink(path):
+        if stat.S_ISDIR(path_stat.st_mode):
+            os.rmdir(path)
+        else:
+            path.unlink()
+    else:
+        _restore_write_permissions(path)
+        path.unlink()
+    return True
+
+
 class ArtifactStore:
     """Manages atomic artifact file writes under a containment root.
 
@@ -173,7 +197,7 @@ class ArtifactStore:
         self._base = base_dir.expanduser().resolve(strict=False)
         self._max_artifact_bytes = max_artifact_bytes
         self._token = object()  # per-instance, not guessable
-        self._lock = threading.Lock()  # protects rollback state transitions
+        self._lock = threading.Lock()
         self._base.mkdir(parents=True, exist_ok=True)
         _set_private_permissions(self._base, directory=True)
 
@@ -272,10 +296,113 @@ class ArtifactStore:
         if staged._state not in allowed:
             raise PathEscapeError(f"{operation}: invalid handle state")
 
+    def _verify_linked_pair_locked(self, staged: TempWriteResult, final: Path) -> None:
+        """Verify the staged and final names still reference the expected bytes."""
+        _check_containment_path(staged.tmp_path, self._base)
+        _check_containment_path(final, self._base)
+        if _is_reparse_or_symlink(staged.tmp_path):
+            raise PathEscapeError(f"staged temp is symlink/reparse: {staged.tmp_path}")
+        if _is_reparse_or_symlink(final):
+            raise PathEscapeError(f"published final is symlink/reparse: {final}")
+
+        try:
+            temp_stat = staged.tmp_path.lstat()
+            final_stat = final.lstat()
+        except OSError as exc:
+            raise PathEscapeError(f"cannot stat linked artifact: {exc}") from exc
+        if not stat.S_ISREG(temp_stat.st_mode) or not stat.S_ISREG(final_stat.st_mode):
+            raise PathEscapeError("staged temp and published final must be regular files")
+        try:
+            same_file = staged.tmp_path.samefile(final)
+        except OSError as exc:
+            raise PathEscapeError(f"cannot verify linked artifact identity: {exc}") from exc
+        if not same_file:
+            raise PathEscapeError("published final no longer references the staged file")
+
+        final_data = final.read_bytes()
+        if len(final_data) != staged.size_bytes:
+            raise PathEscapeError(
+                f"published size changed: expected {staged.size_bytes}, got {len(final_data)}"
+            )
+        actual_hash = sha256(final_data).hexdigest()
+        if actual_hash != staged.sha256:
+            raise PathEscapeError(
+                f"published hash changed: expected {staged.sha256}, got {actual_hash}"
+            )
+
+        try:
+            if not staged.tmp_path.samefile(final):
+                raise PathEscapeError("published final identity changed during verification")
+        except OSError as exc:
+            raise PathEscapeError(
+                f"published final disappeared during verification: {exc}"
+            ) from exc
+
+    def _verify_published_final_locked(self, staged: TempWriteResult, final: Path) -> None:
+        _check_containment_path(final, self._base)
+        if _is_reparse_or_symlink(final):
+            raise PathEscapeError(f"published final is symlink/reparse: {final}")
+        try:
+            final_stat = final.lstat()
+        except OSError as exc:
+            raise PathEscapeError(f"published final is missing: {final}") from exc
+        if not stat.S_ISREG(final_stat.st_mode):
+            raise PathEscapeError(f"published final is not a regular file: {final}")
+        if final_stat.st_nlink != 1:
+            raise PathEscapeError(
+                f"published final has unexpected link count: {final_stat.st_nlink}"
+            )
+        final_data = final.read_bytes()
+        if len(final_data) != staged.size_bytes or sha256(final_data).hexdigest() != staged.sha256:
+            raise PathEscapeError("published final content does not match staged metadata")
+
+    def _mark_cleanup_required(
+        self,
+        staged: TempWriteResult,
+        cleanup_error: BaseException,
+        operation_error: BaseException,
+    ) -> ArtifactCleanupRequired:
+        object.__setattr__(staged, "_state", _CLEANUP_REQUIRED)
+        error = ArtifactCleanupRequired(
+            f"artifact cleanup required for {staged._artifact_type}/{staged._artifact_id}: "
+            f"{cleanup_error}"
+        )
+        error.add_note(f"original artifact operation failed: {operation_error!r}")
+        return error
+
+    @staticmethod
+    def _cleanup_error(
+        staged: TempWriteResult,
+        cleanup_error: BaseException,
+        operation_error: BaseException,
+    ) -> ArtifactCleanupRequired:
+        error = ArtifactCleanupRequired(
+            f"artifact cleanup required for {staged._artifact_type}/{staged._artifact_id}: "
+            f"{cleanup_error}"
+        )
+        error.add_note(f"original artifact operation failed: {operation_error!r}")
+        return error
+
+    def _rollback_failed_publish_locked(
+        self,
+        staged: TempWriteResult,
+        final: Path,
+        operation_error: BaseException,
+    ) -> None:
+        try:
+            _unlink_path_entry(final)
+        except BaseException as cleanup_error:
+            raise self._mark_cleanup_required(
+                staged, cleanup_error, operation_error
+            ) from cleanup_error
+        object.__setattr__(staged, "_state", _ROLLED_BACK)
+
     def publish(self, staged: TempWriteResult) -> None:
         """Atomic no-overwrite publish: hardlink temp → final, unlink temp.
 
-        ALL I/O is inside the store lock to prevent TOCTOU on hash/size.
+        The staged name is retained until the linked final passes identity,
+        type, hash and size verification.  Any failure after linking removes
+        the final or transitions the handle to CLEANUP_REQUIRED.
         Valid from: STAGED.  Transitions to: PUBLISHED.
         """
         if staged._token is not self._token:
@@ -303,25 +430,33 @@ class ArtifactStore:
             if sha256(actual_data).hexdigest() != staged.sha256:
                 raise PathEscapeError(f"temp hash changed: expected {staged.sha256}")
 
+            linked = False
             try:
                 os.link(str(staged.tmp_path), str(final))
-            except FileExistsError:
+                linked = True
+                self._verify_linked_pair_locked(staged, final)
                 self._cleanup_temp(staged)
+                self._verify_published_final_locked(staged, final)
+            except FileExistsError:
+                try:
+                    self._cleanup_temp(staged)
+                except BaseException as cleanup_error:
+                    duplicate_error = PathEscapeError(
+                        f"artifact already exists: {final}; immutable, cannot overwrite"
+                    )
+                    raise self._cleanup_error(staged, cleanup_error, duplicate_error) from (
+                        cleanup_error
+                    )
+                object.__setattr__(staged, "_state", _DISCARDED)
                 raise PathEscapeError(
                     f"artifact already exists: {final}; immutable, cannot overwrite"
                 ) from None
-            except OSError as exc:
-                self._cleanup_temp(staged)
-                raise PathEscapeError(f"publish link failed: {exc}") from exc
-
-            self._cleanup_temp(staged)
-
-            # Post-publish check inside lock
-            if _is_reparse_or_symlink(final):
-                _restore_write_permissions(final)
-                final.unlink()
-                object.__setattr__(staged, "_state", _ROLLED_BACK)
-                raise PathEscapeError(f"post-publish symlink/reparse detected: {final}")
+            except BaseException as operation_error:
+                if linked:
+                    self._rollback_failed_publish_locked(staged, final, operation_error)
+                if isinstance(operation_error, PathEscapeError):
+                    raise
+                raise PathEscapeError(f"publish failed: {operation_error}") from operation_error
 
             object.__setattr__(staged, "_state", _PUBLISHED)
 
@@ -341,9 +476,13 @@ class ArtifactStore:
             if staged._state == _PUBLISHED:
                 final = self.resolve(staged._artifact_id, staged._artifact_type)
                 if final.exists():
-                    _check_containment_path(final, self._base)
-                    _restore_write_permissions(final)
-                    final.unlink()
+                    try:
+                        _unlink_path_entry(final)
+                    except BaseException as cleanup_error:
+                        operation_error = PathEscapeError("artifact rollback failed")
+                        raise self._mark_cleanup_required(
+                            staged, cleanup_error, operation_error
+                        ) from cleanup_error
                 object.__setattr__(staged, "_state", _ROLLED_BACK)
             elif staged._state == _STAGED:
                 object.__setattr__(staged, "_state", _ROLLED_BACK)
@@ -361,6 +500,8 @@ class ArtifactStore:
         with self._lock:
             if staged._state != _PUBLISHED:
                 raise PathEscapeError("finalize: invalid handle state")
+            final = self.resolve(staged._artifact_id, staged._artifact_type)
+            self._verify_published_final_locked(staged, final)
             object.__setattr__(staged, "_state", _FINALIZED)
 
     def discard_staged(self, staged: TempWriteResult) -> None:
@@ -370,19 +511,66 @@ class ArtifactStore:
         Uses lock to prevent concurrent publish from racing.
         """
         if staged._token is not self._token:
-            return  # Silent no-op for wrong-store handles
+            raise PathEscapeError("discard: handle not from this store")
         with self._lock:
             if staged._state not in {_STAGED, _ROLLED_BACK}:
-                return  # Silent no-op for already-discarded/published/finalized
-            self._cleanup_temp(staged)
+                raise PathEscapeError("discard: invalid handle state")
+            try:
+                self._cleanup_temp(staged)
+            except BaseException as cleanup_error:
+                operation_error = PathEscapeError("staged artifact discard failed")
+                raise self._cleanup_error(staged, cleanup_error, operation_error) from cleanup_error
+            object.__setattr__(staged, "_state", _DISCARDED)
+
+    def abort(self, staged: TempWriteResult) -> None:
+        """Clean a failed create operation according to its current state."""
+        if staged._token is not self._token:
+            raise PathEscapeError("abort: handle not from this store")
+        with self._lock:
+            if staged._state == _FINALIZED:
+                raise PathEscapeError("abort: finalized handle cannot be aborted")
+            if staged._state == _DISCARDED:
+                return
+
+            final_cleanup_error: BaseException | None = None
+            if staged._state in {_PUBLISHED, _CLEANUP_REQUIRED}:
+                try:
+                    final = self.resolve(staged._artifact_id, staged._artifact_type)
+                    _unlink_path_entry(final)
+                except BaseException as cleanup_error:
+                    final_cleanup_error = cleanup_error
+                else:
+                    object.__setattr__(staged, "_state", _ROLLED_BACK)
+
+            try:
+                self._cleanup_temp(staged)
+            except BaseException as cleanup_error:
+                operation_error = PathEscapeError("artifact abort failed")
+                raise self._cleanup_error(staged, cleanup_error, operation_error) from cleanup_error
+
+            if final_cleanup_error is not None:
+                operation_error = PathEscapeError("artifact abort failed")
+                raise self._mark_cleanup_required(
+                    staged, final_cleanup_error, operation_error
+                ) from final_cleanup_error
+
             object.__setattr__(staged, "_state", _DISCARDED)
 
     def _cleanup_temp(self, staged: TempWriteResult) -> None:
         """Remove temp file if it exists."""
         if staged.tmp_path.exists():
+            _check_containment_path(staged.tmp_path, self._base)
+            if _is_reparse_or_symlink(staged.tmp_path):
+                raise PathEscapeError(f"staged temp is symlink/reparse: {staged.tmp_path}")
             _restore_write_permissions(staged.tmp_path)
-            with contextlib.suppress(OSError):
-                staged.tmp_path.unlink(missing_ok=True)
+            staged.tmp_path.unlink(missing_ok=True)
+
+    def delete_orphan(self, artifact_id: str, artifact_type: str) -> bool:
+        """Delete an unreferenced final after the repository checks metadata."""
+        final = self.resolve(artifact_id, artifact_type)
+        with self._lock:
+            _check_containment_path(final, self._base)
+            return _unlink_path_entry(final)
 
     def read_bytes(self, artifact_id: str, artifact_type: str) -> bytes:
         """Read artifact bytes after full containment verification."""
@@ -412,7 +600,7 @@ class ArtifactStore:
         type_dir = self._base / artifact_type
         if not type_dir.exists():
             return 0
-        cutoff = (now or time.time()) - ttl_seconds
+        cutoff = (time.time() if now is None else now) - ttl_seconds
         removed = 0
         for tmp in type_dir.glob(".artifact-*.tmp"):
             try:

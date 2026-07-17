@@ -4,6 +4,7 @@ from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.artifact_store import ArtifactStore, TempWriteResult
 from storage.db import Database, Transaction, normalize_utc, utc_now_text
 from storage.errors import (
+    ArtifactCleanupRequired,
     ArtifactNotFound,
     BundleError,
     ConcurrencyConflict,
@@ -43,6 +44,7 @@ from storage.repositories import (
 )
 
 __all__ = [
+    "ArtifactCleanupRequired",
     "ArtifactNotFound",
     "ArtifactRecord",
     "ArtifactRepository",

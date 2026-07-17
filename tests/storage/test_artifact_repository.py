@@ -7,12 +7,15 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+import storage.artifact_store as artifact_store_module
 from protocol import ArtifactType
 from storage.artifact_repository import ArtifactRepository
-from storage.artifact_store import ArtifactStore
+from storage.artifact_store import _CLEANUP_REQUIRED, ArtifactStore, TempWriteResult
 from storage.db import Database
 from storage.errors import (
+    ArtifactCleanupRequired,
     ArtifactNotFound,
+    ContainmentViolation,
     PathEscapeError,
     QuotaExceeded,
     RecordNotFound,
@@ -314,3 +317,117 @@ class TestReverification:
         )
         assert not record.relative_path.startswith("/")
         assert not record.relative_path.startswith("C:")
+
+
+class TestFailureRecovery:
+    @pytest.mark.asyncio
+    async def test_reconcile_preserves_referenced_artifact(
+        self,
+        repo: ArtifactRepository,
+        session_repo: SessionRepository,
+    ) -> None:
+        await _create_session(session_repo)
+        await repo.create(
+            artifact_id="art-referenced",
+            session_id="sess-001",
+            artifact_type=ArtifactType.LOG,
+            content=b"referenced",
+        )
+
+        assert not await repo.reconcile_orphan("art-referenced", ArtifactType.LOG)
+        _, content = await repo.get_and_verify(
+            "art-referenced",
+            expected_session_id="sess-001",
+        )
+        assert content == b"referenced"
+
+    @pytest.mark.asyncio
+    async def test_relative_path_escape_fails_closed(
+        self,
+        database: Database,
+        session_repo: SessionRepository,
+        tmp_path: Path,
+    ) -> None:
+        class MisreportedBaseStore(ArtifactStore):
+            @property
+            def base_dir(self) -> Path:
+                return super().base_dir / "wrong-base"
+
+        await _create_session(session_repo)
+        store = MisreportedBaseStore(tmp_path / "escape-artifacts")
+        repository = ArtifactRepository(database, store)
+
+        with pytest.raises(ContainmentViolation, match="outside store base"):
+            await repository.create(
+                artifact_id="art-path-escape",
+                session_id="sess-001",
+                artifact_type=ArtifactType.LOG,
+                content=b"data",
+            )
+
+        assert not store.exists("art-path-escape", "log")
+        with pytest.raises(ArtifactNotFound):
+            await repository.get("art-path-escape")
+
+    @pytest.mark.asyncio
+    async def test_post_publish_cleanup_failure_is_reconcilable(
+        self,
+        database: Database,
+        session_repo: SessionRepository,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        class CapturingStore(ArtifactStore):
+            last_handle: TempWriteResult | None = None
+
+            def write_temp(
+                self,
+                artifact_id: str,
+                artifact_type: str,
+                content: bytes,
+            ) -> TempWriteResult:
+                handle = super().write_temp(artifact_id, artifact_type, content)
+                self.last_handle = handle
+                return handle
+
+        await _create_session(session_repo)
+        store = CapturingStore(tmp_path / "cleanup-artifacts")
+        repository = ArtifactRepository(database, store)
+        final = store.resolve("art-cleanup-required", "log")
+        original_check = artifact_store_module._is_reparse_or_symlink
+        original_unlink = Path.unlink
+
+        def injected_check(path: Path) -> bool:
+            if path == final:
+                return True
+            return original_check(path)
+
+        def injected_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == final:
+                raise OSError("forced final unlink failure")
+            original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(artifact_store_module, "_is_reparse_or_symlink", injected_check)
+            scoped.setattr(Path, "unlink", injected_unlink)
+            with pytest.raises(ArtifactCleanupRequired) as caught:
+                await repository.create(
+                    artifact_id="art-cleanup-required",
+                    session_id="sess-001",
+                    artifact_type=ArtifactType.LOG,
+                    content=b"payload",
+                )
+
+        assert any("artifact cleanup failed" in note for note in caught.value.__notes__)
+        assert "cleanup after artifact create failure failed" in caplog.text
+        assert store.last_handle is not None
+        assert store.last_handle._state == _CLEANUP_REQUIRED
+        assert not store.last_handle.tmp_path.exists()
+        assert final.exists()
+        with pytest.raises(ArtifactNotFound):
+            await repository.get("art-cleanup-required")
+
+        assert await repository.reconcile_orphan("art-cleanup-required", ArtifactType.LOG)
+        assert not final.exists()
+        assert not await repository.reconcile_orphan("art-cleanup-required", ArtifactType.LOG)

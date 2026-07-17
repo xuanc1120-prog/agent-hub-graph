@@ -43,6 +43,10 @@ class ArtifactNotFound(StorageError):
     """The requested artifact does not exist in the repository."""
 
 
+class ArtifactCleanupRequired(StorageError):
+    """A failed artifact operation left filesystem cleanup to be retried."""
+
+
 class ContainmentViolation(StorageError):
     """An artifact fails containment, hash, size, or redaction checks."""
 

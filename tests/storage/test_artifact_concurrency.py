@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import storage.artifact_store as artifact_store_module
 from storage.artifact_store import (
     _DISCARDED,
     _FINALIZED,
@@ -121,13 +122,13 @@ class TestCrossStoreIsolation:
         with pytest.raises(PathEscapeError, match="not from this store"):
             store_b.finalize(staged)
 
-    def test_cross_store_discard_noop(self, tmp_path: Path) -> None:
-        """discard on wrong store is silent no-op."""
+    def test_cross_store_discard_rejected(self, tmp_path: Path) -> None:
         store_a = ArtifactStore(tmp_path / "a")
         store_b = ArtifactStore(tmp_path / "b")
         staged = store_a.write_temp("art-001", "log", b"data")
-        store_b.discard_staged(staged)  # Should not raise
-        assert staged._state == _STAGED  # Unchanged
+        with pytest.raises(PathEscapeError, match="not from this store"):
+            store_b.discard_staged(staged)
+        assert staged._state == _STAGED
 
 
 # --- Concurrency -----------------------------------------------------------
@@ -222,6 +223,41 @@ class TestConcurrency:
         with pytest.raises(PathEscapeError, match="invalid handle state"):
             store.publish(staged)
 
+    def test_publish_and_discard_have_one_winner(self, store: ArtifactStore) -> None:
+        staged = store.write_temp("art-publish-discard", "log", b"data")
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def publish() -> None:
+            try:
+                barrier.wait(timeout=5)
+                store.publish(staged)
+            except Exception as exc:
+                errors.append(exc)
+
+        def discard() -> None:
+            try:
+                barrier.wait(timeout=5)
+                store.discard_staged(staged)
+            except Exception as exc:
+                errors.append(exc)
+
+        publish_thread = threading.Thread(target=publish)
+        discard_thread = threading.Thread(target=discard)
+        publish_thread.start()
+        discard_thread.start()
+        publish_thread.join(timeout=10)
+        discard_thread.join(timeout=10)
+
+        assert not publish_thread.is_alive()
+        assert not discard_thread.is_alive()
+        assert len(errors) == 1
+        if staged._state == _PUBLISHED:
+            assert store.read_bytes("art-publish-discard", "log") == b"data"
+        else:
+            assert staged._state == _DISCARDED
+            assert not store.exists("art-publish-discard", "log")
+
 
 # --- Tamper detection ------------------------------------------------------
 
@@ -247,6 +283,48 @@ class TestTamperDetection:
         staged.tmp_path.write_bytes(b"TAMPARED")
         with pytest.raises(PathEscapeError, match="temp hash changed"):
             store.publish(staged)
+
+    def test_publish_detects_check_link_tamper(
+        self,
+        store: ArtifactStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        staged = store.write_temp("art-check-link", "log", b"original")
+        original_link = artifact_store_module.os.link
+
+        def tampering_link(source: str, target: str) -> None:
+            Path(source).write_bytes(b"tampered-after-check")
+            original_link(source, target)
+
+        monkeypatch.setattr(artifact_store_module.os, "link", tampering_link)
+
+        with pytest.raises(PathEscapeError, match="published size changed"):
+            store.publish(staged)
+        assert staged._state == _ROLLED_BACK
+        assert not store.exists("art-check-link", "log")
+        store.discard_staged(staged)
+
+    def test_publish_detects_post_link_regular_replacement(
+        self,
+        store: ArtifactStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        staged = store.write_temp("art-link-replace", "log", b"original")
+        original_link = artifact_store_module.os.link
+
+        def replacing_link(source: str, target: str) -> None:
+            original_link(source, target)
+            target_path = Path(target)
+            target_path.unlink()
+            target_path.write_bytes(b"regular-replacement")
+
+        monkeypatch.setattr(artifact_store_module.os, "link", replacing_link)
+
+        with pytest.raises(PathEscapeError, match="no longer references"):
+            store.publish(staged)
+        assert staged._state == _ROLLED_BACK
+        assert not store.exists("art-link-replace", "log")
+        store.discard_staged(staged)
 
 
 # --- Token validation ------------------------------------------------------

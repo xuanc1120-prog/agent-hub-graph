@@ -169,6 +169,16 @@ class TestCleanup:
     def test_cleanup_no_orphans(self, store: ArtifactStore) -> None:
         assert store.cleanup_temp("log", ttl_seconds=1) == 0
 
+    def test_cleanup_honors_explicit_zero_time(self, store: ArtifactStore) -> None:
+        type_dir = store.base_dir / "log"
+        type_dir.mkdir(parents=True, exist_ok=True)
+        tmp = type_dir / ".artifact-epoch.tmp"
+        tmp.write_bytes(b"active-at-epoch")
+        os.utime(tmp, (0, 0))
+
+        assert store.cleanup_temp("log", ttl_seconds=1, now=0) == 0
+        assert tmp.exists()
+
     def test_delete_existing(self, store: ArtifactStore) -> None:
         staged = store.write_temp("art-d01", "log", b"data")
         store.publish(staged)

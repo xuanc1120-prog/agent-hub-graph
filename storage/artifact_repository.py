@@ -14,6 +14,7 @@ approach is:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -32,6 +33,7 @@ from storage.errors import (
 )
 
 _ENTITY_ID = TypeAdapter(EntityId)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _entity_id(value: str) -> str:
@@ -130,8 +132,6 @@ class ArtifactRepository:
 
         # Stage file write first (outside transaction for I/O)
         staged = self._store.write_temp(resolved_id, artifact_type.value, content)
-        published = False
-
         timestamp = utc_now_text(now)
 
         try:
@@ -213,15 +213,16 @@ class ArtifactRepository:
 
                 # Publish final file (no-overwrite)
                 self._store.publish(staged)
-                published = True
 
                 # Store relative path from store base
                 try:
                     final_path = self._store.resolve(staged.artifact_id, staged.artifact_type)
                     relative = final_path.relative_to(self._store.base_dir)
                     relative_str = relative.as_posix()
-                except ValueError:
-                    relative_str = final_path.as_posix()
+                except ValueError as exc:
+                    raise ContainmentViolation(
+                        f"artifact path is outside store base: {final_path}"
+                    ) from exc
 
                 # Insert metadata with server-computed fields
                 await tx.execute(
@@ -246,17 +247,19 @@ class ArtifactRepository:
                     ),
                 )
 
-        except BaseException:
-            # DB failed — cleanup best-effort, never mask the original error
+        except BaseException as operation_error:
+            # Preserve the operation error while making cleanup failure visible.
             try:
-                if published:
-                    self._store.rollback_publish(staged)
-                self._store.discard_staged(staged)
+                self._store.abort(staged)
             except Exception as cleanup_err:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "cleanup after DB failure failed: %s", cleanup_err
+                operation_error.add_note(
+                    f"artifact cleanup failed for {artifact_type.value}/{resolved_id}: "
+                    f"{cleanup_err!r}"
+                )
+                _LOGGER.exception(
+                    "cleanup after artifact create failure failed for %s/%s",
+                    artifact_type.value,
+                    resolved_id,
                 )
             raise
 
@@ -389,6 +392,22 @@ class ArtifactRepository:
             await tx.execute("DELETE FROM artifacts WHERE id = ?", (resolved_id,))
         # File cleanup after DB commit
         self._store.delete(resolved_id, record.artifact_type)
+
+    async def reconcile_orphan(
+        self,
+        artifact_id: str,
+        artifact_type: ArtifactType,
+    ) -> bool:
+        """Delete one final file only when SQLite has no metadata for its ID."""
+        resolved_id = _entity_id(artifact_id)
+        async with self._database.immediate_transaction() as tx:
+            existing = await tx.fetch_one(
+                "SELECT id FROM artifacts WHERE id = ?",
+                (resolved_id,),
+            )
+            if existing is not None:
+                return False
+            return self._store.delete_orphan(resolved_id, artifact_type.value)
 
     # ------------------------------------------------------------------
     # Helpers
