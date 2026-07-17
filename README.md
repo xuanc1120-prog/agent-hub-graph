@@ -47,7 +47,7 @@ flowchart LR
 
 ## 当前进度
 
-截至 2026-07-16，阶段 0 已完成，阶段 1 完成 2/4：
+截至 2026-07-17，阶段 0 已完成；阶段 1 已完成 3/4，`HUB-110` 实现已进入交叉复审：
 
 | 任务 | 状态 | 内容 |
 |---|---|---|
@@ -58,16 +58,15 @@ flowchart LR
 | `HUB-100` | 已完成 | SQLite、Repository、CAS、幂等与 fencing lease |
 | `HUB-120` | 已完成 | RuleBasedPlanner、AgentRouter、fallback 与 lineage |
 | `HUB-130` | 已完成 | ContextPack、ArtifactStore、TaskContextBundle 与 EventRegistry |
-| `HUB-110` | 下一任务 | Compiler、Executor 与 MockAgent 纵向闭环 |
+| `HUB-110` | 待复审 | Compiler、Executor 与只读 MockAgent 纵向闭环已实现 |
 
-当前仓库已经具备协议、存储、规划、路由和工程验证基础，但以下部分尚未完成：
+当前开发分支已经具备协议、存储、规划、路由、确定性编译和只读 Mock 调度闭环，但以下部分尚未完成：
 
-- Compiler、PolicyInjector、DurableScheduler 和 GraphExecutor；
 - 共享工作区 Guard、审批和恢复链；
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步为 `HUB-110`，完成 Compiler、DurableScheduler、GraphExecutor 和无副作用 MockAgent 闭环。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步是完成 `HUB-110` 交叉复审与阶段 1 CLI/Mock gate，之后再启动 `HUB-200`。
 
 ## 技术栈
 

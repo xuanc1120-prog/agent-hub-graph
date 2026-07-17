@@ -7,7 +7,7 @@ import pytest
 
 from protocol import AuthorGraph, NodePosition, SessionStatus, WorkflowLayout, WorkflowNode
 from storage.db import Database
-from storage.errors import ConcurrencyConflict
+from storage.errors import ConcurrencyConflict, SnapshotIntegrityError
 from storage.repositories import (
     NewSession,
     NewWorkflow,
@@ -108,3 +108,29 @@ async def test_workflow_semantic_and_layout_versions_are_independent(
             expected_layout_version=1,
             now=NOW,
         )
+
+
+async def test_workflow_repository_rejects_json_hash_drift(
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    await SessionRepository(database).create(_new_session(tmp_path), now=NOW)
+    workflows = WorkflowRepository(database)
+    created = await workflows.create(
+        NewWorkflow(
+            workflow_id="workflow-hash-drift",
+            session_id="session-1",
+            author_graph=AuthorGraph(),
+            layout=WorkflowLayout(),
+        ),
+        now=NOW,
+    )
+    tampered = AuthorGraph(nodes=[WorkflowNode(id="input", node_type="input", title="Tampered")])
+    async with database.immediate_transaction() as transaction:
+        await transaction.execute(
+            "UPDATE workflows SET author_graph_json = ? WHERE id = ?",
+            (tampered.model_dump_json(), created.workflow_id),
+        )
+
+    with pytest.raises(SnapshotIntegrityError, match="author graph hash"):
+        await workflows.get(created.workflow_id)

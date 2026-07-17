@@ -13,17 +13,17 @@
 | HUB-100 | completed | SQLite、Repository、CAS、idempotency 和 fencing lease 已集成 |
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
-| HUB-110 | next | 依赖已满足，下一步准备 Compiler/Executor/MockAgent 纵向闭环 |
+| HUB-110 | review | 确定性 Compiler/Executor/只读 MockAgent 闭环已实现并通过本地组合验证，等待交叉复审 |
 
-`HUB-130` 已通过 Codex 审查并集成。下一开发波次只启动 `HUB-110`，必须从包含 HUB-130 的最新 `main` 创建 task-specific worktree 并记录实际 base commit；已完成的 Agent worktree 只保留任务证据，不再继续开发。后续顺序为：
+`HUB-130` 已通过 Codex 审查并集成。`HUB-110` 已从包含 HUB-130 的最新 `main` 创建 task-specific worktree，完成实现和本地组合验证；当前不得提前启动依赖它的写入运行时。后续顺序为：
 
 ```text
-HUB-110（Codex）
+HUB-110（Claude Code 交叉复审）
         ↓
 阶段 1 CLI + Mock workflow 集成验收
 ```
 
-下一步先基于已集成的 Context、Artifact 和 Event API 编写 `HUB-110` 执行简报，再创建 Codex 独立 worktree。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+下一步先完成 `HUB-110` 交叉复审和阻塞项修复，再由 Codex 集成并执行阶段 1 gate。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 

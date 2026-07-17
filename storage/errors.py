@@ -61,3 +61,7 @@ class EventPayloadError(StorageError):
 
 class BundleError(StorageError):
     """A TaskContextBundle operation failed."""
+
+
+class SnapshotIntegrityError(StorageError):
+    """An immutable workflow snapshot failed hash or metadata validation."""

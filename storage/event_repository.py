@@ -21,7 +21,7 @@ import aiosqlite
 from pydantic import TypeAdapter
 
 from protocol import ActorType, EntityId, StrictModel, canonical_json
-from storage.db import Database, utc_now_text
+from storage.db import Database, Transaction, utc_now_text
 from storage.errors import EventPayloadError, RecordNotFound
 from storage.event_registry import EventRegistry
 
@@ -105,7 +105,33 @@ class EventRepository:
         Raises :class:`EventPayloadError` if the payload fails registry
         validation or exceeds the canonical JSON size limit.
         """
-        # Validate IDs
+        async with self._database.immediate_transaction() as transaction:
+            return await self.append_in(
+                transaction,
+                session_id=session_id,
+                event_type=event_type,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                payload=payload,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                now=now,
+            )
+
+    async def append_in(
+        self,
+        transaction: Transaction,
+        *,
+        session_id: str,
+        event_type: str,
+        actor_type: ActorType,
+        actor_id: str | None,
+        payload: StrictModel,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        now: datetime | None = None,
+    ) -> EventRecord:
+        """Append an event inside a caller-owned mutation transaction."""
         resolved_session = _entity_id(session_id)
         resolved_actor = _entity_id(actor_id) if actor_id else None
         resolved_wf = _entity_id(workflow_id) if workflow_id else None
@@ -128,92 +154,85 @@ class EventRepository:
             # workflow_id is allowed (workflow-level event)
             pass
 
-        async with self._database.immediate_transaction() as tx:
-            # Verify session exists
-            session_row = await tx.fetch_one(
-                "SELECT id FROM sessions WHERE id = ?",
-                (resolved_session,),
+        session_row = await transaction.fetch_one(
+            "SELECT id FROM sessions WHERE id = ?",
+            (resolved_session,),
+        )
+        if session_row is None:
+            raise RecordNotFound(f"session not found: {resolved_session}")
+
+        run_seq: int | None = None
+
+        if is_run_event:
+            assert resolved_wf is not None
+            assert resolved_run is not None
+
+            wf_row = await transaction.fetch_one(
+                "SELECT session_id FROM workflows WHERE id = ?",
+                (resolved_wf,),
             )
-            if session_row is None:
-                raise RecordNotFound(f"session not found: {resolved_session}")
-
-            run_seq: int | None = None
-
-            if is_run_event:
-                assert resolved_wf is not None
-                assert resolved_run is not None
-
-                # Verify workflow belongs to session
-                wf_row = await tx.fetch_one(
-                    "SELECT session_id FROM workflows WHERE id = ?",
-                    (resolved_wf,),
+            if wf_row is None:
+                raise RecordNotFound(f"workflow not found: {resolved_wf}")
+            if str(wf_row["session_id"]) != resolved_session:
+                raise EventPayloadError(
+                    f"workflow {resolved_wf} does not belong to session {resolved_session}"
                 )
-                if wf_row is None:
-                    raise RecordNotFound(f"workflow not found: {resolved_wf}")
-                if str(wf_row["session_id"]) != resolved_session:
-                    raise EventPayloadError(
-                        f"workflow {resolved_wf} does not belong to session {resolved_session}"
-                    )
 
-                # Verify run belongs to workflow and session
-                run_row = await tx.fetch_one(
-                    """
-                    SELECT session_id, workflow_id, next_event_seq
-                    FROM workflow_runs WHERE id = ?
-                    """,
-                    (resolved_run,),
-                )
-                if run_row is None:
-                    raise RecordNotFound(f"workflow run not found: {resolved_run}")
-                if str(run_row["session_id"]) != resolved_session:
-                    raise EventPayloadError(
-                        f"workflow run {resolved_run} does not belong to session {resolved_session}"
-                    )
-                if str(run_row["workflow_id"]) != resolved_wf:
-                    raise EventPayloadError(
-                        f"workflow run {resolved_run} does not belong to workflow {resolved_wf}"
-                    )
-
-                # Atomically allocate run_seq from next_event_seq
-                run_seq = int(run_row["next_event_seq"])
-                changed = await tx.execute(
-                    """
-                    UPDATE workflow_runs
-                    SET next_event_seq = next_event_seq + 1
-                    WHERE id = ? AND next_event_seq = ?
-                    """,
-                    (resolved_run, run_seq),
-                )
-                if changed != 1:
-                    raise EventPayloadError(
-                        f"failed to allocate run_seq for run "
-                        f"{resolved_run}; concurrent allocation detected"
-                    )
-
-            # Insert event
-            await tx.execute(
+            run_row = await transaction.fetch_one(
                 """
-                INSERT INTO events(
-                    session_id, workflow_id, workflow_run_id, run_seq,
-                    event_type, actor_type, actor_id, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT session_id, workflow_id, next_event_seq
+                FROM workflow_runs WHERE id = ?
                 """,
-                (
-                    resolved_session,
-                    resolved_wf,
-                    resolved_run,
-                    run_seq,
-                    event_type,
-                    actor_type.value,
-                    resolved_actor,
-                    payload_json,
-                    timestamp,
-                ),
+                (resolved_run,),
             )
+            if run_row is None:
+                raise RecordNotFound(f"workflow run not found: {resolved_run}")
+            if str(run_row["session_id"]) != resolved_session:
+                raise EventPayloadError(
+                    f"workflow run {resolved_run} does not belong to session {resolved_session}"
+                )
+            if str(run_row["workflow_id"]) != resolved_wf:
+                raise EventPayloadError(
+                    f"workflow run {resolved_run} does not belong to workflow {resolved_wf}"
+                )
 
-            # Fetch the auto-generated event_id
-            row = await tx.fetch_one("SELECT last_insert_rowid() AS id")
-            event_id = int(row["id"]) if row else 0
+            run_seq = int(run_row["next_event_seq"])
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs
+                SET next_event_seq = next_event_seq + 1
+                WHERE id = ? AND next_event_seq = ?
+                """,
+                (resolved_run, run_seq),
+            )
+            if changed != 1:
+                raise EventPayloadError(
+                    f"failed to allocate run_seq for run "
+                    f"{resolved_run}; concurrent allocation detected"
+                )
+
+        await transaction.execute(
+            """
+            INSERT INTO events(
+                session_id, workflow_id, workflow_run_id, run_seq,
+                event_type, actor_type, actor_id, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                resolved_session,
+                resolved_wf,
+                resolved_run,
+                run_seq,
+                event_type,
+                actor_type.value,
+                resolved_actor,
+                payload_json,
+                timestamp,
+            ),
+        )
+
+        row = await transaction.fetch_one("SELECT last_insert_rowid() AS id")
+        event_id = int(row["id"]) if row else 0
 
         return EventRecord(
             event_id=event_id,

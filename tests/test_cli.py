@@ -61,3 +61,90 @@ def test_serve_fails_fast_when_master_lease_is_held(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "already running" in result.stderr
+
+
+def test_cli_readonly_mock_phase_gate(fixture_source_repo: Path, tmp_path: Path) -> None:
+    data_root = tmp_path / "runtime"
+    common = ["--data-dir", str(data_root)]
+
+    registered = runner.invoke(app, ["register-agent", "mock", *common])
+    created = runner.invoke(
+        app,
+        [
+            "create-session",
+            "--repo",
+            str(fixture_source_repo),
+            "--goal",
+            "Fix a fixture bug without changing files in the phase-one demo",
+            "--session-id",
+            "session-cli",
+            *common,
+        ],
+    )
+    planned = runner.invoke(
+        app,
+        [
+            "plan",
+            "session-cli",
+            "--task-family",
+            "bugfix",
+            "--planner-run-id",
+            "planner-cli",
+            "--workflow-id",
+            "workflow-cli",
+            *common,
+        ],
+    )
+    validated = runner.invoke(app, ["validate", "workflow-cli", *common])
+    executed = runner.invoke(
+        app,
+        [
+            "run-workflow",
+            "workflow-cli",
+            "--workflow-run-id",
+            "run-cli",
+            *common,
+        ],
+    )
+    replayed = runner.invoke(
+        app,
+        ["show-events", "--workflow-run-id", "run-cli", *common],
+    )
+
+    for result in (registered, created, planned, validated, executed, replayed):
+        assert result.exit_code == 0, result.stdout
+    assert json.loads(created.stdout)["session_id"] == "session-cli"
+    assert json.loads(planned.stdout)["demo_read_only"] is True
+    assert json.loads(validated.stdout)["ok"] is True
+    assert json.loads(executed.stdout)["status"] == "completed"
+    events = json.loads(replayed.stdout)
+    assert events[0]["run_seq"] == 1
+    assert events[-1]["payload"]["status"] == "completed"
+
+
+def test_create_session_rejects_path_like_id_before_workspace_creation(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "runtime"
+    escaped = tmp_path / "escaped-session"
+
+    result = runner.invoke(
+        app,
+        [
+            "create-session",
+            "--repo",
+            str(fixture_source_repo),
+            "--goal",
+            "Validate session id containment",
+            "--session-id",
+            "../../escaped-session",
+            "--data-dir",
+            str(data_root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not escaped.exists()
+    shared_root = data_root / "workspaces" / "shared"
+    assert not shared_root.exists() or list(shared_root.iterdir()) == []

@@ -224,6 +224,11 @@ class AgentRouter:
 
     def _route_explicit(self, node: WorkflowNode) -> RoutingResult:
         mode = node.assignment_mode.value
+        if node.task_kind is None:
+            return RoutingResult(
+                decision=RoutingDecision.BLOCKED_UNAVAILABLE,
+                blocked_reason=f"{mode} agent_task requires task_kind",
+            )
         if node.assigned_agent is None:
             return RoutingResult(
                 decision=RoutingDecision.BLOCKED_UNAVAILABLE,
@@ -246,6 +251,17 @@ class AgentRouter:
             return RoutingResult(
                 decision=RoutingDecision.BLOCKED_UNAVAILABLE,
                 blocked_reason=f"assigned agent {agent.agent_id} is unavailable: {detail}",
+            )
+        missing = self._requirements(node).difference(agent.capabilities)
+        if missing:
+            required = ", ".join(
+                capability.value for capability in sorted(missing, key=lambda item: item.value)
+            )
+            return RoutingResult(
+                decision=RoutingDecision.BLOCKED_UNAVAILABLE,
+                blocked_reason=(
+                    f"assigned agent {agent.agent_id} lacks required capabilities: {required}"
+                ),
             )
         return RoutingResult(
             decision=RoutingDecision.ASSIGNED,

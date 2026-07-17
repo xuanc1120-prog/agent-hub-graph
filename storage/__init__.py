@@ -17,6 +17,7 @@ from storage.errors import (
     PermissionError_,
     QuotaExceeded,
     RecordNotFound,
+    SnapshotIntegrityError,
     StorageError,
     UnsupportedSchemaVersion,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "RecordNotFound",
     "SessionRecord",
     "SessionRepository",
+    "SnapshotIntegrityError",
     "StorageError",
     "StoredResponse",
     "TempWriteResult",

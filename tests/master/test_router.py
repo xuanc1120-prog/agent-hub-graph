@@ -186,6 +186,31 @@ def test_locked_assignment_is_preserved(sample_catalog: AgentCatalog) -> None:
     assert result.reason == "preserved locked assignment"
 
 
+def test_explicit_assignment_rejects_missing_task_capabilities() -> None:
+    catalog = AgentCatalog(
+        agents=(
+            _agent(
+                "read-only-agent",
+                capabilities=frozenset({AgentCapability.READ_CODE, AgentCapability.IMPLEMENT}),
+            ),
+        ),
+        catalog_hash="0" * 64,
+    )
+
+    result = AgentRouter(catalog).route(
+        _node(
+            task_kind=TaskKind.IMPLEMENT,
+            requires_write=True,
+            mode=AssignmentMode.LOCKED,
+            assigned_agent="read-only-agent",
+        )
+    )
+
+    assert result.decision == RoutingDecision.BLOCKED_UNAVAILABLE
+    assert "generate_patch" in result.blocked_reason
+    assert "write_files" in result.blocked_reason
+
+
 @pytest.mark.parametrize("mode", [AssignmentMode.MANUAL, AssignmentMode.LOCKED])
 def test_explicit_assignment_requires_agent(
     sample_catalog: AgentCatalog,
