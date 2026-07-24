@@ -8,6 +8,7 @@ directory structure, without depending on the ``protocol`` package layout.
 
 from __future__ import annotations
 
+from protocol import IfOperator
 from protocol.workflow import (
     AgentRecommendation,
     AuthorGraph,
@@ -40,9 +41,20 @@ def normalize_author_graph(graph: AuthorGraph) -> AuthorGraph:
 
     nodes: list[WorkflowNode] = []
     for node in graph.nodes:
+        condition = node.if_condition
+        if (
+            condition is not None
+            and condition.operator == IfOperator.IN
+            and isinstance(condition.value, list)
+        ):
+            condition = condition.model_copy(
+                update={"value": sorted(set(condition.value))},
+                deep=True,
+            )
         nodes.append(
             node.model_copy(
                 update={
+                    "if_condition": condition,
                     "recommended_agents": sorted(
                         node.recommended_agents,
                         key=lambda item: (item.agent_id, -item.score, item.reason),

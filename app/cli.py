@@ -184,6 +184,38 @@ def show_workflow(
     )
 
 
+@app.command("show-run")
+def show_run(
+    workflow_run_id: Annotated[str, typer.Argument(help="Workflow run id.")],
+    data_dir: Annotated[Path | None, typer.Option("--data-dir")] = None,
+) -> None:
+    """Show the immutable run snapshot identity and planner lineage."""
+
+    async def operation():
+        service = WorkflowApplication(_settings(data_dir))
+        await service.initialize()
+        return await service.show_run(workflow_run_id)
+
+    run = asyncio.run(operation())
+    typer.echo(
+        json.dumps(
+            {
+                "workflow_run_id": run.workflow_run_id,
+                "workflow_id": run.workflow_id,
+                "session_id": run.session_id,
+                "status": run.status.value,
+                "author_snapshot_hash": run.author_snapshot_hash,
+                "compiled_snapshot_hash": run.compiled_snapshot_hash,
+                "agent_catalog_snapshot_hash": run.agent_catalog_snapshot_hash,
+                "planner_run_id": run.planner_run_id,
+                "planner_id": run.planner_id,
+                "planner_model": run.planner_model,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 @app.command("run-workflow")
 def run_workflow(
     workflow_id: Annotated[str, typer.Argument(help="Workflow id.")],
@@ -214,6 +246,9 @@ def run_workflow(
                 "workflow_run_id": run.workflow_run_id,
                 "status": run.status.value,
                 "compiled_snapshot_hash": run.compiled_snapshot_hash,
+                "planner_run_id": run.planner_run_id,
+                "planner_id": run.planner_id,
+                "planner_model": run.planner_model,
             },
             sort_keys=True,
         )

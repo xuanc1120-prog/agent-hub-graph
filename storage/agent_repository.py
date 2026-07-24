@@ -26,6 +26,7 @@ class AgentRegistration:
     enabled: bool = True
     available: bool = True
     auto_assignable: bool = False
+    unavailable_reason: str | None = None
 
 
 class AgentRepository:
@@ -53,15 +54,18 @@ class AgentRepository:
                 await transaction.execute(
                     """
                     INSERT INTO agents(
-                        id, display_name, adapter_type, enabled,
-                        capabilities_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        id, display_name, adapter_type, enabled, available,
+                        auto_assignable, unavailable_reason, capabilities_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         spec.agent_id,
                         spec.display_name,
                         spec.adapter_type,
                         1 if spec.enabled else 0,
+                        1 if spec.available else 0,
+                        1 if spec.auto_assignable else 0,
+                        spec.unavailable_reason,
                         capabilities_json,
                         timestamp,
                     ),
@@ -125,8 +129,13 @@ def _row_to_registration(row: object) -> AgentRegistration:
         adapter_type=str(row["adapter_type"]),  # type: ignore[index]
         capabilities=frozenset(AgentCapability(value) for value in capabilities),
         enabled=bool(row["enabled"]),  # type: ignore[index]
-        available=bool(row["enabled"]),  # type: ignore[index]
-        auto_assignable=str(row["adapter_type"]) != "mock",  # type: ignore[index]
+        available=bool(row["available"]),  # type: ignore[index]
+        auto_assignable=bool(row["auto_assignable"]),  # type: ignore[index]
+        unavailable_reason=(
+            str(row["unavailable_reason"])  # type: ignore[index]
+            if row["unavailable_reason"] is not None  # type: ignore[index]
+            else None
+        ),
     )
 
 
@@ -139,6 +148,7 @@ def _to_spec(registration: AgentRegistration) -> AgentSpec:
         "enabled": registration.enabled,
         "available": registration.available,
         "auto_assignable": registration.auto_assignable,
+        "unavailable_reason": registration.unavailable_reason,
     }
     digest = sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -151,6 +161,7 @@ def _to_spec(registration: AgentRegistration) -> AgentSpec:
         enabled=registration.enabled,
         available=registration.available,
         auto_assignable=registration.auto_assignable,
+        unavailable_reason=registration.unavailable_reason,
         spec_sha256=digest,
     )
 

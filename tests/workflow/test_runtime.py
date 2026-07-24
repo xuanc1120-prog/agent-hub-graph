@@ -9,8 +9,9 @@ import aiosqlite
 import pytest
 
 from adapters.mock import MockAgentAdapter
-from context.task_bundle import TaskContextBundle
+from context.task_bundle import CleanupResult, TaskContextBundle
 from protocol import (
+    ArtifactRef,
     ArtifactType,
     AssignmentMode,
     AuthorGraph,
@@ -47,6 +48,7 @@ from workflow.events import build_runtime_event_registry
 from workflow.executable_validator import ExecutableValidator
 from workflow.executor import GraphExecutor
 from workflow.handlers.agent_task import AgentTaskNodeHandler
+from workflow.handlers.base import NodeHandlerResult
 from workflow.handlers.factory import build_node_registry
 from workflow.scheduler import DurableScheduler
 
@@ -114,6 +116,174 @@ async def test_readonly_mock_workflow_is_durable_and_replayable(
         node for node in replay.compiled_snapshot.nodes if node.node_type == NodeType.AGENT_TASK
     )
     assert snapshot_task.title == "Analyze fixture"
+
+
+@pytest.mark.asyncio
+async def test_bundle_cleanup_retries_after_initial_failure(
+    runtime_database: Database,
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = await _build_runtime(runtime_database, tmp_path)
+    session, workflow = await _seed_workflow(
+        runtime_database,
+        fixture_source_repo,
+        _readonly_graph(),
+    )
+    catalog = await runtime.agents.catalog()
+    compilation = WorkflowCompiler(catalog).compile(
+        workflow.author_graph,
+        integration_base_commit=session.integration_head_commit,
+    )
+    assert compilation.ok and compilation.graph is not None
+    lease = await runtime.leases.acquire(
+        instance_id="cleanup-master",
+        process_id=1234,
+        ttl_seconds=60,
+    )
+    created = await _create_run(
+        runtime,
+        NewWorkflowRun(
+            workflow_run_id="run-cleanup-retry",
+            workflow=workflow,
+            compiled_graph=compilation.graph,
+            agent_catalog=catalog,
+            current_commit=session.integration_head_commit,
+        ),
+        lease=lease,
+    )
+    original_cleanup = runtime.bundles.cleanup
+    cleanup_calls = 0
+
+    async def fail_once(task_id: str) -> CleanupResult:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            return CleanupResult(removed_files=0, removed_dirs=0, errors=["injected"])
+        return await original_cleanup(task_id)
+
+    monkeypatch.setattr(runtime.bundles, "cleanup", fail_once)
+
+    completed = await runtime.scheduler.run_until_stable(created.workflow_run_id, lease=lease)
+
+    task = await _only_task(runtime_database)
+    assert completed.status == WorkflowRunStatus.FAILED
+    assert task["status"] == TaskStatus.FAILED.value
+    assert cleanup_calls == 2
+    assert not runtime.bundles.bundle_dir(str(task["id"])).exists()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_same_session_cross_task_artifact(
+    runtime_database: Database,
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = await _build_runtime(runtime_database, tmp_path)
+    session, first_workflow = await _seed_workflow(
+        runtime_database,
+        fixture_source_repo,
+        _readonly_graph(),
+    )
+    catalog = await runtime.agents.catalog()
+    first_compilation = WorkflowCompiler(catalog).compile(
+        first_workflow.author_graph,
+        integration_base_commit=session.integration_head_commit,
+    )
+    assert first_compilation.ok and first_compilation.graph is not None
+    lease = await runtime.leases.acquire(
+        instance_id="artifact-owner-master",
+        process_id=1234,
+        ttl_seconds=60,
+    )
+    first_run = await _create_run(
+        runtime,
+        NewWorkflowRun(
+            workflow_run_id="run-artifact-source",
+            workflow=first_workflow,
+            compiled_graph=first_compilation.graph,
+            agent_catalog=catalog,
+            current_commit=session.integration_head_commit,
+        ),
+        lease=lease,
+    )
+    await runtime.scheduler.run_until_stable(first_run.workflow_run_id, lease=lease)
+    source_node = next(
+        node
+        for node in await runtime.runs.list_nodes(first_run.workflow_run_id)
+        if node.node_id == "analyze"
+    )
+    assert source_node.output_artifact_id is not None
+    source = await runtime.artifacts.get(source_node.output_artifact_id)
+    assert source.task_id is not None
+    source_ref = ArtifactRef(
+        artifact_id=source.artifact_id,
+        artifact_type=ArtifactType(source.artifact_type),
+        relative_path=source.relative_path,
+        sha256=source.sha256,
+        size_bytes=source.size_bytes,
+    )
+
+    second_workflow = await WorkflowRepository(runtime_database).create(
+        NewWorkflow(
+            workflow_id="workflow-artifact-target",
+            session_id=session.session_id,
+            author_graph=_readonly_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    second_compilation = WorkflowCompiler(catalog).compile(
+        second_workflow.author_graph,
+        integration_base_commit=session.integration_head_commit,
+    )
+    assert second_compilation.ok and second_compilation.graph is not None
+
+    class CrossTaskHandler:
+        async def execute(self, context: object) -> NodeHandlerResult:
+            return NodeHandlerResult(
+                status=NodeRunStatus.COMPLETED,
+                outcome=NodeOutcome.SUCCESS,
+                summary="Attempted cross-task output reuse.",
+                artifact_refs=(source_ref,),
+            )
+
+    malicious_registry = build_node_registry(CrossTaskHandler())  # type: ignore[arg-type]
+    malicious_scheduler = DurableScheduler(
+        runtime.runs,
+        GraphExecutor(
+            runtime.runs,
+            SessionRepository(runtime_database),
+            runtime.artifacts,
+            malicious_registry,
+        ),
+        poll_interval_seconds=0.01,
+    )
+    second_run = await _create_run(
+        runtime,
+        NewWorkflowRun(
+            workflow_run_id="run-artifact-target",
+            workflow=second_workflow,
+            compiled_graph=second_compilation.graph,
+            agent_catalog=catalog,
+            current_commit=session.integration_head_commit,
+        ),
+        lease=lease,
+    )
+
+    completed = await malicious_scheduler.run_until_stable(
+        second_run.workflow_run_id,
+        lease=lease,
+    )
+
+    assert completed.status == WorkflowRunStatus.FAILED
+    target_node = next(
+        node
+        for node in await runtime.runs.list_nodes(second_run.workflow_run_id)
+        if node.node_id == "analyze"
+    )
+    assert target_node.status == NodeRunStatus.FAILED
+    assert target_node.error_code == "handler_artifact_invalid"
 
 
 @pytest.mark.asyncio
@@ -570,6 +740,7 @@ class _Runtime:
         events: EventRepository,
         runs: WorkflowRunRepository,
         artifacts: ArtifactRepository,
+        bundles: TaskContextBundle,
         registry,
         scheduler: DurableScheduler,
     ) -> None:
@@ -579,6 +750,7 @@ class _Runtime:
         self.events = events
         self.runs = runs
         self.artifacts = artifacts
+        self.bundles = bundles
         self.registry = registry
         self.scheduler = scheduler
 
@@ -622,6 +794,7 @@ async def _build_runtime(database: Database, tmp_path: Path) -> _Runtime:
         events=events,
         runs=runs,
         artifacts=artifact_repository,
+        bundles=bundle,
         registry=registry,
         scheduler=DurableScheduler(runs, executor, poll_interval_seconds=0.01),
     )

@@ -9,6 +9,7 @@ from protocol import (
     CompiledGraph,
     EdgeCondition,
     NodeType,
+    RiskLevel,
     TaskKind,
     TestKind,
     ValidationIssue,
@@ -33,6 +34,7 @@ _SYSTEM_TYPES = frozenset(
 _DOC_EXTENSIONS = frozenset({".md", ".mdx", ".rst", ".txt"})
 _SENSITIVE_DOC_STEMS = frozenset({"requirements", "constraints", "manifest", "config", "policy"})
 _SENSITIVE_DOC_NAMES = frozenset({"package.json", "pyproject.toml"})
+_RISK_ORDER = {level: index for index, level in enumerate(RiskLevel)}
 
 
 class ExecutableValidator:
@@ -175,6 +177,18 @@ class ExecutableValidator:
                     _issue(
                         "compiled_permissions_missing",
                         "agent_task is missing compiler-owned effective permissions",
+                        node.id,
+                    )
+                )
+            expected_risk_floor = _max_risk(
+                node.risk_level_hint,
+                RiskLevel.L1 if node.requires_write else RiskLevel.L0,
+            )
+            if node.policy_risk_floor != expected_risk_floor:
+                errors.append(
+                    _issue(
+                        "compiled_risk_floor_mismatch",
+                        "policy risk floor does not match the compiler policy minimum",
                         node.id,
                     )
                 )
@@ -656,6 +670,21 @@ def _validate_security_sequence(
             )
         )
         return errors
+    sealed_rules = (
+        (chain[0], NodeType.PATCH_GUARD, "write.patch_guard.v1"),
+        (chain[-3], NodeType.RISK_CLASSIFIER, "write.risk_classifier.v1"),
+        (chain[-2], NodeType.APPROVAL, "write.changeset_approval.v1"),
+        (chain[-1], NodeType.MERGE_PATCH, "write.merge_patch.v1"),
+    )
+    for sealed, expected_type, expected_rule in sealed_rules:
+        if sealed.node_type != expected_type or sealed.system_rule_id != expected_rule:
+            errors.append(
+                _issue(
+                    "security_rule_mismatch",
+                    f"{expected_type.value} must use sealed rule {expected_rule}",
+                    sealed.id,
+                )
+            )
 
     test_segment = chain[1:-3]
     if len(test_segment) == 1 and test_segment[0].node_type == NodeType.TEST:
@@ -665,6 +694,23 @@ def _validate_security_sequence(
                     "security_chain_order",
                     "a test without command_guard must be docs_static",
                     test_segment[0].id,
+                )
+            )
+        docs_test = test_segment[0]
+        if source.effective_allowed_commands:
+            errors.append(
+                _issue(
+                    "docs_static_command_conflict",
+                    "docs_static and command tests are mutually exclusive",
+                    docs_test.id,
+                )
+            )
+        if docs_test.system_rule_id != "write.docs_static_test.v1":
+            errors.append(
+                _issue(
+                    "security_rule_mismatch",
+                    "docs_static test must use its sealed policy rule",
+                    docs_test.id,
                 )
             )
         return errors
@@ -678,6 +724,8 @@ def _validate_security_sequence(
             )
         )
         return errors
+    actual_commands: list[tuple[str, ...]] = []
+    expected_commands = [tuple(command) for command in (source.effective_allowed_commands or [])]
     for index in range(0, len(test_segment), 2):
         guard, test = test_segment[index : index + 2]
         if (
@@ -692,7 +740,35 @@ def _validate_security_sequence(
                     test.id,
                 )
             )
+        else:
+            ordinal = index // 2 + 1
+            expected_guard_rule = f"write.command_guard.{ordinal}.v1"
+            expected_test_rule = f"write.command_test.{ordinal}.v1"
+            if (
+                guard.system_rule_id != expected_guard_rule
+                or test.system_rule_id != expected_test_rule
+            ):
+                errors.append(
+                    _issue(
+                        "security_rule_mismatch",
+                        "command guard/test pair does not match its sealed policy rule",
+                        test.id,
+                    )
+                )
+            actual_commands.append(tuple(test.test_argv or []))
+    if actual_commands != expected_commands:
+        errors.append(
+            _issue(
+                "security_test_commands_mismatch",
+                "command tests must exactly match effective allowed commands",
+                source.id,
+            )
+        )
     return errors
+
+
+def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
+    return left if _RISK_ORDER[left] >= _RISK_ORDER[right] else right
 
 
 def _pure_docs_scope(node: WorkflowNode) -> bool:

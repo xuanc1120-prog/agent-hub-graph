@@ -96,6 +96,9 @@ class WorkflowRunRecord:
     policy_version: str
     agent_catalog_snapshot: AgentCatalog
     agent_catalog_snapshot_hash: str
+    planner_run_id: str | None
+    planner_id: str | None
+    planner_model: str | None
     status: WorkflowRunStatus
     created_at: str
     started_at: str | None
@@ -322,6 +325,9 @@ class WorkflowRunRepository:
                     workflow_run_id=value.workflow_run_id,
                     status=WorkflowRunStatus.PENDING,
                     compiled_snapshot_hash=compiled_hash,
+                    planner_run_id=value.planner_run_id,
+                    planner_id=value.planner_id,
+                    planner_model=value.planner_model,
                 ),
                 now=now,
             )
@@ -526,15 +532,35 @@ class WorkflowRunRepository:
                 raise ConcurrencyConflict("node completion requires a running workflow")
             if output_artifact_id is not None:
                 artifact = await transaction.fetch_one(
-                    "SELECT session_id, redacted FROM artifacts WHERE id = ?",
+                    """
+                    SELECT session_id, redacted, task_id, planner_run_id
+                    FROM artifacts WHERE id = ?
+                    """,
                     (output_artifact_id,),
                 )
                 if artifact is None:
                     raise RecordNotFound(f"output artifact not found: {output_artifact_id}")
-                if str(artifact["session_id"]) != str(current["session_id"]) or not bool(
-                    artifact["redacted"]
+                task_owner = await transaction.fetch_one(
+                    "SELECT id FROM tasks WHERE node_run_id = ?",
+                    (node_run_id_value,),
+                )
+                expected_task_id = str(task_owner["id"]) if task_owner is not None else None
+                actual_task_id = (
+                    str(artifact["task_id"]) if artifact["task_id"] is not None else None
+                )
+                if (
+                    str(artifact["session_id"]) != str(current["session_id"])
+                    or not bool(artifact["redacted"])
+                    or artifact["planner_run_id"] is not None
+                    or (actual_task_id is not None and actual_task_id != expected_task_id)
                 ):
                     raise ValueError("node output artifact is not a redacted session artifact")
+                if (
+                    target == NodeRunStatus.COMPLETED
+                    and NodeType(str(current["node_type"])) == NodeType.AGENT_TASK
+                    and actual_task_id != expected_task_id
+                ):
+                    raise ValueError("completed AgentTask output must belong to its task")
             changed = await transaction.execute(
                 """
                 UPDATE node_runs
@@ -735,23 +761,6 @@ class WorkflowRunRepository:
         assert row is not None
         return _task_record(row)
 
-    async def start_task(
-        self,
-        task_id: str,
-        *,
-        runtime_policy_artifact_id: str,
-        lease: MasterLease,
-        now: datetime | None = None,
-    ) -> TaskRecord:
-        return await self._transition_task(
-            task_id,
-            expected=TaskStatus.PENDING,
-            target=TaskStatus.RUNNING,
-            lease=lease,
-            runtime_policy_artifact_id=runtime_policy_artifact_id,
-            now=now,
-        )
-
     async def finish_task(
         self,
         task_id: str,
@@ -799,7 +808,6 @@ class WorkflowRunRepository:
         expected: TaskStatus,
         target: TaskStatus,
         lease: MasterLease,
-        runtime_policy_artifact_id: str | None = None,
         error_code: str | None = None,
         now: datetime | None = None,
     ) -> TaskRecord:
@@ -829,12 +837,10 @@ class WorkflowRunRepository:
             changed = await transaction.execute(
                 """
                 UPDATE tasks
-                SET status = ?,
-                    runtime_policy_artifact_id = COALESCE(?, runtime_policy_artifact_id),
-                    finished_at = ?
+                SET status = ?, finished_at = ?
                 WHERE id = ? AND status = ?
                 """,
-                (target.value, runtime_policy_artifact_id, finished_at, task_id, expected.value),
+                (target.value, finished_at, task_id, expected.value),
             )
             if changed != 1:
                 raise ConcurrencyConflict(
@@ -1200,6 +1206,9 @@ def _run_record(row: aiosqlite.Row) -> WorkflowRunRecord:
         policy_version=str(row["policy_version"]),
         agent_catalog_snapshot=catalog,
         agent_catalog_snapshot_hash=str(row["agent_catalog_snapshot_hash"]),
+        planner_run_id=(str(row["planner_run_id"]) if row["planner_run_id"] is not None else None),
+        planner_id=str(row["planner_id"]) if row["planner_id"] is not None else None,
+        planner_model=(str(row["planner_model"]) if row["planner_model"] is not None else None),
         status=WorkflowRunStatus(str(row["status"])),
         created_at=str(row["created_at"]),
         started_at=str(row["started_at"]) if row["started_at"] is not None else None,

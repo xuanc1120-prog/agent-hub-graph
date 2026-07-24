@@ -408,6 +408,8 @@ def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
 def _is_docs_static(node: WorkflowNode) -> bool:
     if node.task_kind != TaskKind.DOCS:
         return False
+    if node.effective_allowed_commands:
+        return False
     paths = list(node.effective_allowed_files or []) + list(node.effective_new_files or [])
     if not paths:
         return False

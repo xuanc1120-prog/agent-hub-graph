@@ -31,6 +31,7 @@ class PlannerRunRecord:
     session_id: str
     planner_id: str
     planner_type: PlannerType
+    planner_model: str | None
     status: PlannerRunStatus
     integration_base_commit: str | None
     result_workflow_id: str | None
@@ -60,6 +61,7 @@ class PlannerRunRepository:
         planner_id: str,
         planner_type: PlannerType,
         integration_base_commit: str,
+        planner_model: str | None = None,
         lease: MasterLease,
         now: datetime | None = None,
     ) -> PlannerRunRecord:
@@ -79,15 +81,16 @@ class PlannerRunRepository:
             await transaction.execute(
                 """
                 INSERT INTO planner_runs(
-                    id, session_id, planner_id, planner_type,
+                    id, session_id, planner_id, planner_type, planner_model,
                     integration_base_commit, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
                 (
                     planner_run_id,
                     session_id,
                     planner_id,
                     planner_type.value,
+                    planner_model,
                     integration_base_commit,
                     timestamp,
                 ),
@@ -307,6 +310,11 @@ def _to_record(row: object) -> PlannerRunRecord:
         session_id=str(row["session_id"]),  # type: ignore[index]
         planner_id=str(row["planner_id"]),  # type: ignore[index]
         planner_type=PlannerType(str(row["planner_type"])),  # type: ignore[index]
+        planner_model=(
+            str(row["planner_model"])  # type: ignore[index]
+            if row["planner_model"] is not None  # type: ignore[index]
+            else None
+        ),
         status=PlannerRunStatus(str(row["status"])),  # type: ignore[index]
         integration_base_commit=(
             str(row["integration_base_commit"])  # type: ignore[index]

@@ -30,6 +30,9 @@ class WorkflowRunEventPayload(StrictModel):
     previous_status: WorkflowRunStatus | None = None
     status: WorkflowRunStatus
     compiled_snapshot_hash: Sha256Hex | None = None
+    planner_run_id: EntityId | None = None
+    planner_id: EntityId | None = None
+    planner_model: str | None = Field(default=None, max_length=200)
     reason: str | None = Field(default=None, max_length=1_000)
 
 

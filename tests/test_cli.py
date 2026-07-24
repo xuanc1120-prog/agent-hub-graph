@@ -7,7 +7,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from app.cli import app
-from storage.db import Database
+from storage.db import SCHEMA_VERSION, Database
 from storage.leases import MasterLeaseRepository
 
 runner = CliRunner()
@@ -36,11 +36,11 @@ def test_init_db_is_idempotent(tmp_path: Path) -> None:
     assert first.exit_code == 0
     assert second.exit_code == 0
     payload = json.loads(first.stdout)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == SCHEMA_VERSION
     connection = sqlite3.connect(data_root / "agent-hub.db")
     version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
     connection.close()
-    assert version == 1
+    assert version == SCHEMA_VERSION
 
 
 def test_serve_fails_fast_when_master_lease_is_held(tmp_path: Path) -> None:
@@ -106,20 +106,30 @@ def test_cli_readonly_mock_phase_gate(fixture_source_repo: Path, tmp_path: Path)
             *common,
         ],
     )
+    shown = runner.invoke(app, ["show-run", "run-cli", *common])
     replayed = runner.invoke(
         app,
-        ["show-events", "--workflow-run-id", "run-cli", *common],
+        ["show-events", "--workflow-run-id", "run-cli", "--limit", "2", *common],
     )
 
-    for result in (registered, created, planned, validated, executed, replayed):
+    for result in (registered, created, planned, validated, executed, shown, replayed):
         assert result.exit_code == 0, result.stdout
     assert json.loads(created.stdout)["session_id"] == "session-cli"
     assert json.loads(planned.stdout)["demo_read_only"] is True
     assert json.loads(validated.stdout)["ok"] is True
     assert json.loads(executed.stdout)["status"] == "completed"
+    run = json.loads(shown.stdout)
+    assert run["planner_run_id"] == "planner-cli"
+    assert run["planner_id"] == "rule-based-planner"
+    assert run["planner_model"] is None
     events = json.loads(replayed.stdout)
+    assert len(events) > 2
     assert events[0]["run_seq"] == 1
     assert events[-1]["payload"]["status"] == "completed"
+    run_created = next(event for event in events if event["event_type"] == "workflow.run_created")
+    assert run_created["payload"]["planner_run_id"] == "planner-cli"
+    assert run_created["payload"]["planner_id"] == "rule-based-planner"
+    assert run_created["payload"]["planner_model"] is None
 
 
 def test_create_session_rejects_path_like_id_before_workspace_creation(

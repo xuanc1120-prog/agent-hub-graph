@@ -11,9 +11,12 @@ import aiosqlite
 
 from storage.errors import UnsupportedSchemaVersion
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _MIGRATION_PATH = Path(__file__).resolve().parent.parent / "migrations" / "init.sql"
+_MIGRATION_V2_PATH = (
+    Path(__file__).resolve().parent.parent / "migrations" / "0002_agent_routing_state.sql"
+)
 
 
 def normalize_utc(value: datetime | None = None) -> datetime:
@@ -119,6 +122,11 @@ class Database:
             try:
                 cursor = await connection.executescript(migration_sql)
                 await cursor.close()
+                if existing_version < 2:
+                    cursor = await connection.executescript(
+                        _MIGRATION_V2_PATH.read_text(encoding="utf-8")
+                    )
+                    await cursor.close()
             except BaseException:
                 await connection.rollback()
                 raise

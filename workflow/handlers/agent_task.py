@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from hashlib import sha256
 from typing import Literal
 
@@ -29,6 +30,8 @@ from storage.workflow_run_repository import (
     task_id_for_node,
 )
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _ReadOnlyRuntimePolicy(FrozenStrictModel):
@@ -185,7 +188,6 @@ class AgentTaskNodeHandler:
             ):
                 raise ValueError("AgentResult identity does not match the sealed task")
             cleanup = await self._bundles.cleanup(task_id)
-            bundle_created = False
             if cleanup.errors:
                 await self._runs.finish_task(
                     task_id,
@@ -199,6 +201,7 @@ class AgentTaskNodeHandler:
                     summary="Read-only context bundle cleanup failed.",
                     error_code="context_cleanup_failed",
                 )
+            bundle_created = False
             if agent_result.status == AgentResultStatus.SUCCEEDED:
                 output = _MockOutput(
                     task_id=task_id,
@@ -252,7 +255,17 @@ class AgentTaskNodeHandler:
             )
         finally:
             if bundle_created:
-                await self._bundles.cleanup(task_id)
+                try:
+                    retry = await self._bundles.cleanup(task_id)
+                except Exception:
+                    _LOGGER.warning("context bundle cleanup retry raised", exc_info=True)
+                else:
+                    if retry.errors:
+                        _LOGGER.warning(
+                            "context bundle cleanup retry failed for %s: %s",
+                            task_id,
+                            retry.errors,
+                        )
 
     async def _predecessor_refs(
         self,

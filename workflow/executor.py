@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from protocol import ArtifactType, NodeOutcome, NodeRunStatus, canonical_json
+from protocol import ArtifactType, NodeOutcome, NodeRunStatus, NodeType, canonical_json
 from storage.artifact_repository import ArtifactRepository
 from storage.leases import MasterLease
 from storage.repositories import SessionRepository
-from storage.workflow_run_repository import NodeRunRecord, WorkflowRunRepository
+from storage.workflow_run_repository import (
+    NodeRunRecord,
+    WorkflowRunRepository,
+    task_id_for_node,
+)
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workflow.registry import NodeRegistry
 
@@ -90,10 +94,15 @@ class GraphExecutor:
         output_artifact_id = None
         if result.artifact_refs:
             try:
+                if node.node_type != NodeType.AGENT_TASK:
+                    raise ValueError("only AgentTask handlers may return artifact references")
+                expected_task_id = task_id_for_node(claimed.node_run_id)
                 for ref in result.artifact_refs:
                     record = await self._artifacts.get(ref.artifact_id)
                     if (
                         record.session_id != run.session_id
+                        or record.task_id != expected_task_id
+                        or record.planner_run_id is not None
                         or record.artifact_type != ref.artifact_type.value
                         or record.relative_path != ref.relative_path
                         or record.sha256 != ref.sha256

@@ -423,6 +423,7 @@ class WorkflowApplication:
                     current_commit=validation.integration_base_commit,
                     planner_run_id=workflow.source_planner_run_id,
                     planner_id=planner_run.planner_id if planner_run is not None else None,
+                    planner_model=(planner_run.planner_model if planner_run is not None else None),
                 ),
                 lease=lease,
                 workspace_lease=workspace_lease,
@@ -448,9 +449,9 @@ class WorkflowApplication:
         if (workflow_run_id is None) == (session_id is None):
             raise ValueError("provide exactly one of workflow_run_id or session_id")
         if workflow_run_id is not None:
-            return await self.services.events.list_by_run(workflow_run_id, limit=limit)
+            return await self.services.events.list_all_by_run(workflow_run_id, page_size=limit)
         assert session_id is not None
-        return await self.services.events.list_by_session(session_id, limit=limit)
+        return await self.services.events.list_all_by_session(session_id, page_size=limit)
 
 
 @dataclass(frozen=True, slots=True)

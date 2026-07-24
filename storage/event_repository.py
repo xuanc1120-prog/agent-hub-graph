@@ -331,6 +331,55 @@ class EventRepository:
             await cursor.close()
         return [self._to_validated_record(r) for r in rows]
 
+    async def list_all_by_session(
+        self,
+        session_id: str,
+        *,
+        after_event_id: int = 0,
+        page_size: int = _MAX_LIMIT,
+    ) -> list[EventRecord]:
+        """Replay every session event after a stable event-id cursor."""
+
+        page_size = _validate_limit(page_size, "page_size")
+        cursor = after_event_id
+        result: list[EventRecord] = []
+        while True:
+            page = await self.list_by_session(
+                session_id,
+                after_event_id=cursor,
+                limit=page_size,
+            )
+            result.extend(page)
+            if len(page) < page_size:
+                return result
+            cursor = page[-1].event_id
+
+    async def list_all_by_run(
+        self,
+        workflow_run_id: str,
+        *,
+        after_run_seq: int = 0,
+        page_size: int = _MAX_LIMIT,
+    ) -> list[EventRecord]:
+        """Replay every run event after a stable run-sequence cursor."""
+
+        page_size = _validate_limit(page_size, "page_size")
+        cursor = after_run_seq
+        result: list[EventRecord] = []
+        while True:
+            page = await self.list_by_run(
+                workflow_run_id,
+                after_run_seq=cursor,
+                limit=page_size,
+            )
+            result.extend(page)
+            if len(page) < page_size:
+                return result
+            next_cursor = page[-1].run_seq
+            if next_cursor is None:
+                raise EventPayloadError("run event is missing its run_seq")
+            cursor = next_cursor
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
