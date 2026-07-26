@@ -47,7 +47,7 @@ flowchart LR
 
 ## 当前进度
 
-截至 2026-07-25，阶段 0 已完成；阶段 1 已完成 3/4，`HUB-110` 已完成二次复审修复并等待最终复审：
+截至 2026-07-26，阶段 0 和阶段 1 均已完成；`HUB-110` 已通过最终复审、集成到 `main`，阶段 1 CLI/Mock gate 已通过：
 
 | 任务 | 状态 | 内容 |
 |---|---|---|
@@ -58,7 +58,7 @@ flowchart LR
 | `HUB-100` | 已完成 | SQLite、Repository、CAS、幂等与 fencing lease |
 | `HUB-120` | 已完成 | RuleBasedPlanner、AgentRouter、fallback 与 lineage |
 | `HUB-130` | 已完成 | ContextPack、ArtifactStore、TaskContextBundle 与 EventRegistry |
-| `HUB-110` | 最终复审 | Author/Compiled 实质绑定与 migration 并发竞态已修复 |
+| `HUB-110` | 已完成 | Compiler、Scheduler、GraphExecutor 与只读 MockAgent 闭环 |
 
 当前开发分支已经具备协议、存储、规划、路由、确定性编译和只读 Mock 调度闭环，但以下部分尚未完成：
 
@@ -66,7 +66,7 @@ flowchart LR
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步是完成 `HUB-110` 最终复审、集成与阶段 1 CLI/Mock gate，之后再启动 `HUB-200`。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步启动 `HUB-200`，实现共享工作区、ChangeSet 和 Guard 安全链。
 
 ## 技术栈
 

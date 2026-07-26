@@ -1,6 +1,6 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
-## 当前执行基线（2026-07-25）
+## 当前执行基线（2026-07-26）
 
 协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
@@ -13,17 +13,17 @@
 | HUB-100 | completed | SQLite、Repository、CAS、idempotency 和 fencing lease 已集成 |
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
-| HUB-110 | re-review | 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已修复，等待最终复审 |
+| HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
 
-`HUB-130` 已通过 Codex 审查并集成。`HUB-110` 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已在 `codex/hub-110-review-fixes` 修复；当前不得提前启动依赖它的写入运行时。后续顺序为：
+阶段 0 和阶段 1 已完成。`HUB-110` 最终复审确认无 P0/P1/P2，已集成到 `main`；只读 Mock workflow 可由 CLI 从 Session 创建运行到 completed，并完整回放 snapshot、node/task 状态和事件。后续顺序为：
 
 ```text
-HUB-110（Claude Code 最终复审）
+HUB-200（Workspace、ChangeSet、Guard）
         ↓
-阶段 1 CLI + Mock workflow 集成验收
+HUB-210（Approval、Merge、Cancel、Recovery）
 ```
 
-下一步先完成 `HUB-110` 最终复审，再由 Codex 集成并执行阶段 1 gate。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+下一步开始 `HUB-200`。真实写任务在 `HUB-200/210` 完成前继续 fail closed。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 
