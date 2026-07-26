@@ -8,6 +8,7 @@ directory structure, without depending on the ``protocol`` package layout.
 
 from __future__ import annotations
 
+from protocol import IfOperator
 from protocol.workflow import (
     AgentRecommendation,
     AuthorGraph,
@@ -21,6 +22,61 @@ from protocol.workflow import (
     WorkflowNode,
 )
 
+
+def normalize_command_templates(commands: list[list[str]]) -> list[list[str]]:
+    """Deduplicate argv templates without changing execution order."""
+
+    seen: set[tuple[str, ...]] = set()
+    result: list[list[str]] = []
+    for command in commands:
+        key = tuple(command)
+        if key not in seen:
+            seen.add(key)
+            result.append(list(command))
+    return result
+
+
+def normalize_author_graph(graph: AuthorGraph) -> AuthorGraph:
+    """Canonicalize set-like fields while preserving ordered semantics."""
+
+    nodes: list[WorkflowNode] = []
+    for node in graph.nodes:
+        condition = node.if_condition
+        if (
+            condition is not None
+            and condition.operator == IfOperator.IN
+            and isinstance(condition.value, list)
+        ):
+            condition = condition.model_copy(
+                update={"value": sorted(set(condition.value))},
+                deep=True,
+            )
+        nodes.append(
+            node.model_copy(
+                update={
+                    "if_condition": condition,
+                    "recommended_agents": sorted(
+                        node.recommended_agents,
+                        key=lambda item: (item.agent_id, -item.score, item.reason),
+                    ),
+                    "allowed_files_candidate": sorted(node.allowed_files_candidate),
+                    "new_files_candidate": sorted(node.new_files_candidate),
+                    # Command order is execution order. Preserve it, including
+                    # duplicates, so DraftValidator can reject ambiguous input.
+                    "allowed_commands_candidate": [
+                        list(command) for command in node.allowed_commands_candidate
+                    ],
+                },
+                deep=True,
+            )
+        )
+    return AuthorGraph(
+        schema_version=graph.schema_version,
+        nodes=sorted(nodes, key=lambda item: item.id),
+        edges=sorted(graph.edges, key=lambda item: item.id),
+    )
+
+
 __all__ = [
     "AgentRecommendation",
     "AuthorGraph",
@@ -32,4 +88,6 @@ __all__ = [
     "WorkflowEdge",
     "WorkflowLayout",
     "WorkflowNode",
+    "normalize_author_graph",
+    "normalize_command_templates",
 ]

@@ -12,6 +12,7 @@ from pydantic import TypeAdapter
 
 from protocol import (
     AuthorGraph,
+    CompiledGraph,
     EntityId,
     GitObjectId,
     SessionStatus,
@@ -20,7 +21,9 @@ from protocol import (
     canonical_json,
 )
 from storage.db import Database, Transaction, utc_now_text
-from storage.errors import ConcurrencyConflict, RecordNotFound
+from storage.errors import ConcurrencyConflict, RecordNotFound, SnapshotIntegrityError
+from storage.leases import WorkspaceLease, WorkspaceLeaseRepository
+from workflow.graph_model import normalize_author_graph
 
 _ENTITY_ID = TypeAdapter(EntityId)
 _GIT_OBJECT_ID = TypeAdapter(GitObjectId)
@@ -41,6 +44,10 @@ def _sha256(value: str) -> str:
 
 def _model_hash(model: AuthorGraph | WorkflowLayout) -> str:
     return sha256(canonical_json(model)).hexdigest()
+
+
+def _normalize_layout(layout: WorkflowLayout) -> WorkflowLayout:
+    return WorkflowLayout(nodes=sorted(layout.nodes, key=lambda item: item.node_id))
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +98,12 @@ class WorkflowRecord:
     author_graph_hash: str
     layout: WorkflowLayout
     layout_hash: str
+    last_compiled_graph: CompiledGraph | None
+    last_compiled_graph_hash: str | None
+    last_compiled_semantic_version: int | None
+    last_compiled_agent_catalog_hash: str | None
+    last_compiled_base_commit: str | None
+    policy_version: str | None
     created_at: str
     updated_at: str
 
@@ -218,67 +231,76 @@ class WorkflowRepository:
         self._database = database
 
     async def create(self, value: NewWorkflow, *, now: datetime | None = None) -> WorkflowRecord:
+        async with self._database.immediate_transaction() as transaction:
+            return await self.create_in(transaction, value, now=now)
+
+    async def create_in(
+        self,
+        transaction: Transaction,
+        value: NewWorkflow,
+        *,
+        now: datetime | None = None,
+    ) -> WorkflowRecord:
         workflow_id = _entity_id(value.workflow_id)
         session_id = _entity_id(value.session_id)
         parent_id = _entity_id(value.parent_workflow_id) if value.parent_workflow_id else None
         planner_run_id = (
             _entity_id(value.source_planner_run_id) if value.source_planner_run_id else None
         )
-        author_json = canonical_json(value.author_graph).decode("utf-8")
-        layout_json = canonical_json(value.layout).decode("utf-8")
-        author_hash = _model_hash(value.author_graph)
-        layout_hash = _model_hash(value.layout)
+        normalized_author = normalize_author_graph(value.author_graph)
+        author_json = canonical_json(normalized_author).decode("utf-8")
+        normalized_layout = _normalize_layout(value.layout)
+        layout_json = canonical_json(normalized_layout).decode("utf-8")
+        author_hash = _model_hash(normalized_author)
+        layout_hash = _model_hash(normalized_layout)
         timestamp = utc_now_text(now)
 
-        async with self._database.immediate_transaction() as transaction:
-            session = await _fetchone(
-                transaction, "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        session = await _fetchone(
+            transaction, "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        )
+        if session is None:
+            raise RecordNotFound(f"session not found: {session_id}")
+        if parent_id is not None:
+            parent = await _fetchone(
+                transaction, "SELECT session_id FROM workflows WHERE id = ?", (parent_id,)
             )
-            if session is None:
-                raise RecordNotFound(f"session not found: {session_id}")
-            if parent_id is not None:
-                parent = await _fetchone(
-                    transaction, "SELECT session_id FROM workflows WHERE id = ?", (parent_id,)
-                )
-                if parent is None:
-                    raise RecordNotFound(f"parent workflow not found: {parent_id}")
-                if parent["session_id"] != session_id:
-                    raise ValueError("parent workflow must belong to the same session")
-            if planner_run_id is not None:
-                planner = await _fetchone(
-                    transaction,
-                    "SELECT session_id FROM planner_runs WHERE id = ?",
-                    (planner_run_id,),
-                )
-                if planner is None:
-                    raise RecordNotFound(f"planner run not found: {planner_run_id}")
-                if planner["session_id"] != session_id:
-                    raise ValueError("source planner run must belong to the same session")
+            if parent is None:
+                raise RecordNotFound(f"parent workflow not found: {parent_id}")
+            if parent["session_id"] != session_id:
+                raise ValueError("parent workflow must belong to the same session")
+        if planner_run_id is not None:
+            planner = await _fetchone(
+                transaction,
+                "SELECT session_id FROM planner_runs WHERE id = ?",
+                (planner_run_id,),
+            )
+            if planner is None:
+                raise RecordNotFound(f"planner run not found: {planner_run_id}")
+            if planner["session_id"] != session_id:
+                raise ValueError("source planner run must belong to the same session")
 
-            await transaction.execute(
-                """
-                INSERT INTO workflows(
-                    id, session_id, parent_workflow_id, source_planner_run_id,
-                    semantic_version, layout_version, author_graph_json, author_graph_hash,
-                    layout_json, layout_hash, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    workflow_id,
-                    session_id,
-                    parent_id,
-                    planner_run_id,
-                    author_json,
-                    author_hash,
-                    layout_json,
-                    layout_hash,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            row = await _fetchone(
-                transaction, "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
-            )
+        await transaction.execute(
+            """
+            INSERT INTO workflows(
+                id, session_id, parent_workflow_id, source_planner_run_id,
+                semantic_version, layout_version, author_graph_json, author_graph_hash,
+                layout_json, layout_hash, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workflow_id,
+                session_id,
+                parent_id,
+                planner_run_id,
+                author_json,
+                author_hash,
+                layout_json,
+                layout_hash,
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = await _fetchone(transaction, "SELECT * FROM workflows WHERE id = ?", (workflow_id,))
         assert row is not None
         return self._to_record(row)
 
@@ -303,8 +325,9 @@ class WorkflowRepository:
         if expected_semantic_version < 1:
             raise ValueError("expected_semantic_version must be positive")
         resolved_id = _entity_id(workflow_id)
-        payload = canonical_json(author_graph).decode("utf-8")
-        payload_hash = _model_hash(author_graph)
+        normalized_author = normalize_author_graph(author_graph)
+        payload = canonical_json(normalized_author).decode("utf-8")
+        payload_hash = _model_hash(normalized_author)
         timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as transaction:
             changed = await transaction.execute(
@@ -337,8 +360,9 @@ class WorkflowRepository:
         if expected_layout_version < 1:
             raise ValueError("expected_layout_version must be positive")
         resolved_id = _entity_id(workflow_id)
-        payload = canonical_json(layout).decode("utf-8")
-        payload_hash = _model_hash(layout)
+        normalized_layout = _normalize_layout(layout)
+        payload = canonical_json(normalized_layout).decode("utf-8")
+        payload_hash = _model_hash(normalized_layout)
         timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as transaction:
             changed = await transaction.execute(
@@ -356,6 +380,76 @@ class WorkflowRepository:
                 )
             row = await _fetchone(
                 transaction, "SELECT * FROM workflows WHERE id = ?", (resolved_id,)
+            )
+        assert row is not None
+        return self._to_record(row)
+
+    async def save_compiled_preview(
+        self,
+        workflow_id: str,
+        compiled_graph: CompiledGraph,
+        *,
+        expected_semantic_version: int,
+        workspace_lease: WorkspaceLease,
+        workspace_leases: WorkspaceLeaseRepository,
+        now: datetime | None = None,
+    ) -> WorkflowRecord:
+        """Persist a compile preview only if its complete source tuple is current."""
+
+        if expected_semantic_version < 1:
+            raise ValueError("expected_semantic_version must be positive")
+        resolved_id = _entity_id(workflow_id)
+        payload = canonical_json(compiled_graph).decode("utf-8")
+        payload_hash = sha256(canonical_json(compiled_graph)).hexdigest()
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            current = await _fetchone(
+                transaction,
+                "SELECT session_id FROM workflows WHERE id = ?",
+                (resolved_id,),
+            )
+            if current is None:
+                raise RecordNotFound(f"workflow not found: {resolved_id}")
+            expected_resource = f"session:{current['session_id']}:integration"
+            if workspace_lease.resource_key != expected_resource:
+                raise ValueError("workspace lease does not belong to the workflow session")
+            await workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
+            changed = await transaction.execute(
+                """
+                UPDATE workflows
+                SET last_compiled_graph_json = ?,
+                    last_compiled_graph_hash = ?,
+                    last_compiled_semantic_version = ?,
+                    last_compiled_agent_catalog_hash = ?,
+                    last_compiled_base_commit = ?,
+                    policy_version = ?,
+                    updated_at = ?
+                WHERE id = ? AND semantic_version = ? AND author_graph_hash = ?
+                """,
+                (
+                    payload,
+                    payload_hash,
+                    expected_semantic_version,
+                    compiled_graph.agent_catalog_snapshot_hash,
+                    compiled_graph.integration_base_commit,
+                    compiled_graph.policy_version,
+                    timestamp,
+                    resolved_id,
+                    expected_semantic_version,
+                    compiled_graph.source_author_hash,
+                ),
+            )
+            if changed != 1:
+                await self._raise_workflow_conflict(
+                    transaction,
+                    resolved_id,
+                    "semantic_version",
+                    expected_semantic_version,
+                )
+            row = await _fetchone(
+                transaction,
+                "SELECT * FROM workflows WHERE id = ?",
+                (resolved_id,),
             )
         assert row is not None
         return self._to_record(row)
@@ -378,6 +472,46 @@ class WorkflowRepository:
 
     @staticmethod
     def _to_record(row: aiosqlite.Row) -> WorkflowRecord:
+        author_graph = AuthorGraph.model_validate_json(str(row["author_graph_json"]))
+        author_graph_hash = _sha256(str(row["author_graph_hash"]))
+        layout = WorkflowLayout.model_validate_json(str(row["layout_json"]))
+        layout_hash = _sha256(str(row["layout_hash"]))
+        if _model_hash(author_graph) != author_graph_hash:
+            raise SnapshotIntegrityError("workflow author graph hash does not match its JSON")
+        if _model_hash(layout) != layout_hash:
+            raise SnapshotIntegrityError("workflow layout hash does not match its JSON")
+
+        compiled = (
+            CompiledGraph.model_validate_json(str(row["last_compiled_graph_json"]))
+            if row["last_compiled_graph_json"] is not None
+            else None
+        )
+        compiled_hash = (
+            _sha256(str(row["last_compiled_graph_hash"]))
+            if row["last_compiled_graph_hash"] is not None
+            else None
+        )
+        compiled_metadata = (
+            row["last_compiled_semantic_version"],
+            row["last_compiled_agent_catalog_hash"],
+            row["last_compiled_base_commit"],
+            row["policy_version"],
+        )
+        if compiled is None:
+            if compiled_hash is not None or any(value is not None for value in compiled_metadata):
+                raise SnapshotIntegrityError("workflow compiled preview metadata is incomplete")
+        else:
+            if compiled_hash is None or any(value is None for value in compiled_metadata):
+                raise SnapshotIntegrityError("workflow compiled preview metadata is incomplete")
+            if sha256(canonical_json(compiled)).hexdigest() != compiled_hash:
+                raise SnapshotIntegrityError("workflow compiled preview hash is invalid")
+            if (
+                compiled.agent_catalog_snapshot_hash != str(row["last_compiled_agent_catalog_hash"])
+                or compiled.integration_base_commit != str(row["last_compiled_base_commit"])
+                or compiled.policy_version != str(row["policy_version"])
+            ):
+                raise SnapshotIntegrityError("workflow compiled preview metadata drifted")
+
         return WorkflowRecord(
             workflow_id=str(row["id"]),
             session_id=str(row["session_id"]),
@@ -391,10 +525,30 @@ class WorkflowRepository:
             ),
             semantic_version=int(row["semantic_version"]),
             layout_version=int(row["layout_version"]),
-            author_graph=AuthorGraph.model_validate_json(str(row["author_graph_json"])),
-            author_graph_hash=_sha256(str(row["author_graph_hash"])),
-            layout=WorkflowLayout.model_validate_json(str(row["layout_json"])),
-            layout_hash=_sha256(str(row["layout_hash"])),
+            author_graph=author_graph,
+            author_graph_hash=author_graph_hash,
+            layout=layout,
+            layout_hash=layout_hash,
+            last_compiled_graph=compiled,
+            last_compiled_graph_hash=compiled_hash,
+            last_compiled_semantic_version=(
+                int(row["last_compiled_semantic_version"])
+                if row["last_compiled_semantic_version"] is not None
+                else None
+            ),
+            last_compiled_agent_catalog_hash=(
+                _sha256(str(row["last_compiled_agent_catalog_hash"]))
+                if row["last_compiled_agent_catalog_hash"] is not None
+                else None
+            ),
+            last_compiled_base_commit=(
+                _git_object_id(str(row["last_compiled_base_commit"]))
+                if row["last_compiled_base_commit"] is not None
+                else None
+            ),
+            policy_version=(
+                str(row["policy_version"]) if row["policy_version"] is not None else None
+            ),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )

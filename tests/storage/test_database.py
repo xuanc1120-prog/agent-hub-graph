@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +68,7 @@ async def test_initialize_is_idempotent_and_creates_v1_schema(database: Database
         cursor = await connection.execute(
             "SELECT version, length(applied_at) FROM schema_migrations"
         )
-        migration = await cursor.fetchone()
+        migrations = await cursor.fetchall()
         await cursor.close()
         cursor = await connection.execute("PRAGMA foreign_key_check")
         foreign_key_errors = await cursor.fetchall()
@@ -77,7 +78,7 @@ async def test_initialize_is_idempotent_and_creates_v1_schema(database: Database
         await cursor.close()
 
     assert tables == EXPECTED_TABLES
-    assert tuple(migration) == (1, 27)
+    assert [tuple(row) for row in migrations] == [(1, 27), (2, 27)]
     assert foreign_key_errors == []
     assert integrity is not None and integrity[0] == "ok"
 
@@ -215,13 +216,58 @@ async def test_enum_checks_cover_every_frozen_protocol_value(database: Database)
                     assert f"'{member.value}'" in sql, f"{table} does not constrain {member.value}"
 
 
+@pytest.mark.parametrize("seed_v1", [False, True], ids=["fresh", "v1"])
+async def test_concurrent_initializers_share_one_migration_lock(
+    tmp_path: Path,
+    *,
+    seed_v1: bool,
+) -> None:
+    path = tmp_path / f"concurrent-{seed_v1}.db"
+    if seed_v1:
+        migration = (Path(__file__).resolve().parents[2] / "migrations" / "init.sql").read_text(
+            encoding="utf-8"
+        )
+        connection = sqlite3.connect(path)
+        connection.executescript(migration)
+        connection.close()
+
+    release = asyncio.Event()
+    all_ready = asyncio.Event()
+    ready = 0
+
+    async def initialize(database: Database) -> int:
+        nonlocal ready
+        ready += 1
+        if ready == 2:
+            all_ready.set()
+        await release.wait()
+        return await database.initialize()
+
+    tasks = [
+        asyncio.create_task(initialize(Database(path))),
+        asyncio.create_task(initialize(Database(path))),
+    ]
+    await all_ready.wait()
+    release.set()
+
+    assert await asyncio.gather(*tasks) == [SCHEMA_VERSION, SCHEMA_VERSION]
+    connection = sqlite3.connect(path)
+    versions = connection.execute(
+        "SELECT version FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(agents)").fetchall()}
+    connection.close()
+    assert versions == [(1,), (2,)]
+    assert {"available", "auto_assignable", "unavailable_reason"} <= columns
+
+
 async def test_newer_schema_fails_before_applying_v1(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     connection = sqlite3.connect(path)
     connection.executescript(
         f"""
         CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-        INSERT INTO schema_migrations VALUES (2, '{TIMESTAMP}');
+        INSERT INTO schema_migrations VALUES ({SCHEMA_VERSION + 1}, '{TIMESTAMP}');
         """
     )
     connection.close()

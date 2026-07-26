@@ -1,6 +1,6 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
-## 当前执行基线（2026-07-17）
+## 当前执行基线（2026-07-25）
 
 协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
@@ -13,17 +13,17 @@
 | HUB-100 | completed | SQLite、Repository、CAS、idempotency 和 fencing lease 已集成 |
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
-| HUB-110 | next | 依赖已满足，下一步准备 Compiler/Executor/MockAgent 纵向闭环 |
+| HUB-110 | re-review | 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已修复，等待最终复审 |
 
-`HUB-130` 已通过 Codex 审查并集成。下一开发波次只启动 `HUB-110`，必须从包含 HUB-130 的最新 `main` 创建 task-specific worktree 并记录实际 base commit；已完成的 Agent worktree 只保留任务证据，不再继续开发。后续顺序为：
+`HUB-130` 已通过 Codex 审查并集成。`HUB-110` 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已在 `codex/hub-110-review-fixes` 修复；当前不得提前启动依赖它的写入运行时。后续顺序为：
 
 ```text
-HUB-110（Codex）
+HUB-110（Claude Code 最终复审）
         ↓
 阶段 1 CLI + Mock workflow 集成验收
 ```
 
-下一步先基于已集成的 Context、Artifact 和 Event API 编写 `HUB-110` 执行简报，再创建 Codex 独立 worktree。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+下一步先完成 `HUB-110` 最终复审，再由 Codex 集成并执行阶段 1 gate。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 

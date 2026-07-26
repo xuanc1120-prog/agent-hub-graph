@@ -24,17 +24,18 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 ## 3. 阶段任务
 
-### 当前执行看板（2026-07-17）
+### 当前执行看板（2026-07-25）
 
 | 状态 | 任务 |
 |---|---|
 | completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-120`、`HUB-130` |
-| next | `HUB-110`：依赖已满足，准备 Compiler/Executor/MockAgent 纵向闭环简报和独立 worktree |
+| re-review | `HUB-110`：二次复审新增的 1 项 P1 和 1 项 P2 已修复，等待 Claude Code 最终复审 |
+| next | Claude Code 最终复审；通过后由 Codex 集成 `HUB-110` 并执行阶段 1 CLI/Mock gate |
 | later | `HUB-200` 及后续任务；等待阶段 1 门槛通过 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `3/4`，总任务为 `7/25`。主分支最近一次组合验证为 Python `332 passed, 5 skipped`，前端 Vitest `7 passed`、Playwright `1 passed`，Ruff、构建和依赖审计均通过。
+当前进度：阶段 0 为 `4/4`，阶段 1 已集成为 `3/4`，总任务已集成为 `7/25`。`HUB-110` 最新修复分支本地验证为 Python `389 passed, 5 skipped`、前端 Vitest `7 passed`，Ruff、Oxlint 和生产构建均通过。Playwright smoke 断言通过且无进程残留；Claude 二次复审环境正常退出，当前 Codex 沙箱仍在 WebServer teardown 阶段超时。
 
-协议冻结点为 `contracts-frozen-v1`。`HUB-130` 已审查并集成到 `main`；下一执行顺序为 `HUB-110 -> 阶段 1 CLI/Mock gate`。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。`HUB-130` 已审查并集成到 `main`；当前执行顺序为 `HUB-110 最终复审 -> Codex 集成 -> 阶段 1 CLI/Mock gate -> HUB-200`。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 
