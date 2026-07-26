@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from pathlib import Path
 
 import aiosqlite
 
@@ -23,6 +24,8 @@ from protocol import (
     WorkflowRunStatus,
     canonical_json,
 )
+from security.command_guard import CommandGuard
+from security.path_policy import PathPolicy
 from storage.agent_repository import AgentRepository, compute_agent_catalog_hash
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ConcurrencyConflict, RecordNotFound, SnapshotIntegrityError
@@ -219,7 +222,8 @@ class WorkflowRunRepository:
                 SELECT w.session_id, w.semantic_version, w.layout_version,
                        w.author_graph_hash, w.layout_hash,
                        s.status AS session_status,
-                       s.integration_head_commit
+                       s.integration_head_commit,
+                       s.shared_repo_path
                 FROM workflows w
                 JOIN sessions s ON w.session_id = s.id
                 WHERE w.id = ?
@@ -247,6 +251,8 @@ class WorkflowRunRepository:
             authoritative = WorkflowCompiler(
                 current_catalog,
                 policy_version=self._policy_version,
+                path_policy=PathPolicy(Path(str(current["shared_repo_path"]))),
+                command_guard=CommandGuard(),
             ).compile(
                 workflow.author_graph,
                 integration_base_commit=value.current_commit,
