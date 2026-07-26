@@ -90,8 +90,10 @@ async def test_full_run_replay_crosses_repository_page_limit(
             )
 
     events = await repository.list_all_by_run("run-replay", page_size=37)
+    session_events = await repository.list_all_by_session("session-replay", page_size=41)
 
     assert len(events) == 603
     assert [event.run_seq for event in events] == list(range(1, 604))
     assert len({event.event_id for event in events}) == 603
     assert events[-1].run_seq == 603
+    assert [event.event_id for event in session_events] == [event.event_id for event in events]

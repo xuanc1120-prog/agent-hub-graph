@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 
 from master.router import AgentCapability, AgentCatalog, AgentSpec
 from protocol import EntityId
-from storage.db import Database, utc_now_text
+from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ConcurrencyConflict, RecordNotFound
 
 _ENTITY_ID = TypeAdapter(EntityId)
@@ -93,11 +93,21 @@ class AgentRepository:
             cursor = await connection.execute("SELECT * FROM agents ORDER BY id")
             rows = await cursor.fetchall()
             await cursor.close()
-        specs = tuple(_to_spec(_row_to_registration(row)) for row in rows)
-        return AgentCatalog(agents=specs, catalog_hash=compute_agent_catalog_hash(specs))
+        return _catalog_from_rows(rows)
+
+    async def catalog_in(self, transaction: Transaction) -> AgentCatalog:
+        """Load the authoritative catalog inside a caller-owned transaction."""
+
+        rows = await transaction.fetch_all("SELECT * FROM agents ORDER BY id")
+        return _catalog_from_rows(rows)
 
     async def register_mock(self, *, now: datetime | None = None) -> AgentSpec:
         return await self.register(mock_agent_registration(), now=now)
+
+
+def _catalog_from_rows(rows: list[object]) -> AgentCatalog:
+    specs = tuple(_to_spec(_row_to_registration(row)) for row in rows)
+    return AgentCatalog(agents=specs, catalog_hash=compute_agent_catalog_hash(specs))
 
 
 def mock_agent_registration() -> AgentRegistration:

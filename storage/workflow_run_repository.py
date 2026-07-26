@@ -23,7 +23,7 @@ from protocol import (
     WorkflowRunStatus,
     canonical_json,
 )
-from storage.agent_repository import compute_agent_catalog_hash
+from storage.agent_repository import AgentRepository, compute_agent_catalog_hash
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ConcurrencyConflict, RecordNotFound, SnapshotIntegrityError
 from storage.event_repository import EventRepository
@@ -34,6 +34,7 @@ from storage.leases import (
     WorkspaceLeaseRepository,
 )
 from storage.repositories import WorkflowRecord
+from workflow.compiler import WorkflowCompiler
 from workflow.events import (
     NODE_STATE_CHANGED,
     RUN_CREATED,
@@ -141,11 +142,17 @@ class WorkflowRunRepository:
         events: EventRepository,
         leases: MasterLeaseRepository,
         workspace_leases: WorkspaceLeaseRepository,
+        *,
+        policy_version: str = "demo-v1",
     ) -> None:
+        if not policy_version or len(policy_version) > 64:
+            raise ValueError("policy_version must contain 1..64 characters")
         self._database = database
         self._events = events
         self._leases = leases
         self._workspace_leases = workspace_leases
+        self._agents = AgentRepository(database)
+        self._policy_version = policy_version
 
     async def create(
         self,
@@ -186,12 +193,10 @@ class WorkflowRunRepository:
                 )
 
         author_json = canonical_json(workflow.author_graph).decode("utf-8")
-        compiled_json = canonical_json(graph).decode("utf-8")
+        submitted_compiled_json = canonical_json(graph)
         layout = _normalized_layout(workflow.layout)
         layout_json = canonical_json(layout).decode("utf-8")
-        catalog_json = canonical_json(value.agent_catalog).decode("utf-8")
         author_hash = sha256(author_json.encode()).hexdigest()
-        compiled_hash = sha256(compiled_json.encode()).hexdigest()
         layout_hash = sha256(layout_json.encode()).hexdigest()
         timestamp = utc_now_text(now)
         if author_hash != workflow.author_graph_hash:
@@ -235,6 +240,34 @@ class WorkflowRunRepository:
                 raise ConcurrencyConflict("workflow run requires an active session")
             if str(current["integration_head_commit"]) != value.current_commit:
                 raise ConcurrencyConflict("session integration HEAD changed before run creation")
+
+            current_catalog = await self._agents.catalog_in(transaction)
+            if current_catalog.catalog_hash != value.agent_catalog.catalog_hash:
+                raise ConcurrencyConflict("agent catalog changed before run snapshot creation")
+            authoritative = WorkflowCompiler(
+                current_catalog,
+                policy_version=self._policy_version,
+            ).compile(
+                workflow.author_graph,
+                integration_base_commit=value.current_commit,
+            )
+            if not authoritative.ok or authoritative.graph is None:
+                raise SnapshotIntegrityError(
+                    "authoritative workflow compilation failed before snapshot creation"
+                )
+            authoritative_compiled_json = canonical_json(authoritative.graph)
+            if (
+                authoritative.source_author_hash != author_hash
+                or authoritative_compiled_json != submitted_compiled_json
+            ):
+                raise SnapshotIntegrityError(
+                    "submitted compiled graph is not the deterministic workflow compilation"
+                )
+            graph = authoritative.graph
+            compiled_json = authoritative_compiled_json.decode("utf-8")
+            compiled_hash = sha256(authoritative_compiled_json).hexdigest()
+            catalog_json = canonical_json(current_catalog).decode("utf-8")
+
             if value.planner_run_id is not None:
                 planner = await transaction.fetch_one(
                     """

@@ -13,17 +13,17 @@
 | HUB-100 | completed | SQLite、Repository、CAS、idempotency 和 fencing lease 已集成 |
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
-| HUB-110 | re-review | 首次交叉复审的 4 项 P1 和 4 项 P2 已修复并完成全仓回归，等待二次复审 |
+| HUB-110 | re-review | 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已修复，等待最终复审 |
 
-`HUB-130` 已通过 Codex 审查并集成。`HUB-110` 首次交叉复审发现的 4 项 P1 和 4 项 P2 已在 `codex/hub-110-review-fixes` 修复；当前不得提前启动依赖它的写入运行时。后续顺序为：
+`HUB-130` 已通过 Codex 审查并集成。`HUB-110` 二次复审新增的 compiled provenance P1 和 migration concurrency P2 已在 `codex/hub-110-review-fixes` 修复；当前不得提前启动依赖它的写入运行时。后续顺序为：
 
 ```text
-HUB-110（Claude Code 二次复审）
+HUB-110（Claude Code 最终复审）
         ↓
 阶段 1 CLI + Mock workflow 集成验收
 ```
 
-下一步先完成 `HUB-110` 二次复审，再由 Codex 集成并执行阶段 1 gate。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+下一步先完成 `HUB-110` 最终复审，再由 Codex 集成并执行阶段 1 gate。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 

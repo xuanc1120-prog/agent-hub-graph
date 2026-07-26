@@ -10,11 +10,13 @@ import pytest
 
 from adapters.mock import MockAgentAdapter
 from context.task_bundle import CleanupResult, TaskContextBundle
+from master.router import AgentCapability
 from protocol import (
     ArtifactRef,
     ArtifactType,
     AssignmentMode,
     AuthorGraph,
+    CompiledGraph,
     EdgeCondition,
     IfCondition,
     IfOperator,
@@ -29,11 +31,11 @@ from protocol import (
     WorkflowNode,
     WorkflowRunStatus,
 )
-from storage.agent_repository import AgentRepository
+from storage.agent_repository import AgentRegistration, AgentRepository
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import ArtifactStore
 from storage.db import Database
-from storage.errors import LeaseLost, SnapshotIntegrityError
+from storage.errors import ConcurrencyConflict, LeaseLost, SnapshotIntegrityError
 from storage.event_repository import EventRepository
 from storage.leases import MasterLease, MasterLeaseRepository, WorkspaceLeaseRepository
 from storage.repositories import (
@@ -116,6 +118,119 @@ async def test_readonly_mock_workflow_is_durable_and_replayable(
         node for node in replay.compiled_snapshot.nodes if node.node_type == NodeType.AGENT_TASK
     )
     assert snapshot_task.title == "Analyze fixture"
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["risk", "command", "file_scope", "write_to_readonly"],
+)
+async def test_run_snapshot_rejects_synchronized_compiled_graph_tampering(
+    runtime_database: Database,
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    tamper_kind: str,
+) -> None:
+    runtime = await _build_runtime(runtime_database, tmp_path)
+    await runtime.agents.register(
+        AgentRegistration(
+            agent_id="writer",
+            display_name="Writer",
+            adapter_type="mock",
+            capabilities=frozenset(
+                {
+                    AgentCapability.READ_CODE,
+                    AgentCapability.IMPLEMENT,
+                    AgentCapability.WRITE_FILES,
+                    AgentCapability.GENERATE_PATCH,
+                }
+            ),
+        )
+    )
+    session, workflow = await _seed_workflow(
+        runtime_database,
+        fixture_source_repo,
+        _write_graph(),
+    )
+    catalog = await runtime.agents.catalog()
+    compilation = WorkflowCompiler(catalog).compile(
+        workflow.author_graph,
+        integration_base_commit=session.integration_head_commit,
+    )
+    assert compilation.ok and compilation.graph is not None
+    tampered = _tamper_compiled_graph(compilation.graph, tamper_kind)
+    write_runtime_enabled = tamper_kind != "write_to_readonly"
+    assert (
+        ExecutableValidator(
+            runtime.registry,
+            write_runtime_enabled=write_runtime_enabled,
+        )
+        .validate(tampered)
+        .ok
+    )
+    lease = await runtime.leases.acquire(
+        instance_id=f"snapshot-seal-{tamper_kind}",
+        process_id=1234,
+        ttl_seconds=60,
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="deterministic workflow compilation"):
+        await _create_run(
+            runtime,
+            NewWorkflowRun(
+                workflow_run_id=f"run-snapshot-seal-{tamper_kind}",
+                workflow=workflow,
+                compiled_graph=tampered,
+                agent_catalog=catalog,
+                current_commit=session.integration_head_commit,
+            ),
+            lease=lease,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_snapshot_rejects_catalog_change_after_compilation(
+    runtime_database: Database,
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = await _build_runtime(runtime_database, tmp_path)
+    session, workflow = await _seed_workflow(
+        runtime_database,
+        fixture_source_repo,
+        _readonly_graph(),
+    )
+    stale_catalog = await runtime.agents.catalog()
+    compilation = WorkflowCompiler(stale_catalog).compile(
+        workflow.author_graph,
+        integration_base_commit=session.integration_head_commit,
+    )
+    assert compilation.ok and compilation.graph is not None
+    await runtime.agents.register(
+        AgentRegistration(
+            agent_id="late-agent",
+            display_name="Late Agent",
+            adapter_type="mock",
+            capabilities=frozenset({AgentCapability.READ_CODE, AgentCapability.ANALYZE}),
+        )
+    )
+    lease = await runtime.leases.acquire(
+        instance_id="catalog-drift-master",
+        process_id=1234,
+        ttl_seconds=60,
+    )
+
+    with pytest.raises(ConcurrencyConflict, match="agent catalog changed"):
+        await _create_run(
+            runtime,
+            NewWorkflowRun(
+                workflow_run_id="run-catalog-drift",
+                workflow=workflow,
+                compiled_graph=compilation.graph,
+                agent_catalog=stale_catalog,
+                current_commit=session.integration_head_commit,
+            ),
+            lease=lease,
+        )
 
 
 @pytest.mark.asyncio
@@ -894,6 +1009,73 @@ def _readonly_graph() -> AuthorGraph:
             WorkflowEdge(id="e2", from_node="analyze", to_node="output"),
         ],
     )
+
+
+def _write_graph() -> AuthorGraph:
+    graph = _readonly_graph().model_copy(deep=True)
+    task = next(node for node in graph.nodes if node.node_type == NodeType.AGENT_TASK)
+    task.task_kind = TaskKind.IMPLEMENT
+    task.instruction = "Implement the bounded change and run the approved test."
+    task.assigned_agent = "writer"
+    task.requires_write = True
+    task.risk_level_hint = RiskLevel.L3
+    task.allowed_files_candidate = []
+    task.new_files_candidate = ["src/new.py"]
+    task.allowed_commands_candidate = [["pytest", "-q"]]
+    return graph
+
+
+def _tamper_compiled_graph(graph: CompiledGraph, kind: str) -> CompiledGraph:
+    tampered = graph.model_copy(deep=True)
+    source = next(node for node in tampered.nodes if node.node_type == NodeType.AGENT_TASK)
+    if kind == "risk":
+        source.risk_level_hint = RiskLevel.L0
+        source.policy_risk_floor = RiskLevel.L1
+        for node in tampered.nodes:
+            if node.source_node_id == source.id:
+                node.policy_risk_floor = RiskLevel.L1
+        return tampered
+    if kind == "command":
+        argv = ["python", "-c", "evil"]
+        source.allowed_commands_candidate = [argv]
+        source.effective_allowed_commands = [argv]
+        test = next(node for node in tampered.nodes if node.node_type == NodeType.TEST)
+        test.test_argv = argv
+        return tampered
+    if kind == "file_scope":
+        source.allowed_files_candidate = ["pyproject.toml"]
+        source.new_files_candidate = []
+        source.effective_allowed_files = ["pyproject.toml"]
+        source.effective_new_files = []
+        return tampered
+    if kind == "write_to_readonly":
+        system_ids = {node.id for node in tampered.nodes if node.source_node_id == source.id}
+        output = next(node for node in tampered.nodes if node.node_type == NodeType.OUTPUT)
+        source.requires_write = False
+        source.allowed_files_candidate = []
+        source.new_files_candidate = []
+        source.allowed_commands_candidate = []
+        source.effective_allowed_files = []
+        source.effective_new_files = []
+        source.effective_allowed_commands = []
+        source.policy_risk_floor = source.risk_level_hint
+        source.requires_changeset_approval = False
+        tampered.nodes = [node for node in tampered.nodes if node.id not in system_ids]
+        tampered.edges = [
+            edge
+            for edge in tampered.edges
+            if edge.from_node not in system_ids and edge.to_node not in system_ids
+        ]
+        tampered.edges.append(
+            WorkflowEdge(
+                id="tampered-readonly-direct",
+                from_node=source.id,
+                to_node=output.id,
+                condition=EdgeCondition.SUCCESS,
+            )
+        )
+        return tampered
+    raise AssertionError(f"unknown tamper kind: {kind}")
 
 
 def _serial_agent_graph() -> AuthorGraph:
