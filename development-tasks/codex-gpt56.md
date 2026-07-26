@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的核心运行时、安全和最终集成负责人。对确定性、事务一致性、路径安全、崩溃恢复和测试结果负责。
 
-当前任务：启动 `HUB-200`，实现 Workspace、ChangeSet 和 Guard 安全链；`HUB-110` 已通过最终复审、集成和阶段 1 gate。
+当前任务：继续 `HUB-200` 第二批，实现 ChangeSet/artifact 持久化和 Guard/Test NodeHandler 接线；第一批安全基础设施已提交为 `72ae933`。
 
 ## 高级任务
 

@@ -30,11 +30,11 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 |---|---|
 | completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130` |
 | in_progress | `HUB-200`：Workspace、ChangeSet、LockManager、PatchGuard、CommandGuard 和 RiskClassifier |
-| next | `HUB-210`；`HUB-220` 在 HUB-200 接口冻结后启动 |
+| next | `HUB-210`、`HUB-220`：在 HUB-200 接口冻结后并行启动 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，总任务已集成为 `8/25`。`HUB-200` 已在 `codex/hub-200-workspace-security` 启动，首批完成 Session 独立 clone、Path/Command/Patch Guard、RiskClassifier 和 canonical WorkspaceTransaction；ChangeSet 持久化与 NodeHandler 接线仍在本任务内进行。阶段 1 基线 Python `389 passed, 5 skipped`，前端和 CLI/Mock gate 均通过。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，总任务已集成为 `8/25`。`HUB-200` 已在 `codex/hub-200-workspace-security` 启动，首批提交为 `72ae933`，完成 Session 独立 clone、Path/Command/Patch Guard、RiskClassifier 和 canonical WorkspaceTransaction；ChangeSet 持久化与 NodeHandler 接线仍在本任务内进行。当前任务分支 Python `481 passed, 6 skipped`，Ruff、前端 lint、Vitest 和生产构建均通过；阶段 1 集成基线为 Python `389 passed, 5 skipped`。
 
-协议冻结点为 `contracts-frozen-v1`。阶段 1 已完成并集成到 `main`；当前执行顺序为 `HUB-200 -> HUB-210 -> 阶段 2 gate`。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。阶段 1 已完成并集成到 `main`；当前执行顺序为 `HUB-200 -> (HUB-210 与 HUB-220) -> 阶段 2 gate`，其中 HUB-210 与 HUB-220 均在 HUB-200 接口冻结后启动，可并行推进。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 
