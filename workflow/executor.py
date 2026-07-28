@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from protocol import ArtifactType, NodeOutcome, NodeRunStatus, NodeType, canonical_json
+from protocol import (
+    ArtifactType,
+    NodeOutcome,
+    NodeRunStatus,
+    NodeType,
+    WorkflowNode,
+    canonical_json,
+)
 from storage.artifact_repository import ArtifactRepository
 from storage.leases import MasterLease
 from storage.repositories import SessionRepository
@@ -94,11 +101,23 @@ class GraphExecutor:
         output_artifact_id = None
         if result.artifact_refs:
             try:
-                if node.node_type != NodeType.AGENT_TASK:
-                    raise ValueError("only AgentTask handlers may return artifact references")
-                expected_task_id = task_id_for_node(claimed.node_run_id)
+                if node.node_type == NodeType.AGENT_TASK:
+                    expected_task_id = task_id_for_node(claimed.node_run_id)
+                elif node.system_managed and node.source_node_id is not None:
+                    source_run = by_node.get(node.source_node_id)
+                    if source_run is None:
+                        raise ValueError("system handler source node run is unavailable")
+                    expected_task_id = task_id_for_node(source_run.node_run_id)
+                else:
+                    raise ValueError(
+                        "handler artifacts require an AgentTask or source-bound system node"
+                    )
                 for ref in result.artifact_refs:
-                    record = await self._artifacts.get(ref.artifact_id)
+                    record, _content = await self._artifacts.get_and_verify(
+                        ref.artifact_id,
+                        expected_session_id=run.session_id,
+                        expected_task_id=expected_task_id,
+                    )
                     if (
                         record.session_id != run.session_id
                         or record.task_id != expected_task_id
@@ -123,6 +142,7 @@ class GraphExecutor:
                 record = await self._artifacts.create(
                     artifact_id=_result_artifact_id(claimed.node_run_id, result),
                     session_id=run.session_id,
+                    task_id=_system_source_task_id(node, by_node),
                     artifact_type=ArtifactType.REPORT,
                     content=canonical_json(result),
                     redacted=True,
@@ -157,6 +177,18 @@ def _edge_satisfied(condition: str, outcome: NodeOutcome | None) -> bool:
         "rejected": {NodeOutcome.REJECTED},
     }
     return outcome in expected[condition]
+
+
+def _system_source_task_id(
+    node: WorkflowNode,
+    by_node: dict[str, NodeRunRecord],
+) -> str | None:
+    if not node.system_managed or node.source_node_id is None:
+        return None
+    source_run = by_node.get(node.source_node_id)
+    if source_run is None:
+        raise ValueError("system node source run is unavailable")
+    return task_id_for_node(source_run.node_run_id)
 
 
 def _result_artifact_id(node_run_id: str, result: NodeHandlerResult) -> str:

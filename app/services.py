@@ -32,9 +32,12 @@ from protocol import (
 )
 from security.command_guard import CommandGuard
 from security.path_policy import PathPolicy
+from security.risk_classifier import RiskClassifier
+from security.test_runner import TestRunner
 from storage.agent_repository import AgentRepository
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import ArtifactStore
+from storage.change_set_repository import ChangeSetRepository
 from storage.db import Database
 from storage.errors import LeaseLost
 from storage.event_repository import EventRecord, EventRepository
@@ -64,6 +67,12 @@ from workflow.executable_validator import ExecutableValidator
 from workflow.executor import GraphExecutor
 from workflow.handlers.agent_task import AgentTaskNodeHandler
 from workflow.handlers.factory import build_node_registry
+from workflow.handlers.guards import (
+    CommandGuardNodeHandler,
+    PatchGuardNodeHandler,
+    RiskClassifierNodeHandler,
+    TestNodeHandler,
+)
 from workflow.registry import NodeRegistry
 from workflow.scheduler import DurableScheduler
 from workspace.git_manager import GitManager
@@ -93,6 +102,8 @@ class RuntimeServices:
     leases: MasterLeaseRepository
     workspace_leases: WorkspaceLeaseRepository
     locks: LockManager
+    artifacts: ArtifactRepository
+    change_sets: ChangeSetRepository
     runs: WorkflowRunRepository
     registry: NodeRegistry
     scheduler: DurableScheduler
@@ -351,7 +362,7 @@ class WorkflowApplication:
         if compilation.graph is not None:
             executable = ExecutableValidator(
                 self.services.registry,
-                write_runtime_enabled=False,
+                write_runtime_enabled=True,
             ).validate(compilation.graph)
             errors.extend(executable.errors)
             warnings.extend(executable.warnings)
@@ -534,6 +545,13 @@ def _build_services(settings: Settings) -> RuntimeServices:
         max_artifact_bytes=settings.max_artifact_bytes,
         max_session_artifact_bytes=settings.max_session_artifact_bytes,
     )
+    command_guard = CommandGuard()
+    change_sets = ChangeSetRepository(database, artifacts, events, leases, locks)
+    test_runner = TestRunner(
+        command_guard,
+        timeout_seconds=settings.agent_default_timeout_seconds,
+        max_output_bytes=settings.max_console_bytes_per_run,
+    )
     bundles = TaskContextBundle(
         artifacts,
         paths.agent_runs,
@@ -544,9 +562,44 @@ def _build_services(settings: Settings) -> RuntimeServices:
         runs,
         artifacts,
         bundles,
-        {"mock": MockAgentAdapter()},
+        {"mock": MockAgentAdapter(demo_write_enabled=True)},
+        change_sets=change_sets,
+        git=git,
+        locks=locks,
+        agent_runs_dir=paths.agent_runs,
+        workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
+        workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
+        max_changed_paths=settings.max_changed_paths,
+        max_patch_bytes=settings.max_patch_bytes,
+        max_created_bytes=settings.max_task_created_bytes,
     )
-    registry = build_node_registry(agent_handler)
+    registry = build_node_registry(
+        agent_handler,
+        patch_guard_handler=PatchGuardNodeHandler(change_sets, artifacts),
+        command_guard_handler=CommandGuardNodeHandler(
+            change_sets,
+            artifacts,
+            command_guard,
+        ),
+        test_handler=TestNodeHandler(
+            change_sets,
+            artifacts,
+            git,
+            locks,
+            test_runner,
+            runtime_root=paths.agent_runs,
+            workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
+            workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
+            max_changed_paths=settings.max_changed_paths,
+            max_patch_bytes=settings.max_patch_bytes,
+            max_created_bytes=settings.max_task_created_bytes,
+        ),
+        risk_handler=RiskClassifierNodeHandler(
+            change_sets,
+            artifacts,
+            RiskClassifier(),
+        ),
+    )
     executor = GraphExecutor(runs, sessions, artifacts, registry)
     scheduler = DurableScheduler(
         runs,
@@ -565,6 +618,8 @@ def _build_services(settings: Settings) -> RuntimeServices:
         leases=leases,
         workspace_leases=workspace_leases,
         locks=locks,
+        artifacts=artifacts,
+        change_sets=change_sets,
         runs=runs,
         registry=registry,
         scheduler=scheduler,

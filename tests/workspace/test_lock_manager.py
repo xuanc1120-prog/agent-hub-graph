@@ -83,3 +83,44 @@ async def test_session_lock_rejects_cross_session_assertion(
 
     with pytest.raises(ValueError, match="does not belong"):
         await manager.assert_valid(lease, session_id="session-two")
+
+
+@pytest.mark.asyncio
+async def test_hold_preserves_body_error_when_release_also_fails(
+    runtime_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LockManager(WorkspaceLeaseRepository(runtime_database))
+
+    async def fail_release(lease: object) -> None:
+        _ = lease
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(manager, "release", fail_release)
+
+    with pytest.raises(ValueError, match="body failed") as captured:
+        async with manager.hold(
+            session_id="session-hold",
+            owner_kind=WorkspaceOwnerKind.TEST,
+            owner_operation_id="test-hold",
+            owner_process_id=os.getpid(),
+            ttl_seconds=10,
+            heartbeat_seconds=1,
+        ):
+            raise ValueError("body failed")
+
+    assert any(
+        "workspace lease release failed" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        async with manager.hold(
+            session_id="session-hold",
+            owner_kind=WorkspaceOwnerKind.TEST,
+            owner_operation_id="test-invalid-heartbeat",
+            owner_process_id=os.getpid(),
+            ttl_seconds=10,
+            heartbeat_seconds=0,
+        ):
+            pass

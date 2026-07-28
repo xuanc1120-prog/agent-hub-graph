@@ -122,7 +122,9 @@ def mock_agent_registration() -> AgentRegistration:
                 AgentCapability.IMPLEMENT,
                 AgentCapability.REVIEW,
                 AgentCapability.DOCS,
+                AgentCapability.GENERATE_PATCH,
                 AgentCapability.RUN_TESTS,
+                AgentCapability.WRITE_FILES,
             }
         ),
         enabled=True,

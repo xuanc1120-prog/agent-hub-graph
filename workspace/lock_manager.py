@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
@@ -9,6 +13,7 @@ from pydantic import TypeAdapter
 
 from protocol import EntityId
 from storage.db import Transaction
+from storage.errors import LeaseLost
 from storage.leases import WorkspaceLease, WorkspaceLeaseRepository
 
 _ENTITY_ID = TypeAdapter(EntityId)
@@ -23,6 +28,18 @@ class WorkspaceOwnerKind(StrEnum):
     VALIDATE = "validate"
     RUN = "run"
     RECOVERY = "recovery"
+
+
+@dataclass(slots=True)
+class HeldWorkspaceLease:
+    """A live lease plus any asynchronous heartbeat failure."""
+
+    lease: WorkspaceLease
+    heartbeat_error: BaseException | None = None
+
+    def assert_healthy(self) -> None:
+        if self.heartbeat_error is not None:
+            raise LeaseLost("workspace lease heartbeat failed") from self.heartbeat_error
 
 
 class LockManager:
@@ -93,6 +110,75 @@ class LockManager:
         self._assert_session(lease, session_id)
         await self._repository.assert_valid_in(transaction, lease, now=now)
 
+    @asynccontextmanager
+    async def hold(
+        self,
+        *,
+        session_id: str,
+        owner_kind: WorkspaceOwnerKind,
+        owner_operation_id: str,
+        owner_process_id: int,
+        ttl_seconds: int,
+        heartbeat_seconds: float | None = None,
+    ) -> AsyncIterator[HeldWorkspaceLease]:
+        """Acquire, renew, validate, and release one workspace lease."""
+
+        interval = max(1.0, ttl_seconds / 3) if heartbeat_seconds is None else heartbeat_seconds
+        if interval <= 0 or interval >= ttl_seconds:
+            raise ValueError("heartbeat_seconds must be positive and less than ttl_seconds")
+        lease = await self.acquire(
+            session_id=session_id,
+            owner_kind=owner_kind,
+            owner_operation_id=owner_operation_id,
+            owner_process_id=owner_process_id,
+            ttl_seconds=ttl_seconds,
+        )
+        held = HeldWorkspaceLease(lease=lease)
+
+        async def heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    held.lease = await self.heartbeat(
+                        held.lease,
+                        ttl_seconds=ttl_seconds,
+                    )
+                except BaseException as error:
+                    held.heartbeat_error = error
+                    return
+
+        heartbeat = asyncio.create_task(
+            heartbeat_loop(),
+            name=f"workspace-heartbeat:{owner_operation_id}",
+        )
+        body_error: BaseException | None = None
+        try:
+            yield held
+            held.assert_healthy()
+            await self.assert_valid(held.lease, session_id=session_id)
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            late_error: BaseException | None = None
+            if body_error is None:
+                try:
+                    held.assert_healthy()
+                except BaseException as error:
+                    late_error = error
+            try:
+                await self.release(held.lease)
+            except BaseException as release_error:
+                primary_error = body_error or late_error
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"workspace lease release failed: {release_error!r}")
+            if late_error is not None:
+                raise late_error
+
     @staticmethod
     def resource_key(session_id: str) -> str:
         return f"session:{_ENTITY_ID.validate_python(session_id)}:integration"
@@ -103,4 +189,4 @@ class LockManager:
             raise ValueError("workspace lease does not belong to the requested session")
 
 
-__all__ = ["LockManager", "WorkspaceOwnerKind"]
+__all__ = ["HeldWorkspaceLease", "LockManager", "WorkspaceOwnerKind"]

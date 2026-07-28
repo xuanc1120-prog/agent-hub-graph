@@ -11,20 +11,34 @@ from workflow.handlers.deterministic import (
     OutputNodeHandler,
     UnavailableWriteNodeHandler,
 )
+from workflow.handlers.guards import (
+    CommandGuardNodeHandler,
+    PatchGuardNodeHandler,
+    RiskClassifierNodeHandler,
+    TestNodeHandler,
+)
 from workflow.registry import NODE_CONFIG_MODELS, NodeRegistry
 
 
-def build_node_registry(agent_task_handler: AgentTaskNodeHandler) -> NodeRegistry:
+def build_node_registry(
+    agent_task_handler: AgentTaskNodeHandler,
+    *,
+    patch_guard_handler: PatchGuardNodeHandler | None = None,
+    command_guard_handler: CommandGuardNodeHandler | None = None,
+    test_handler: TestNodeHandler | None = None,
+    risk_handler: RiskClassifierNodeHandler | None = None,
+) -> NodeRegistry:
+    unavailable = UnavailableWriteNodeHandler()
     handlers = {
         NodeType.INPUT: InputNodeHandler(),
         NodeType.AGENT_TASK: agent_task_handler,
         NodeType.CONTEXT_BUILDER: ContextBuilderNodeHandler(),
-        NodeType.PATCH_GUARD: UnavailableWriteNodeHandler(),
-        NodeType.COMMAND_GUARD: UnavailableWriteNodeHandler(),
-        NodeType.TEST: UnavailableWriteNodeHandler(),
-        NodeType.RISK_CLASSIFIER: UnavailableWriteNodeHandler(),
-        NodeType.APPROVAL: UnavailableWriteNodeHandler(),
-        NodeType.MERGE_PATCH: UnavailableWriteNodeHandler(),
+        NodeType.PATCH_GUARD: patch_guard_handler or unavailable,
+        NodeType.COMMAND_GUARD: command_guard_handler or unavailable,
+        NodeType.TEST: test_handler or unavailable,
+        NodeType.RISK_CLASSIFIER: risk_handler or unavailable,
+        NodeType.APPROVAL: unavailable,
+        NodeType.MERGE_PATCH: unavailable,
         NodeType.IF: IfNodeHandler(),
         NodeType.OUTPUT: OutputNodeHandler(),
     }

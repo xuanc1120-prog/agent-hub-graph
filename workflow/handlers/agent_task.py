@@ -1,20 +1,25 @@
-"""Read-only AgentTask handler for the phase-one MockAgent slice."""
+"""AgentTask handler for read-only and demo shared-write execution."""
 
 from __future__ import annotations
 
 import logging
+import os
 from hashlib import sha256
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 
-from adapters.base import BaseAgentAdapter
+from adapters.base import BaseAgentAdapter, ConsoleSink
 from context.context_builder import ContextBuilder
 from context.task_bundle import TaskContextBundle
 from protocol import (
+    AgentResult,
     AgentResultStatus,
     ArtifactRef,
     ArtifactType,
+    ChangeSetStatus,
+    ContextPack,
     FrozenStrictModel,
     NodeOutcome,
     NodeRunStatus,
@@ -22,16 +27,27 @@ from protocol import (
     RiskLevel,
     TaskPackage,
     TaskStatus,
+    WorkflowNode,
     canonical_json,
 )
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
+from storage.change_set_repository import ChangeSetRepository
 from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
 )
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
+from workspace.git_manager import GitManager
+from workspace.lock_manager import LockManager, WorkspaceOwnerKind
+from workspace.transaction import WorkspaceTransaction
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _AgentTaskError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class _ReadOnlyRuntimePolicy(FrozenStrictModel):
@@ -41,6 +57,22 @@ class _ReadOnlyRuntimePolicy(FrozenStrictModel):
     write: Literal[False] = False
     commands: Literal[False] = False
     network: Literal[False] = False
+
+
+class _WriteRuntimePolicy(FrozenStrictModel):
+    mode: Literal["shared_write"] = "shared_write"
+    agent_id: str = Field(min_length=1, max_length=128)
+    node_id: str = Field(min_length=1, max_length=128)
+    allowed_existing_files: tuple[str, ...] = Field(default_factory=tuple, max_length=100)
+    allowed_new_files: tuple[str, ...] = Field(default_factory=tuple, max_length=100)
+    allowed_commands: tuple[tuple[str, ...], ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+    write: Literal[True] = True
+    network: Literal[False] = False
+    git_push: Literal[False] = False
+    git_merge: Literal[False] = False
 
 
 class _MockOutput(FrozenStrictModel):
@@ -59,6 +91,15 @@ class AgentTaskNodeHandler:
         adapters: dict[str, BaseAgentAdapter],
         *,
         max_prompt_chars: int = 12_000,
+        change_sets: ChangeSetRepository | None = None,
+        git: GitManager | None = None,
+        locks: LockManager | None = None,
+        agent_runs_dir: Path | None = None,
+        workspace_lease_ttl_seconds: int = 30,
+        workspace_heartbeat_seconds: float = 5,
+        max_changed_paths: int = 500,
+        max_patch_bytes: int = 20 * 1024 * 1024,
+        max_created_bytes: int = 100 * 1024 * 1024,
     ) -> None:
         self._runs = runs
         self._artifacts = artifacts
@@ -66,15 +107,70 @@ class AgentTaskNodeHandler:
         self._adapters = dict(adapters)
         self._context_builder = ContextBuilder()
         self._max_prompt_chars = max_prompt_chars
+        dependencies = (change_sets, git, locks, agent_runs_dir)
+        if any(item is None for item in dependencies) and any(
+            item is not None for item in dependencies
+        ):
+            raise ValueError("write runtime dependencies must be configured together")
+        if workspace_heartbeat_seconds >= workspace_lease_ttl_seconds:
+            raise ValueError("workspace heartbeat must be shorter than its lease TTL")
+        self._change_sets = change_sets
+        self._git = git
+        self._locks = locks
+        self._agent_runs_dir = (
+            agent_runs_dir.expanduser().resolve(strict=False) if agent_runs_dir else None
+        )
+        self._workspace_lease_ttl_seconds = workspace_lease_ttl_seconds
+        self._workspace_heartbeat_seconds = workspace_heartbeat_seconds
+        self._transaction_limits = {
+            "max_changed_paths": max_changed_paths,
+            "max_patch_bytes": max_patch_bytes,
+            "max_created_bytes": max_created_bytes,
+        }
+
+    @property
+    def _write_runtime_available(self) -> bool:
+        return all(
+            item is not None
+            for item in (
+                self._change_sets,
+                self._git,
+                self._locks,
+                self._agent_runs_dir,
+            )
+        )
+
+    @staticmethod
+    def _runtime_policy(node: WorkflowNode) -> FrozenStrictModel:
+        if not node.requires_write:
+            assert node.resolved_agent_id is not None
+            return _ReadOnlyRuntimePolicy(
+                agent_id=node.resolved_agent_id,
+                node_id=node.id,
+            )
+        if (
+            node.resolved_agent_id is None
+            or node.effective_allowed_files is None
+            or node.effective_new_files is None
+            or node.effective_allowed_commands is None
+        ):
+            raise ValueError("compiled write task is missing effective policy fields")
+        return _WriteRuntimePolicy(
+            agent_id=node.resolved_agent_id,
+            node_id=node.id,
+            allowed_existing_files=tuple(node.effective_allowed_files),
+            allowed_new_files=tuple(node.effective_new_files),
+            allowed_commands=tuple(tuple(command) for command in node.effective_allowed_commands),
+        )
 
     async def execute(self, context: object) -> NodeHandlerResult:
         if not isinstance(context, NodeExecutionContext):
             raise TypeError("AgentTaskNodeHandler requires NodeExecutionContext")
         node = context.node
-        if node.requires_write:
+        if node.requires_write and not self._write_runtime_available:
             return _blocked(
                 "write_runtime_unavailable",
-                "Write AgentTask execution requires HUB-200 workspace transactions.",
+                "Write AgentTask execution requires configured workspace transactions.",
             )
         if node.task_kind is None or node.instruction is None:
             return _blocked("compiled_task_invalid", "Compiled AgentTask is incomplete.")
@@ -92,12 +188,7 @@ class AgentTaskNodeHandler:
                 artifact_id=_artifact_id("policy", context.node_run.node_run_id),
                 session_id=context.run.session_id,
                 artifact_type=ArtifactType.RUNTIME_POLICY,
-                content=canonical_json(
-                    _ReadOnlyRuntimePolicy(
-                        agent_id=node.resolved_agent_id,
-                        node_id=node.id,
-                    )
-                ),
+                content=canonical_json(self._runtime_policy(node)),
                 redacted=True,
             )
             policy_ref = _artifact_ref(policy_record)
@@ -131,19 +222,35 @@ class AgentTaskNodeHandler:
                 agent_id=node.resolved_agent_id,
                 task_kind=node.task_kind,
                 instruction=node.instruction,
-                repo_path=".",
+                repo_path=(str(context.session.shared_repo_path) if node.requires_write else "."),
                 base_commit=context.run.current_commit,
-                effective_allowed_files=[],
-                effective_new_files=[],
-                readonly_files=list(node.effective_allowed_files or []),
-                effective_allowed_commands=[],
-                forbidden_actions=[
-                    "Do not modify files.",
-                    "Do not execute commands.",
-                    "Do not access secrets or Master credentials.",
-                ],
+                effective_allowed_files=(
+                    list(node.effective_allowed_files or []) if node.requires_write else []
+                ),
+                effective_new_files=(
+                    list(node.effective_new_files or []) if node.requires_write else []
+                ),
+                readonly_files=(
+                    [] if node.requires_write else list(node.effective_allowed_files or [])
+                ),
+                effective_allowed_commands=(
+                    list(node.effective_allowed_commands or []) if node.requires_write else []
+                ),
+                forbidden_actions=(
+                    [
+                        "Do not access secrets or Master credentials.",
+                        "Do not git push, merge, commit, checkout, or change branches.",
+                        "Do not modify files outside the sealed write scope.",
+                    ]
+                    if node.requires_write
+                    else [
+                        "Do not modify files.",
+                        "Do not execute commands.",
+                        "Do not access secrets or Master credentials.",
+                    ]
+                ),
                 effective_risk=node.policy_risk_floor or RiskLevel.L0,
-                requires_changeset_approval=False,
+                requires_changeset_approval=bool(node.requires_changeset_approval),
                 runtime_policy_ref=policy_ref,
                 context_bundle_path=f"{task_id}/context",
                 context_bundle_sha256=bundle.manifest.bundle_sha256,
@@ -180,7 +287,16 @@ class AgentTaskNodeHandler:
                 if len(console) < 100:
                     console.append(message[:1_000])
 
-            agent_result = await adapter.run(task, context_result.pack, collect)
+            if node.requires_write:
+                agent_result = await self._run_write_adapter(
+                    context=context,
+                    adapter=adapter,
+                    task=task,
+                    context_pack=context_result.pack,
+                    collect=collect,
+                )
+            else:
+                agent_result = await adapter.run(task, context_result.pack, collect)
             if (
                 agent_result.task_id != task_id
                 or agent_result.node_run_id != context.node_run.node_run_id
@@ -251,7 +367,7 @@ class AgentTaskNodeHandler:
                 status=NodeRunStatus.FAILED,
                 outcome=NodeOutcome.FAILURE,
                 summary="AgentTask handler failed without exposing subprocess or path details.",
-                error_code=f"handler_{type(exc).__name__.lower()}",
+                error_code=_handler_error_code(exc),
             )
         finally:
             if bundle_created:
@@ -266,6 +382,95 @@ class AgentTaskNodeHandler:
                             task_id,
                             retry.errors,
                         )
+
+    async def _run_write_adapter(
+        self,
+        *,
+        context: NodeExecutionContext,
+        adapter: BaseAgentAdapter,
+        task: TaskPackage,
+        context_pack: ContextPack,
+        collect: ConsoleSink,
+    ) -> AgentResult:
+        assert self._change_sets is not None
+        assert self._git is not None
+        assert self._locks is not None
+        assert self._agent_runs_dir is not None
+        execution_error: BaseException | None = None
+        agent_result: AgentResult | None = None
+        async with self._locks.hold(
+            session_id=context.run.session_id,
+            owner_kind=WorkspaceOwnerKind.AGENT_TASK,
+            owner_operation_id=task.task_id,
+            owner_process_id=os.getpid(),
+            ttl_seconds=self._workspace_lease_ttl_seconds,
+            heartbeat_seconds=self._workspace_heartbeat_seconds,
+        ) as held:
+            transaction = WorkspaceTransaction(
+                self._git,
+                Path(context.session.shared_repo_path),
+                base_commit=context.run.current_commit,
+                expected_branch=context.session.integration_branch,
+                temp_directory=self._agent_runs_dir / task.task_id / "workspace-transaction",
+                **self._transaction_limits,
+            )
+            transaction.begin()
+            try:
+                agent_result = await adapter.run(task, context_pack, collect)
+                if (
+                    agent_result.task_id != task.task_id
+                    or agent_result.node_run_id != task.node_run_id
+                    or agent_result.agent_id != task.agent_id
+                ):
+                    execution_error = _AgentTaskError("agent_identity_mismatch")
+            except BaseException as error:
+                execution_error = error
+
+            try:
+                capture = transaction.capture_and_restore()
+            except BaseException as capture_error:
+                if execution_error is not None:
+                    capture_error.add_note(
+                        f"Agent execution also failed: {type(execution_error).__name__}"
+                    )
+                raise
+
+            has_changes = bool(
+                capture.manifest.changes
+                or capture.manifest.ignored_files_touched
+                or capture.manifest.created_directories
+            )
+            held.assert_healthy()
+            if has_changes:
+                await self._change_sets.persist_capture(
+                    session_id=context.run.session_id,
+                    workflow_run_id=context.run.workflow_run_id,
+                    node_run_id=context.node_run.node_run_id,
+                    task_id=task.task_id,
+                    capture=capture,
+                    master_lease=context.master_lease,
+                    workspace_lease=held.lease,
+                    status=(
+                        ChangeSetStatus.CAPTURED
+                        if execution_error is None
+                        and agent_result is not None
+                        and agent_result.status == AgentResultStatus.SUCCEEDED
+                        else ChangeSetStatus.ABANDONED_PARTIAL
+                    ),
+                    reason=(
+                        None
+                        if execution_error is None
+                        and agent_result is not None
+                        and agent_result.status == AgentResultStatus.SUCCEEDED
+                        else "Agent execution did not complete successfully"
+                    ),
+                )
+            if execution_error is not None:
+                raise execution_error
+            assert agent_result is not None
+            if agent_result.status == AgentResultStatus.SUCCEEDED and not has_changes:
+                raise _AgentTaskError("write_agent_no_changes")
+            return agent_result
 
     async def _predecessor_refs(
         self,
@@ -334,11 +539,17 @@ class AgentTaskNodeHandler:
                 await self._runs.finish_task(
                     task_id,
                     target=TaskStatus.FAILED,
-                    error_code=f"handler_{type(error).__name__.lower()}",
+                    error_code=_handler_error_code(error),
                     lease=context.master_lease,
                 )
         except Exception:
             return
+
+
+def _handler_error_code(error: Exception) -> str:
+    if isinstance(error, _AgentTaskError):
+        return error.code
+    return f"handler_{type(error).__name__.lower()}"
 
 
 def _artifact_id(prefix: str, node_run_id: str) -> str:

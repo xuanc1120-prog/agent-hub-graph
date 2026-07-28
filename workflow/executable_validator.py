@@ -16,6 +16,7 @@ from protocol import (
     WorkflowEdge,
     WorkflowNode,
 )
+from security.risk_classifier import RiskClassifier
 from workflow.registry import NodeRegistry
 from workflow.validation import ValidationReport
 
@@ -38,9 +39,16 @@ _RISK_ORDER = {level: index for index, level in enumerate(RiskLevel)}
 
 
 class ExecutableValidator:
-    def __init__(self, registry: NodeRegistry, *, write_runtime_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        registry: NodeRegistry,
+        *,
+        write_runtime_enabled: bool = False,
+        risk_classifier: RiskClassifier | None = None,
+    ) -> None:
         self._registry = registry
         self._write_runtime_enabled = write_runtime_enabled
+        self._risk_classifier = risk_classifier or RiskClassifier()
 
     def validate(self, graph: CompiledGraph) -> ValidationReport:
         errors: list[ValidationIssue] = []
@@ -147,8 +155,8 @@ class ExecutableValidator:
                     )
         return ValidationReport(errors=tuple(errors))
 
-    @staticmethod
     def _validate_node(
+        self,
         node: WorkflowNode,
         nodes: dict[str, WorkflowNode],
     ) -> list[ValidationIssue]:
@@ -180,8 +188,15 @@ class ExecutableValidator:
                         node.id,
                     )
                 )
+            candidate_risk = (
+                self._risk_classifier.classify_paths(
+                    [*(node.effective_allowed_files or []), *(node.effective_new_files or [])]
+                ).effective_risk
+                if node.requires_write
+                else RiskLevel.L0
+            )
             expected_risk_floor = _max_risk(
-                node.risk_level_hint,
+                _max_risk(node.risk_level_hint, candidate_risk),
                 RiskLevel.L1 if node.requires_write else RiskLevel.L0,
             )
             if node.policy_risk_floor != expected_risk_floor:

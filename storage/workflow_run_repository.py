@@ -556,7 +556,8 @@ class WorkflowRunRepository:
             current = await transaction.fetch_one(
                 """
                 SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
-                       wr.cancel_requested_at
+                       wr.cancel_requested_at, wr.compiled_snapshot_json,
+                       wr.compiled_snapshot_hash
                 FROM node_runs nr
                 JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
                 WHERE nr.id = ?
@@ -579,10 +580,52 @@ class WorkflowRunRepository:
                 )
                 if artifact is None:
                     raise RecordNotFound(f"output artifact not found: {output_artifact_id}")
+                graph = CompiledGraph.model_validate_json(
+                    str(current["compiled_snapshot_json"]),
+                    strict=True,
+                )
+                if sha256(canonical_json(graph)).hexdigest() != str(
+                    current["compiled_snapshot_hash"]
+                ):
+                    raise SnapshotIntegrityError("compiled workflow snapshot hash mismatch")
+                compiled_node = next(
+                    (node for node in graph.nodes if node.id == str(current["node_id"])),
+                    None,
+                )
+                if compiled_node is None:
+                    raise SnapshotIntegrityError(
+                        "running node is absent from compiled workflow snapshot"
+                    )
+                owner_node_run_id = node_run_id_value
+                source_bound = False
+                if compiled_node.system_managed and compiled_node.source_node_id is not None:
+                    source_bound = True
+                    owner = await transaction.fetch_one(
+                        """
+                        SELECT id FROM node_runs
+                        WHERE workflow_run_id = ? AND node_id = ?
+                        ORDER BY attempt DESC LIMIT 1
+                        """,
+                        (
+                            str(current["workflow_run_id"]),
+                            compiled_node.source_node_id,
+                        ),
+                    )
+                    if owner is None:
+                        raise SnapshotIntegrityError(
+                            "system node source run is absent from workflow run"
+                        )
+                    owner_node_run_id = str(owner["id"])
                 task_owner = await transaction.fetch_one(
                     "SELECT id FROM tasks WHERE node_run_id = ?",
-                    (node_run_id_value,),
+                    (owner_node_run_id,),
                 )
+                node_type = NodeType(str(current["node_type"]))
+                if task_owner is None and (
+                    source_bound
+                    or (node_type == NodeType.AGENT_TASK and target == NodeRunStatus.COMPLETED)
+                ):
+                    raise SnapshotIntegrityError("node output requires an existing source task")
                 expected_task_id = str(task_owner["id"]) if task_owner is not None else None
                 actual_task_id = (
                     str(artifact["task_id"]) if artifact["task_id"] is not None else None
@@ -594,12 +637,11 @@ class WorkflowRunRepository:
                     or (actual_task_id is not None and actual_task_id != expected_task_id)
                 ):
                     raise ValueError("node output artifact is not a redacted session artifact")
-                if (
-                    target == NodeRunStatus.COMPLETED
-                    and NodeType(str(current["node_type"])) == NodeType.AGENT_TASK
-                    and actual_task_id != expected_task_id
-                ):
-                    raise ValueError("completed AgentTask output must belong to its task")
+                requires_owned_output = (
+                    target == NodeRunStatus.COMPLETED and node_type == NodeType.AGENT_TASK
+                ) or (source_bound and target != NodeRunStatus.FAILED)
+                if requires_owned_output and actual_task_id != expected_task_id:
+                    raise ValueError("node output artifact must belong to its source task")
             changed = await transaction.execute(
                 """
                 UPDATE node_runs
