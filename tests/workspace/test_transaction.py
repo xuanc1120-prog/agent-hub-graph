@@ -66,6 +66,10 @@ def test_capture_canonical_patch_and_restore_mixed_changes(
     tmp_path: Path,
 ) -> None:
     manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    object_seal = manager.capture_metadata_seal(
+        repo,
+        include_objects=True,
+    )
     original = (repo / "src" / "example.py").read_bytes()
     transaction = _transaction(manager, repo, commit, branch, tmp_path)
     transaction.begin()
@@ -84,6 +88,11 @@ def test_capture_canonical_patch_and_restore_mixed_changes(
     assert (repo / "src" / "example.py").read_bytes() == original
     assert not (repo / "src" / "new.py").exists()
     assert manager.state(repo).dirty is False
+    manager.assert_metadata_seal(
+        repo,
+        object_seal,
+        include_objects=True,
+    )
 
 
 def test_staged_and_unstaged_edits_produce_one_final_patch_without_index_pollution(
@@ -152,20 +161,66 @@ def test_ignored_preimages_are_restored_and_new_ignored_files_removed(
     cache = repo / "cache"
     cache.mkdir()
     existing = cache / "state.txt"
-    existing.write_text("before\n", encoding="utf-8")
+    existing.write_text("before\n", encoding="utf-8", newline="\n")
     transaction = _transaction(manager, repo, commit, branch, tmp_path)
     transaction.begin()
 
-    existing.write_text("after\n", encoding="utf-8")
-    (cache / "new.txt").write_text("new\n", encoding="utf-8")
+    existing.write_text("after\n", encoding="utf-8", newline="\n")
+    (cache / "new.txt").write_text("new\n", encoding="utf-8", newline="\n")
     result = transaction.capture_and_restore()
 
     assert result.manifest.ignored_files_touched == (
         "cache/new.txt",
         "cache/state.txt",
     )
+    actions = {(change.action, change.path) for change in result.manifest.changes}
+    assert (FileAction.CREATED, "cache/new.txt") in actions
+    assert (FileAction.MODIFIED, "cache/state.txt") in actions
+    ignored_preimage = next(
+        preimage for preimage in result.preimages if preimage.path == "cache/state.txt"
+    )
+    assert ignored_preimage.baseline_ignored is True
+    assert ignored_preimage.content == b"before\n"
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert not (cache / "new.txt").exists()
+    assert manager.state(repo).dirty is False
+
+
+def test_deleted_ignored_file_and_parent_are_replayable_and_restored(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    existing = cache / "state.txt"
+    existing.write_text("before\n", encoding="utf-8", newline="\n")
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    existing.unlink()
+    cache.rmdir()
+    result = transaction.capture_and_restore()
+
+    deleted = next(change for change in result.manifest.changes if change.path == "cache/state.txt")
+    assert deleted.action == FileAction.DELETED
+    assert result.manifest.ignored_files_touched == ("cache/state.txt",)
+    preimage = next(preimage for preimage in result.preimages if preimage.path == "cache/state.txt")
+    assert preimage.baseline_ignored is True
+    assert preimage.content == b"before\n"
+    assert existing.read_text(encoding="utf-8") == "before\n"
     assert manager.state(repo).dirty is False
 
 
@@ -314,7 +369,7 @@ def test_inventory_limit_restores_ignored_preimage_and_created_directories(
     assert manager.state(repo).dirty is False
 
 
-def test_forbidden_control_patch_is_not_replayed_before_guard(
+def test_forbidden_control_patch_is_replayed_only_in_disposable_clone(
     fixture_source_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -325,11 +380,19 @@ def test_forbidden_control_patch_is_not_replayed_before_guard(
     control_file = repo / ".gitattributes"
     control_file.write_text("*.py filter=unsafe\n", encoding="utf-8")
 
-    def unexpected_replay(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("forbidden patch must not be replayed before PatchGuard")
+    replay_repositories: list[Path] = []
+    original_apply_check = manager.apply_check
 
-    monkeypatch.setattr(manager, "apply_check", unexpected_replay)
+    def observe_replay(replay_repo: Path, patch_bytes: bytes) -> None:
+        assert replay_repo.resolve() != repo.resolve()
+        assert not control_file.exists()
+        replay_repositories.append(replay_repo)
+        original_apply_check(replay_repo, patch_bytes)
+
+    monkeypatch.setattr(manager, "apply_check", observe_replay)
     result = transaction.capture_and_restore()
 
     assert result.manifest.changes[0].path == ".gitattributes"
+    assert len(replay_repositories) == 1
+    assert not replay_repositories[0].exists()
     assert not control_file.exists()

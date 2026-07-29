@@ -30,7 +30,7 @@ from storage.leases import MasterLease, MasterLeaseRepository, WorkspaceLease
 from workflow.events import CHANGE_SET_STATE_CHANGED, ChangeSetEventPayload
 from workspace.change_set import ChangeSetManifest, FileAction
 from workspace.lock_manager import LockManager
-from workspace.transaction import CapturedWorkspaceChangeSet
+from workspace.transaction import CapturedWorkspaceChangeSet, FilePreimage
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,6 +86,8 @@ class EvidenceBinding(FrozenStrictModel):
 class PreimageBinding(FrozenStrictModel):
     path: RepoRelativePath
     artifact_ref: ArtifactRef
+    mode: int = Field(ge=0, le=0o777)
+    baseline_ignored: bool
 
 
 class StoredChangeSetDocument(FrozenStrictModel):
@@ -253,6 +255,8 @@ class ChangeSetRepository:
                     PreimageBinding(
                         path=preimage.path,
                         artifact_ref=_artifact_ref(record),
+                        mode=preimage.mode,
+                        baseline_ignored=preimage.baseline_ignored,
                     )
                 )
 
@@ -471,6 +475,29 @@ class ChangeSetRepository:
         if sha256(content).hexdigest() != record.change_set.patch_sha256:
             raise ChangeSetIntegrityError("canonical patch artifact hash mismatch")
         return record, content
+
+    async def load_preimages(self, change_set_id: str) -> tuple[FilePreimage, ...]:
+        record = await self.get(change_set_id)
+        preimages: list[FilePreimage] = []
+        for binding in record.document.preimages:
+            _metadata, content = await self._artifacts.get_and_verify(
+                binding.artifact_ref.artifact_id,
+                expected_session_id=record.change_set.session_id,
+                expected_task_id=record.change_set.task_id,
+            )
+            if sha256(content).hexdigest() != binding.artifact_ref.sha256:
+                raise ChangeSetIntegrityError(f"preimage artifact hash mismatch: {binding.path}")
+            preimages.append(
+                FilePreimage(
+                    path=binding.path,
+                    sha256=binding.artifact_ref.sha256,
+                    size_bytes=binding.artifact_ref.size_bytes,
+                    mode=binding.mode,
+                    content=content,
+                    baseline_ignored=binding.baseline_ignored,
+                )
+            )
+        return tuple(preimages)
 
     async def _insert_capture_in(
         self,
@@ -808,8 +835,11 @@ class ChangeSetRepository:
             if change.action != FileAction.CREATED
         }
         actual_preimages = {item.path for item in document.preimages}
-        if actual_preimages != expected_preimages:
-            raise ChangeSetIntegrityError("ChangeSet preimages do not match modified paths")
+        if not expected_preimages.issubset(actual_preimages):
+            raise ChangeSetIntegrityError("ChangeSet is missing a modified-path preimage")
+        unexpected = actual_preimages - expected_preimages
+        if any(not item.baseline_ignored for item in document.preimages if item.path in unexpected):
+            raise ChangeSetIntegrityError("unexpected ChangeSet preimage is not baseline ignored")
         for binding in document.preimages:
             if binding.artifact_ref.artifact_type != ArtifactType.CHANGE_PREIMAGE:
                 raise ChangeSetIntegrityError("preimage has the wrong artifact type")

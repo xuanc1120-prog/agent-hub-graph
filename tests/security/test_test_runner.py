@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
 import pytest
 
 from security.command_guard import ApprovedCommand, CommandGuard
-from security.test_runner import TestRunner as SafeTestRunner
+from security.test_runner import (
+    TestRunner as SafeTestRunner,
+)
+from security.test_runner import (
+    _bounded_utf8,
+    _OutputCollector,
+    _redact_output,
+)
 
 
 @pytest.mark.asyncio
@@ -118,3 +126,48 @@ def test_runner_rejects_package_manager_without_node(
             str(tmp_path / "npm"),
             "npm-test",
         )
+
+
+@pytest.mark.asyncio
+async def test_output_redaction_spans_reader_chunks_and_output_boundary() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=256)
+    secret = "split-secret-token-value"
+    reader.feed_data(b"x" * 60 + b" Bearer split-sec")
+    reader.feed_data(b"ret-token-value tail")
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+    bounded, truncated = _bounded_utf8(redacted, 64)
+
+    assert secret not in redacted
+    assert secret not in bounded
+    assert "[REDACTED]" in redacted
+    assert truncated is True
+    assert len(bounded.encode("utf-8")) <= 64
+
+
+@pytest.mark.parametrize(
+    "value,secret",
+    [
+        (
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+            "abcdefghijklmnopqrstuvwxyz012345",
+        ),
+        (
+            "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudC1odWIifQ.c2lnbmF0dXJlLXZhbHVl",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
+        (
+            "DATABASE_URL=postgresql://agent:secret-password@localhost/demo",
+            "secret-password",
+        ),
+        ("api_key=top-secret-value", "top-secret-value"),
+    ],
+)
+def test_structured_credentials_are_redacted(value: str, secret: str) -> None:
+    redacted = _redact_output(value)
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted

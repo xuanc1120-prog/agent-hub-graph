@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -160,6 +161,36 @@ def test_cleanup_is_contained_to_workspace_root(
         )
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows symlink creation requires host-specific privileges",
+)
+def test_cleanup_does_not_follow_workspace_symlink(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager = GitManager(tmp_path / "git-profile")
+    source = manager.inspect_source_repository(fixture_source_repo)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    destination = workspace_root / "session-one" / "repo"
+    manager.create_session_repository(
+        source=source,
+        destination=destination,
+        session_id="session-one",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+    (destination / "escape").symlink_to(outside, target_is_directory=True)
+
+    manager.remove_session_repository(destination, allowed_root=workspace_root)
+
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+    assert not destination.parent.exists()
+
+
 @pytest.mark.parametrize("relative_path", ["config", "info/attributes"])
 def test_git_metadata_seal_rejects_control_file_changes(
     fixture_source_repo: Path,
@@ -205,3 +236,31 @@ def test_git_metadata_seal_allows_staged_index_and_object_updates(
     _git(destination, "add", "src/example.py")
 
     manager.assert_metadata_seal(destination, seal)
+
+
+def test_git_metadata_seal_rejects_object_updates_when_requested(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager = GitManager(tmp_path / "git-profile")
+    source = manager.inspect_source_repository(fixture_source_repo)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    destination = workspace_root / "session-one" / "repo"
+    manager.create_session_repository(
+        source=source,
+        destination=destination,
+        session_id="session-one",
+    )
+    seal = manager.capture_metadata_seal(
+        destination,
+        include_objects=True,
+    )
+    (destination / ".git" / "objects" / "agent-hub-pollution").write_bytes(b"pollution")
+
+    with pytest.raises(GitManagerError, match="control metadata changed"):
+        manager.assert_metadata_seal(
+            destination,
+            seal,
+            include_objects=True,
+        )

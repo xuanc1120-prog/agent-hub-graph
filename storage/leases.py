@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TypeVar
 
 from aiosqlite import Row
 from pydantic import TypeAdapter
@@ -11,6 +13,8 @@ from pydantic import TypeAdapter
 from protocol import EntityId
 from storage.db import Database, Transaction, normalize_utc, utc_now_text
 from storage.errors import LeaseLost, LeaseUnavailable
+
+_T = TypeVar("_T")
 
 _ENTITY_ID = TypeAdapter(EntityId)
 
@@ -449,6 +453,19 @@ class WorkspaceLeaseRepository:
         )
         if row is None:
             raise LeaseLost("workspace lease is no longer valid")
+
+    async def run_fenced(
+        self,
+        lease: WorkspaceLease,
+        operation: Callable[[], _T],
+        *,
+        now: datetime | None = None,
+    ) -> _T:
+        """Run synchronous workspace I/O while excluding lease takeover."""
+
+        async with self._database.immediate_transaction() as transaction:
+            await self.assert_valid_in(transaction, lease, now=now)
+            return operation()
 
     @staticmethod
     def _workspace(row: Row) -> WorkspaceLease:

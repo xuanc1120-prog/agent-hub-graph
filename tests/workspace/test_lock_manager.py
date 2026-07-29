@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,3 +125,86 @@ async def test_hold_preserves_body_error_when_release_also_fails(
             heartbeat_seconds=0,
         ):
             pass
+
+
+@pytest.mark.asyncio
+async def test_hold_cancels_owner_when_heartbeat_fails(
+    runtime_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LockManager(WorkspaceLeaseRepository(runtime_database))
+    heartbeat_called = asyncio.Event()
+
+    async def fail_heartbeat(
+        lease: object,
+        *,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> object:
+        _ = lease, ttl_seconds, now
+        heartbeat_called.set()
+        raise LeaseLost("injected heartbeat failure")
+
+    monkeypatch.setattr(manager, "heartbeat", fail_heartbeat)
+
+    with pytest.raises(LeaseLost, match="heartbeat failed"):
+        async with manager.hold(
+            session_id="session-heartbeat-failure",
+            owner_kind=WorkspaceOwnerKind.AGENT_TASK,
+            owner_operation_id="task-heartbeat-failure",
+            owner_process_id=os.getpid(),
+            ttl_seconds=10,
+            heartbeat_seconds=0.01,
+        ):
+            await asyncio.sleep(10)
+
+    assert heartbeat_called.is_set()
+    replacement = await manager.acquire(
+        session_id="session-heartbeat-failure",
+        owner_kind=WorkspaceOwnerKind.RECOVERY,
+        owner_operation_id="recovery-heartbeat-failure",
+        owner_process_id=os.getpid(),
+        ttl_seconds=10,
+    )
+    await manager.release(replacement)
+
+
+@pytest.mark.asyncio
+async def test_hold_normal_exit_does_not_treat_heartbeat_cancellation_as_loss(
+    runtime_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LockManager(WorkspaceLeaseRepository(runtime_database))
+    heartbeat_started = asyncio.Event()
+
+    async def wait_forever(
+        lease: object,
+        *,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> object:
+        _ = ttl_seconds, now
+        heartbeat_started.set()
+        await asyncio.Event().wait()
+        return lease
+
+    monkeypatch.setattr(manager, "heartbeat", wait_forever)
+
+    async with manager.hold(
+        session_id="session-heartbeat-cancel",
+        owner_kind=WorkspaceOwnerKind.TEST,
+        owner_operation_id="test-heartbeat-cancel",
+        owner_process_id=os.getpid(),
+        ttl_seconds=10,
+        heartbeat_seconds=0.01,
+    ):
+        await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+
+    replacement = await manager.acquire(
+        session_id="session-heartbeat-cancel",
+        owner_kind=WorkspaceOwnerKind.RECOVERY,
+        owner_operation_id="recovery-heartbeat-cancel",
+        owner_process_id=os.getpid(),
+        ttl_seconds=10,
+    )
+    await manager.release(replacement)

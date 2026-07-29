@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import TypeVar
 
 from pydantic import TypeAdapter
 
@@ -17,6 +18,8 @@ from storage.errors import LeaseLost
 from storage.leases import WorkspaceLease, WorkspaceLeaseRepository
 
 _ENTITY_ID = TypeAdapter(EntityId)
+
+_T = TypeVar("_T")
 
 
 class WorkspaceOwnerKind(StrEnum):
@@ -110,6 +113,19 @@ class LockManager:
         self._assert_session(lease, session_id)
         await self._repository.assert_valid_in(transaction, lease, now=now)
 
+    async def run_fenced(
+        self,
+        lease: WorkspaceLease,
+        *,
+        session_id: str,
+        operation: Callable[[], _T],
+        now: datetime | None = None,
+    ) -> _T:
+        """Run synchronous workspace I/O while preventing lease takeover."""
+
+        self._assert_session(lease, session_id)
+        return await self._repository.run_fenced(lease, operation, now=now)
+
     @asynccontextmanager
     async def hold(
         self,
@@ -134,6 +150,7 @@ class LockManager:
             ttl_seconds=ttl_seconds,
         )
         held = HeldWorkspaceLease(lease=lease)
+        owner_task = asyncio.current_task()
 
         async def heartbeat_loop() -> None:
             while True:
@@ -143,8 +160,12 @@ class LockManager:
                         held.lease,
                         ttl_seconds=ttl_seconds,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except BaseException as error:
                     held.heartbeat_error = error
+                    if owner_task is not None and not owner_task.done():
+                        owner_task.cancel()
                     return
 
         heartbeat = asyncio.create_task(
@@ -156,6 +177,13 @@ class LockManager:
             yield held
             held.assert_healthy()
             await self.assert_valid(held.lease, session_id=session_id)
+        except asyncio.CancelledError as error:
+            if held.heartbeat_error is not None:
+                lease_error = LeaseLost("workspace lease heartbeat failed")
+                body_error = lease_error
+                raise lease_error from held.heartbeat_error
+            body_error = error
+            raise
         except BaseException as error:
             body_error = error
             raise

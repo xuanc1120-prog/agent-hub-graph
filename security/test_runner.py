@@ -20,11 +20,23 @@ from protocol import FrozenStrictModel
 from security.command_guard import ApprovedCommand, CommandGuard
 
 _SECRET_OUTPUT = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END", re.I),
+    re.compile(
+        r"-----BEGIN [^-\r\n]{0,64}PRIVATE KEY-----[\s\S]*?"
+        r"(?:-----END [^-\r\n]{0,64}PRIVATE KEY-----|\Z)",
+        re.I,
+    ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,255}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"),
+    re.compile(
+        r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)"
+        r"://[^\s,;]+"
+    ),
     re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*[^\s,;]+"),
 )
+
+_REDACTION_OVERLAP_BYTES = 64 * 1024
 
 
 class TestRunResult(FrozenStrictModel):
@@ -46,19 +58,16 @@ class _OutputCollector:
     limit: int
     value: bytearray = field(default_factory=bytearray)
     truncated: bool = False
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def read(self, stream: asyncio.StreamReader, label: bytes) -> None:
+    async def read(self, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(16 * 1024):
-            async with self.lock:
-                remaining = self.limit - len(self.value)
-                if remaining <= 0:
-                    self.truncated = True
-                    continue
-                framed = label + chunk
-                self.value.extend(framed[:remaining])
-                if len(framed) > remaining:
-                    self.truncated = True
+            remaining = self.limit - len(self.value)
+            if remaining <= 0:
+                self.truncated = True
+                continue
+            self.value.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                self.truncated = True
 
 
 class TestRunner:
@@ -115,10 +124,12 @@ class TestRunner:
         )
         assert process.stdout is not None
         assert process.stderr is not None
-        collector = _OutputCollector(self._max_output_bytes)
+        capture_limit = self._max_output_bytes + _REDACTION_OVERLAP_BYTES
+        stdout_collector = _OutputCollector(capture_limit)
+        stderr_collector = _OutputCollector(capture_limit)
         readers = (
-            asyncio.create_task(collector.read(process.stdout, b"[stdout] ")),
-            asyncio.create_task(collector.read(process.stderr, b"[stderr] ")),
+            asyncio.create_task(stdout_collector.read(process.stdout)),
+            asyncio.create_task(stderr_collector.read(process.stderr)),
         )
         timed_out = False
         try:
@@ -134,16 +145,21 @@ class TestRunner:
         finally:
             await asyncio.gather(*readers)
 
-        output = collector.value.decode("utf-8", errors="replace")
-        for pattern in _SECRET_OUTPUT:
-            output = pattern.sub("[REDACTED]", output)
+        stdout = _redact_output(stdout_collector.value.decode("utf-8", errors="replace"))
+        stderr = _redact_output(stderr_collector.value.decode("utf-8", errors="replace"))
+        framed = []
+        if stdout:
+            framed.append(f"[stdout] {stdout}")
+        if stderr:
+            framed.append(f"[stderr] {stderr}")
+        output, bounded = _bounded_utf8("\n".join(framed), self._max_output_bytes)
         return TestRunResult(
             template_id=approved.template_id,
             argv=(executable, *arguments),
             exit_code=process.returncode,
             timed_out=timed_out,
             output=output,
-            output_truncated=collector.truncated,
+            output_truncated=(bounded or stdout_collector.truncated or stderr_collector.truncated),
             duration_ms=max(0, int((time.monotonic() - started) * 1_000)),
         )
 
@@ -195,6 +211,19 @@ class TestRunner:
                 if value:
                     environment[name] = value
         return environment
+
+
+def _redact_output(value: str) -> str:
+    for pattern in _SECRET_OUTPUT:
+        value = pattern.sub("[REDACTED]", value)
+    return value
+
+
+def _bounded_utf8(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
 
 
 def _terminate_process_tree(pid: int) -> None:

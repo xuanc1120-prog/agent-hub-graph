@@ -25,6 +25,7 @@ from protocol import (
     NodeRunStatus,
     NodeSummary,
     RiskLevel,
+    SecuritySeverity,
     TaskPackage,
     TaskStatus,
     WorkflowNode,
@@ -32,6 +33,7 @@ from protocol import (
 )
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRepository
+from storage.errors import LeaseLost
 from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
@@ -288,15 +290,18 @@ class AgentTaskNodeHandler:
                     console.append(message[:1_000])
 
             if node.requires_write:
-                agent_result = await self._run_write_adapter(
+                result = await self._execute_write_task(
                     context=context,
                     adapter=adapter,
                     task=task,
                     context_pack=context_result.pack,
                     collect=collect,
+                    console=console,
                 )
-            else:
-                agent_result = await adapter.run(task, context_result.pack, collect)
+                bundle_created = False
+                return result
+
+            agent_result = await adapter.run(task, context_result.pack, collect)
             if (
                 agent_result.task_id != task_id
                 or agent_result.node_run_id != context.node_run.node_run_id
@@ -360,8 +365,10 @@ class AgentTaskNodeHandler:
                 summary=agent_result.summary or "MockAgent execution failed.",
                 error_code=code,
             )
+        except LeaseLost:
+            raise
         except Exception as exc:
-            if task_started:
+            if task_started and not node.requires_write:
                 await self._finish_failed_if_running(task_id, context, exc)
             return NodeHandlerResult(
                 status=NodeRunStatus.FAILED,
@@ -383,7 +390,7 @@ class AgentTaskNodeHandler:
                             retry.errors,
                         )
 
-    async def _run_write_adapter(
+    async def _execute_write_task(
         self,
         *,
         context: NodeExecutionContext,
@@ -391,7 +398,8 @@ class AgentTaskNodeHandler:
         task: TaskPackage,
         context_pack: ContextPack,
         collect: ConsoleSink,
-    ) -> AgentResult:
+        console: list[str],
+    ) -> NodeHandlerResult:
         assert self._change_sets is not None
         assert self._git is not None
         assert self._locks is not None
@@ -412,6 +420,7 @@ class AgentTaskNodeHandler:
                 base_commit=context.run.current_commit,
                 expected_branch=context.session.integration_branch,
                 temp_directory=self._agent_runs_dir / task.task_id / "workspace-transaction",
+                seal_git_objects=True,
                 **self._transaction_limits,
             )
             transaction.begin()
@@ -427,7 +436,12 @@ class AgentTaskNodeHandler:
                 execution_error = error
 
             try:
-                capture = transaction.capture_and_restore()
+                held.assert_healthy()
+                capture = await self._locks.run_fenced(
+                    held.lease,
+                    session_id=context.run.session_id,
+                    operation=transaction.capture_and_restore,
+                )
             except BaseException as capture_error:
                 if execution_error is not None:
                     capture_error.add_note(
@@ -441,36 +455,121 @@ class AgentTaskNodeHandler:
                 or capture.manifest.created_directories
             )
             held.assert_healthy()
-            if has_changes:
-                await self._change_sets.persist_capture(
-                    session_id=context.run.session_id,
-                    workflow_run_id=context.run.workflow_run_id,
-                    node_run_id=context.node_run.node_run_id,
-                    task_id=task.task_id,
-                    capture=capture,
-                    master_lease=context.master_lease,
-                    workspace_lease=held.lease,
-                    status=(
-                        ChangeSetStatus.CAPTURED
-                        if execution_error is None
-                        and agent_result is not None
-                        and agent_result.status == AgentResultStatus.SUCCEEDED
-                        else ChangeSetStatus.ABANDONED_PARTIAL
-                    ),
-                    reason=(
-                        None
-                        if execution_error is None
-                        and agent_result is not None
-                        and agent_result.status == AgentResultStatus.SUCCEEDED
-                        else "Agent execution did not complete successfully"
-                    ),
+            change_set_id: str | None = None
+            capture_live = False
+            try:
+                if has_changes:
+                    stored = await self._change_sets.persist_capture(
+                        session_id=context.run.session_id,
+                        workflow_run_id=context.run.workflow_run_id,
+                        node_run_id=context.node_run.node_run_id,
+                        task_id=task.task_id,
+                        capture=capture,
+                        master_lease=context.master_lease,
+                        workspace_lease=held.lease,
+                        status=(
+                            ChangeSetStatus.CAPTURED
+                            if execution_error is None
+                            and agent_result is not None
+                            and agent_result.status == AgentResultStatus.SUCCEEDED
+                            else ChangeSetStatus.ABANDONED_PARTIAL
+                        ),
+                        reason=(
+                            None
+                            if execution_error is None
+                            and agent_result is not None
+                            and agent_result.status == AgentResultStatus.SUCCEEDED
+                            else "Agent execution did not complete successfully"
+                        ),
+                    )
+                    change_set_id = stored.change_set.change_set_id
+                    capture_live = stored.change_set.status == ChangeSetStatus.CAPTURED
+                if execution_error is not None:
+                    raise execution_error
+                assert agent_result is not None
+                if agent_result.status == AgentResultStatus.SUCCEEDED and not has_changes:
+                    raise _AgentTaskError("write_agent_no_changes")
+
+                cleanup = await self._bundles.cleanup(task.task_id)
+                if cleanup.errors:
+                    raise _AgentTaskError("context_cleanup_failed")
+
+                if agent_result.status == AgentResultStatus.SUCCEEDED:
+                    output = _MockOutput(
+                        task_id=task.task_id,
+                        summary=agent_result.summary,
+                        console=tuple(console),
+                        risks=tuple(agent_result.risks),
+                    )
+                    output_record = await self._artifacts.create(
+                        artifact_id=_artifact_id(
+                            "mock-output",
+                            context.node_run.node_run_id,
+                        ),
+                        session_id=context.run.session_id,
+                        task_id=task.task_id,
+                        artifact_type=ArtifactType.REPORT,
+                        content=canonical_json(output),
+                        redacted=True,
+                    )
+                    await self._runs.finish_task(
+                        task.task_id,
+                        target=TaskStatus.SUCCEEDED,
+                        lease=context.master_lease,
+                        workspace_lease=held.lease,
+                    )
+                    return NodeHandlerResult(
+                        status=NodeRunStatus.COMPLETED,
+                        outcome=NodeOutcome.SUCCESS,
+                        summary=agent_result.summary,
+                        artifact_refs=(_artifact_ref(output_record),),
+                    )
+
+                target, code = _task_failure(
+                    agent_result.status,
+                    agent_result.error_code,
                 )
-            if execution_error is not None:
-                raise execution_error
-            assert agent_result is not None
-            if agent_result.status == AgentResultStatus.SUCCEEDED and not has_changes:
-                raise _AgentTaskError("write_agent_no_changes")
-            return agent_result
+                await self._runs.finish_task(
+                    task.task_id,
+                    target=target,
+                    error_code=code,
+                    lease=context.master_lease,
+                    workspace_lease=held.lease,
+                )
+                if target == TaskStatus.BLOCKED_BY_GUARD:
+                    return _blocked(
+                        code,
+                        agent_result.summary or "Agent blocked the write task.",
+                    )
+                return NodeHandlerResult(
+                    status=NodeRunStatus.FAILED,
+                    outcome=NodeOutcome.FAILURE,
+                    summary=agent_result.summary or "Agent execution failed.",
+                    error_code=code,
+                )
+            except LeaseLost:
+                raise
+            except Exception as error:
+                if capture_live and change_set_id is not None:
+                    await self._change_sets.transition(
+                        change_set_id,
+                        expected=ChangeSetStatus.CAPTURED,
+                        target=ChangeSetStatus.ABANDONED_PARTIAL,
+                        master_lease=context.master_lease,
+                        workspace_lease=held.lease,
+                        reason=(f"Write task failed after capture: {_handler_error_code(error)}"),
+                        severity=SecuritySeverity.HIGH,
+                    )
+                current = await self._runs.get_task(task.task_id)
+                if current.status == TaskStatus.RUNNING:
+                    await self._runs.finish_task(
+                        task.task_id,
+                        target=TaskStatus.FAILED,
+                        error_code=_handler_error_code(error),
+                        lease=context.master_lease,
+                        workspace_lease=held.lease,
+                    )
+                raise
 
     async def _predecessor_refs(
         self,

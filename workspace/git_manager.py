@@ -7,8 +7,10 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Collection, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -72,6 +74,13 @@ class GitEvidence:
 class CanonicalPatch:
     patch_bytes: bytes
     name_status_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalBaselineFile:
+    path: str
+    content: bytes
+    mode: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +346,7 @@ class GitManager:
         base_commit: str,
         changed_paths: Sequence[str],
         temp_directory: Path,
+        baseline_files: Sequence[CanonicalBaselineFile] = (),
     ) -> CanonicalPatch:
         self._require_object_id(base_commit)
         root = repo.expanduser().resolve(strict=True)
@@ -344,25 +354,80 @@ class GitManager:
         if not paths:
             return CanonicalPatch(patch_bytes=b"", name_status_bytes=b"")
         pathspec = self._pathspec_bytes(paths)
+        baseline_by_path = {item.path: item for item in baseline_files}
+        if len(baseline_by_path) != len(baseline_files):
+            raise GitManagerError("canonical baseline file paths must be unique")
+        self._pathspec_bytes(tuple(baseline_by_path))
+        for item in baseline_files:
+            if item.mode < 0 or item.mode > 0o777:
+                raise GitManagerError("canonical baseline file mode is invalid")
         temporary_root = temp_directory.expanduser().resolve(strict=False)
         try:
             temporary_common = Path(os.path.commonpath((root, temporary_root)))
         except ValueError:
             temporary_common = None
         if temporary_common == root:
-            raise GitManagerError("temporary Git index must be outside the session repository")
+            raise GitManagerError("temporary Git state must be outside the session repository")
         temporary_root.mkdir(parents=True, exist_ok=True)
-        self._assert_directory_not_reparse(temporary_root, label="temporary Git index root")
-        index_path = temporary_root / f"index-{uuid.uuid4().hex}"
-        index_lock = Path(f"{index_path}.lock")
-        before_index = self.index_sha256(root)
-        environment = {"GIT_INDEX_FILE": str(index_path)}
+        self._assert_directory_not_reparse(temporary_root, label="temporary Git state root")
+        operation_root = temporary_root / f"canonical-{uuid.uuid4().hex}"
+        operation_root.mkdir(parents=False, exist_ok=False)
+        index_path = operation_root / "index"
+        object_directory = Path(tempfile.mkdtemp(prefix="ah-git-objects-")).resolve(strict=True)
         try:
+            self._assert_directory_not_reparse(
+                object_directory,
+                label="temporary Git object store",
+            )
+            try:
+                object_common = Path(os.path.commonpath((root, object_directory)))
+            except ValueError:
+                object_common = None
+            if object_common == root:
+                raise GitManagerError(
+                    "temporary Git object store must be outside the session repository"
+                )
+            alternate_objects = (root / ".git" / "objects").resolve(strict=True)
+            before_index = self.index_sha256(root)
+            environment = {
+                "GIT_INDEX_FILE": str(index_path),
+                "GIT_OBJECT_DIRECTORY": str(object_directory),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(alternate_objects),
+            }
             self._run(
                 ("read-tree", base_commit),
                 cwd=root,
                 extra_environment=environment,
             )
+            for item in sorted(baseline_files, key=lambda value: value.path):
+                object_id = self._decode(
+                    self._run(
+                        ("hash-object", "-w", "--stdin"),
+                        cwd=root,
+                        input_bytes=item.content,
+                        extra_environment=environment,
+                    ).stdout
+                ).strip()
+                self._require_object_id(object_id)
+                git_mode = "100755" if item.mode & 0o111 else "100644"
+                self._run(
+                    (
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"{git_mode},{object_id},{item.path}",
+                    ),
+                    cwd=root,
+                    extra_environment=environment,
+                )
+            baseline_tree = self._decode(
+                self._run(
+                    ("write-tree",),
+                    cwd=root,
+                    extra_environment=environment,
+                ).stdout
+            ).strip()
+            self._require_object_id(baseline_tree)
             self._run(
                 (
                     "add",
@@ -384,7 +449,7 @@ class GitManager:
                     "--find-renames",
                     "--no-ext-diff",
                     "--no-textconv",
-                    base_commit,
+                    baseline_tree,
                     "--",
                 ),
                 cwd=root,
@@ -397,15 +462,17 @@ class GitManager:
                     "--name-status",
                     "-z",
                     "--find-renames",
-                    base_commit,
+                    baseline_tree,
                     "--",
                 ),
                 cwd=root,
                 extra_environment=environment,
             ).stdout
         finally:
-            index_lock.unlink(missing_ok=True)
-            index_path.unlink(missing_ok=True)
+            try:
+                self._remove_tree(operation_root)
+            finally:
+                self._remove_tree(object_directory)
         if self.index_sha256(root) != before_index:
             raise GitManagerError("canonical patch construction modified the real Git index")
         return CanonicalPatch(patch_bytes=patch, name_status_bytes=name_status)
@@ -468,14 +535,48 @@ class GitManager:
         entries = self._run(("ls-files", "--stage", "-z", "--"), cwd=root).stdout
         return sha256(entries).hexdigest()
 
-    def capture_metadata_seal(self, repo: Path) -> GitMetadataSeal:
-        digest, entry_count = self._git_metadata_digest(repo)
+    def capture_metadata_seal(
+        self,
+        repo: Path,
+        *,
+        include_objects: bool = False,
+    ) -> GitMetadataSeal:
+        digest, entry_count = self._git_metadata_digest(
+            repo,
+            include_objects=include_objects,
+        )
         return GitMetadataSeal(sha256=digest, entry_count=entry_count)
 
-    def assert_metadata_seal(self, repo: Path, expected: GitMetadataSeal) -> None:
-        current = self.capture_metadata_seal(repo)
+    def assert_metadata_seal(
+        self,
+        repo: Path,
+        expected: GitMetadataSeal,
+        *,
+        include_objects: bool = False,
+    ) -> None:
+        current = self.capture_metadata_seal(repo, include_objects=include_objects)
         if current != expected:
             raise GitManagerError("session Git control metadata changed during task execution")
+
+    def commit_validation_baseline(self, repo: Path) -> RepositoryState:
+        root = repo.expanduser().resolve(strict=True)
+        self._run(("add", "-A", "-f", "--"), cwd=root)
+        self._run(
+            ("commit", "--no-verify", "--no-gpg-sign", "-m", "Agent Hub validation baseline"),
+            cwd=root,
+            extra_environment={
+                "GIT_AUTHOR_NAME": "Agent Hub",
+                "GIT_AUTHOR_EMAIL": "agent-hub@localhost.invalid",
+                "GIT_COMMITTER_NAME": "Agent Hub",
+                "GIT_COMMITTER_EMAIL": "agent-hub@localhost.invalid",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            },
+        )
+        state = self.state(root)
+        if state.dirty:
+            raise GitManagerError("validation baseline commit left a dirty repository")
+        return state
 
     def remove_session_repository(self, destination: Path, *, allowed_root: Path) -> None:
         target = destination.expanduser().resolve(strict=False)
@@ -488,7 +589,64 @@ class GitManager:
         if common != root or workspace == root:
             raise GitManagerError("session cleanup path is outside the workspace root")
         if workspace.exists() or workspace.is_symlink():
-            shutil.rmtree(workspace)
+            self._remove_tree(workspace)
+
+    @staticmethod
+    def _remove_tree(root: Path) -> None:
+        if not root.exists() and not root.is_symlink():
+            return
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        def is_link_or_reparse(path: Path) -> tuple[bool, os.stat_result]:
+            metadata = path.lstat()
+            return (
+                stat.S_ISLNK(metadata.st_mode)
+                or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag),
+                metadata,
+            )
+
+        root_is_link, root_metadata = is_link_or_reparse(root)
+        if root_is_link:
+            if stat.S_ISLNK(root_metadata.st_mode):
+                root.unlink()
+            elif stat.S_ISDIR(root_metadata.st_mode):
+                root.rmdir()
+            else:
+                root.unlink()
+            return
+        with suppress(OSError):
+            root.chmod(stat.S_IRWXU)
+        for current_root, directories, files in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+        ):
+            current = Path(current_root)
+            safe_directories: list[str] = []
+            for name in directories:
+                target = current / name
+                linked, metadata = is_link_or_reparse(target)
+                if linked:
+                    if stat.S_ISLNK(metadata.st_mode):
+                        target.unlink()
+                    elif stat.S_ISDIR(metadata.st_mode):
+                        target.rmdir()
+                    else:
+                        target.unlink()
+                    continue
+                with suppress(OSError):
+                    target.chmod(stat.S_IRWXU)
+                safe_directories.append(name)
+            directories[:] = safe_directories
+            for name in files:
+                target = current / name
+                linked, _metadata = is_link_or_reparse(target)
+                if linked:
+                    target.unlink()
+                else:
+                    with suppress(OSError):
+                        target.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        shutil.rmtree(root)
 
     def _run(
         self,
@@ -621,7 +779,12 @@ class GitManager:
         if any(variant and variant in text for variant in variants):
             raise GitManagerError("session repository still contains the source path")
 
-    def _git_metadata_digest(self, repo: Path) -> tuple[str, int]:
+    def _git_metadata_digest(
+        self,
+        repo: Path,
+        *,
+        include_objects: bool,
+    ) -> tuple[str, int]:
         root = repo.expanduser().resolve(strict=True)
         self._assert_directory_not_reparse(root, label="repository")
         git_dir = root / ".git"
@@ -638,19 +801,30 @@ class GitManager:
             excluded_top_directories=frozenset({"objects"}),
             mutable_files=frozenset({"index"}),
         )
-        objects_info = objects / "info"
-        digest.update(
-            b"objects-info-present\0" if objects_info.exists() else b"objects-info-absent\0"
-        )
-        if objects_info.exists():
-            info_entries, info_bytes = self._update_stable_tree_digest(
+        if include_objects:
+            object_entries, object_bytes = self._update_stable_tree_digest(
                 digest,
-                objects_info,
-                prefix="objects/info",
+                objects,
+                prefix="objects",
+                max_bytes=self._max_git_bytes,
+                limit_label="session Git object store",
             )
-            entry_count += info_entries
-            total_bytes += info_bytes
-        if total_bytes > 16 * 1024 * 1024:
+            entry_count += object_entries
+            total_bytes += object_bytes
+        else:
+            objects_info = objects / "info"
+            digest.update(
+                b"objects-info-present\0" if objects_info.exists() else b"objects-info-absent\0"
+            )
+            if objects_info.exists():
+                info_entries, info_bytes = self._update_stable_tree_digest(
+                    digest,
+                    objects_info,
+                    prefix="objects/info",
+                )
+                entry_count += info_entries
+                total_bytes += info_bytes
+        if total_bytes > 16 * 1024 * 1024 and not include_objects:
             raise GitManagerError("session Git control metadata exceeds 16 MiB")
         return digest.hexdigest(), entry_count
 
@@ -662,6 +836,8 @@ class GitManager:
         prefix: str,
         excluded_top_directories: frozenset[str] = frozenset(),
         mutable_files: frozenset[str] = frozenset(),
+        max_bytes: int = 16 * 1024 * 1024,
+        limit_label: str = "session Git control metadata",
     ) -> tuple[int, int]:
         entry_count = 0
         total_bytes = 0
@@ -698,8 +874,8 @@ class GitManager:
                     )
                 content = path.read_bytes()
                 total_bytes += len(content)
-                if total_bytes > 16 * 1024 * 1024:
-                    raise GitManagerError("session Git control metadata exceeds 16 MiB")
+                if total_bytes > max_bytes:
+                    raise GitManagerError(f"{limit_label} exceeds its byte limit")
                 digest.update(b"F\0")
                 digest.update(sealed_path.encode("utf-8", errors="strict"))
                 digest.update(b"\0")
@@ -815,6 +991,7 @@ class GitManager:
 
 
 __all__ = [
+    "CanonicalBaselineFile",
     "CanonicalPatch",
     "GitCommandError",
     "GitEvidence",

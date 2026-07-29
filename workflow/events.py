@@ -52,6 +52,7 @@ class NodeRunEventPayload(StrictModel):
 
 class TaskEventPayload(StrictModel):
     master_fencing_token: int = Field(ge=1)
+    workspace_fencing_token: int | None = Field(default=None, ge=1)
     workflow_run_id: EntityId
     node_run_id: EntityId
     task_id: EntityId

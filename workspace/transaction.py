@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
 import unicodedata
 import uuid
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
-from security.path_policy import PathPolicy, PathPolicyViolation
+from security.path_policy import PathPolicy
 from workspace.change_set import ChangeSetManifest, FileAction, FileChange
 from workspace.git_manager import (
+    CanonicalBaselineFile,
     GitManager,
     GitManagerError,
     GitMetadataSeal,
@@ -49,6 +51,7 @@ class FilePreimage:
     size_bytes: int
     mode: int
     content: bytes
+    baseline_ignored: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +89,7 @@ class WorkspaceTransaction:
         max_inventory_paths: int = 50_000,
         max_inventory_bytes: int = 2 * 1024 * 1024 * 1024,
         max_ignored_preimage_bytes: int = 100 * 1024 * 1024,
+        seal_git_objects: bool = False,
     ) -> None:
         if any(
             limit < 1
@@ -110,6 +114,7 @@ class WorkspaceTransaction:
         self._max_inventory_paths = max_inventory_paths
         self._max_inventory_bytes = max_inventory_bytes
         self._max_ignored_preimage_bytes = max_ignored_preimage_bytes
+        self._seal_git_objects = seal_git_objects
         self._path_policy = PathPolicy(self._repo, max_scope_files=max_changed_paths)
         self._phase = "new"
         self._baseline_state: RepositoryState | None = None
@@ -123,7 +128,10 @@ class WorkspaceTransaction:
     def begin(self) -> None:
         if self._phase != "new":
             raise WorkspaceTransactionError("workspace transaction can only begin once")
-        metadata_seal = self._git.capture_metadata_seal(self._repo)
+        metadata_seal = self._git.capture_metadata_seal(
+            self._repo,
+            include_objects=self._seal_git_objects,
+        )
         state = self._git.state(self._repo)
         if state.commit != self._base_commit:
             raise WorkspaceNotClean("workspace HEAD does not match the task base commit")
@@ -136,6 +144,8 @@ class WorkspaceTransaction:
         inventory = self._scan_inventory()
         tracked = frozenset(self._git.tracked_paths(self._repo))
         ignored = frozenset(state.ignored_files)
+        if len(ignored) > self._max_changed_paths:
+            raise WorkspaceNotClean("ignored baseline exceeds the replayable workspace path limit")
         preimages = self._capture_ignored_preimages(ignored, inventory)
         self._baseline_state = state
         self._baseline_inventory = inventory
@@ -146,6 +156,10 @@ class WorkspaceTransaction:
         self._git_metadata_seal = metadata_seal
         self._phase = "active"
 
+    @property
+    def baseline_state_hash(self) -> str:
+        return self._require_baseline_inventory().state_hash
+
     def capture_and_restore(self) -> CapturedWorkspaceChangeSet:
         if self._phase != "active":
             raise WorkspaceTransactionError("workspace transaction is not active")
@@ -153,7 +167,11 @@ class WorkspaceTransaction:
         baseline = self._require_baseline_inventory()
         metadata_seal = self._require_git_metadata_seal()
         try:
-            self._git.assert_metadata_seal(self._repo, metadata_seal)
+            self._git.assert_metadata_seal(
+                self._repo,
+                metadata_seal,
+                include_objects=self._seal_git_objects,
+            )
         except GitManagerError as error:
             self._phase = "orphaned"
             raise WorkspaceRestoreError(
@@ -207,6 +225,14 @@ class WorkspaceTransaction:
                 base_commit=self._base_commit,
                 changed_paths=tuple(restore_paths),
                 temp_directory=self._temp_directory,
+                baseline_files=tuple(
+                    CanonicalBaselineFile(
+                        path=preimage.path,
+                        content=preimage.content,
+                        mode=preimage.mode,
+                    )
+                    for preimage in self._ignored_preimages.values()
+                ),
             )
             if len(canonical.patch_bytes) > self._max_patch_bytes:
                 raise WorkspaceTransactionError(
@@ -257,7 +283,7 @@ class WorkspaceTransaction:
             raise capture_error
         assert result is not None
         try:
-            self._verify_canonical_patch(result, restore_paths)
+            self._verify_canonical_patch(result, after)
         except WorkspaceRestoreError:
             self._phase = "orphaned"
             raise
@@ -270,51 +296,61 @@ class WorkspaceTransaction:
     def _verify_canonical_patch(
         self,
         result: CapturedWorkspaceChangeSet,
-        restore_paths: set[str],
+        post_inventory: _Inventory,
     ) -> None:
         if not result.patch_bytes:
+            if result.manifest.pre_state_hash != result.manifest.post_state_hash:
+                raise WorkspaceTransactionError(
+                    "empty canonical patch does not reproduce the captured post-state"
+                )
             return
-        if result.manifest.ignored_files_touched:
-            return
-        existing_scope: list[str] = []
-        new_scope: list[str] = []
-        for change in result.manifest.changes:
-            if change.action in {FileAction.MODIFIED, FileAction.DELETED}:
-                existing_scope.append(change.path)
-            elif change.action == FileAction.CREATED:
-                new_scope.append(change.path)
-            else:
-                assert change.old_path is not None
-                existing_scope.append(change.old_path)
-                new_scope.append(change.path)
+        replay_id = uuid.uuid4().hex
+        replay_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=True)
         try:
-            self._path_policy.validate_scope(existing_scope, new_scope)
-        except PathPolicyViolation:
-            return
-        self._git.apply_check(self._repo, result.patch_bytes)
-        verification_error: BaseException | None = None
+            replay_common = Path(os.path.commonpath((self._repo, replay_root)))
+        except ValueError:
+            replay_common = None
+        if replay_common == self._repo:
+            raise WorkspaceTransactionError("replay root must be outside the session repository")
+        replay_repo = replay_root / f"ah-replay-{replay_id}" / "repo"
         try:
-            self._git.apply_patch(self._repo, result.patch_bytes)
-            applied = self._scan_inventory()
+            source = self._git.inspect_source_repository(
+                self._repo,
+                base_ref=self._base_commit,
+            )
+            self._git.create_session_repository(
+                source=source,
+                destination=replay_repo,
+                session_id=f"replay-{replay_id[:24]}",
+            )
+            materialize_workspace_preimages(
+                replay_repo,
+                tuple(self._ignored_preimages.values()),
+                max_paths=self._max_changed_paths,
+            )
+            replay_baseline = self._scan_inventory(repo=replay_repo)
+            if replay_baseline.state_hash != result.manifest.pre_state_hash:
+                raise WorkspaceTransactionError(
+                    "replay workspace does not match the captured pre-state"
+                )
+            self._git.apply_check(replay_repo, result.patch_bytes)
+            self._git.apply_patch(replay_repo, result.patch_bytes)
+            applied = self._scan_inventory(repo=replay_repo)
             if applied.state_hash != result.manifest.post_state_hash:
                 raise WorkspaceTransactionError(
                     "canonical patch does not reproduce the captured post-state"
                 )
-        except BaseException as error:
-            verification_error = error
-        try:
-            self._restore(
-                restore_paths,
-                created_directories=result.manifest.created_directories,
-                ignored_touched=(),
-            )
-            self._assert_restored()
-        except BaseException as restore_error:
-            raise WorkspaceRestoreError(
-                "canonical patch verification could not restore the workspace"
-            ) from restore_error
-        if verification_error is not None:
-            raise verification_error
+            if applied != post_inventory:
+                raise WorkspaceTransactionError(
+                    "canonical replay inventory differs from captured inventory"
+                )
+        finally:
+            replay_workspace = replay_repo.parent
+            if replay_workspace.exists() or replay_workspace.is_symlink():
+                self._git.remove_session_repository(
+                    replay_repo,
+                    allowed_root=replay_root,
+                )
 
     def _restore(
         self,
@@ -372,7 +408,11 @@ class WorkspaceTransaction:
     def _assert_restored(self) -> None:
         baseline_state = self._require_baseline_state()
         baseline_inventory = self._require_baseline_inventory()
-        self._git.assert_metadata_seal(self._repo, self._require_git_metadata_seal())
+        self._git.assert_metadata_seal(
+            self._repo,
+            self._require_git_metadata_seal(),
+            include_objects=self._seal_git_objects,
+        )
         current = self._git.state(self._repo)
         if current != baseline_state:
             raise WorkspaceRestoreError("workspace Git state differs from its baseline")
@@ -381,22 +421,23 @@ class WorkspaceTransaction:
         if self._scan_inventory() != baseline_inventory:
             raise WorkspaceRestoreError("workspace file inventory differs from its baseline")
 
-    def _scan_directories(self) -> tuple[str, ...]:
+    def _scan_directories(self, *, repo: Path | None = None) -> tuple[str, ...]:
+        root = self._repo if repo is None else repo.expanduser().resolve(strict=True)
         directories: list[str] = []
         for current_root, directory_names, _file_names in os.walk(
-            self._repo,
+            root,
             topdown=True,
             followlinks=False,
         ):
             current = Path(current_root)
             safe_directories: list[str] = []
             for name in sorted(directory_names):
-                if current == self._repo and name.casefold() == ".git":
+                if current == root and name.casefold() == ".git":
                     continue
                 child = current / name
                 self._assert_plain_entry(child, expect_directory=True)
                 safe_directories.append(name)
-                directories.append(self._relative_path(child))
+                directories.append(self._relative_path(child, root=root))
                 if len(directories) > self._max_inventory_paths:
                     raise WorkspaceTransactionError(
                         "workspace directory inventory path limit exceeded"
@@ -404,29 +445,30 @@ class WorkspaceTransaction:
             directory_names[:] = safe_directories
         return tuple(sorted(directories))
 
-    def _scan_inventory(self) -> _Inventory:
+    def _scan_inventory(self, *, repo: Path | None = None) -> _Inventory:
+        root = self._repo if repo is None else repo.expanduser().resolve(strict=True)
         files: dict[str, FileSnapshot] = {}
         directories: list[str] = []
         total_bytes = 0
         for current_root, directory_names, file_names in os.walk(
-            self._repo,
+            root,
             topdown=True,
             followlinks=False,
         ):
             current = Path(current_root)
             safe_directories: list[str] = []
             for name in sorted(directory_names):
-                if current == self._repo and name.casefold() == ".git":
+                if current == root and name.casefold() == ".git":
                     continue
                 child = current / name
                 self._assert_plain_entry(child, expect_directory=True)
                 safe_directories.append(name)
-                directories.append(self._relative_path(child))
+                directories.append(self._relative_path(child, root=root))
             directory_names[:] = safe_directories
             for name in sorted(file_names):
                 child = current / name
                 self._assert_plain_entry(child, expect_directory=False)
-                relative = self._relative_path(child)
+                relative = self._relative_path(child, root=root)
                 snapshot = self._snapshot_file(child, relative)
                 files[relative] = snapshot
                 total_bytes += snapshot.size_bytes
@@ -464,6 +506,7 @@ class WorkspaceTransaction:
                 size_bytes=snapshot.size_bytes,
                 mode=snapshot.mode,
                 content=content,
+                baseline_ignored=True,
             )
         return preimages
 
@@ -573,14 +616,12 @@ class WorkspaceTransaction:
         return tuple(changes)
 
     def _build_preimages(self, changes: tuple[FileChange, ...]) -> tuple[FilePreimage, ...]:
-        preimages: list[FilePreimage] = []
+        preimages = dict(self._ignored_preimages)
         for change in changes:
             if change.action == FileAction.CREATED:
                 continue
             source_path = change.old_path or change.path
-            ignored = self._ignored_preimages.get(source_path)
-            if ignored is not None:
-                preimages.append(ignored)
+            if source_path in preimages:
                 continue
             content = self._git.read_blob(
                 self._repo,
@@ -592,16 +633,15 @@ class WorkspaceTransaction:
             if expected is None or digest != expected:
                 raise WorkspaceTransactionError(f"tracked preimage hash mismatch: {source_path}")
             snapshot = self._require_baseline_inventory().files[source_path]
-            preimages.append(
-                FilePreimage(
-                    path=source_path,
-                    sha256=digest,
-                    size_bytes=len(content),
-                    mode=snapshot.mode,
-                    content=content,
-                )
+            preimages[source_path] = FilePreimage(
+                path=source_path,
+                sha256=digest,
+                size_bytes=len(content),
+                mode=snapshot.mode,
+                content=content,
+                baseline_ignored=False,
             )
-        return tuple(preimages)
+        return tuple(preimages[path] for path in sorted(preimages))
 
     def _remove_exact_new_file(self, path: str) -> None:
         validated = self._path_policy.validate_cleanup_path(path)
@@ -614,24 +654,11 @@ class WorkspaceTransaction:
         target.unlink()
 
     def _restore_preimage(self, preimage: FilePreimage) -> None:
-        validated = self._path_policy.validate_cleanup_path(preimage.path)
-        target = validated.absolute_path
-        if target.exists():
-            metadata = target.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
-                raise WorkspaceRestoreError(
-                    f"ignored path is not a plain single-link file: {preimage.path}"
-                )
-        temporary = target.parent / f".{target.name}.agent-hub-{uuid.uuid4().hex}.tmp"
-        try:
-            with temporary.open("xb") as stream:
-                stream.write(preimage.content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temporary, preimage.mode)
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        materialize_workspace_preimages(
+            self._repo,
+            (preimage,),
+            max_paths=self._max_changed_paths,
+        )
 
     @staticmethod
     def _snapshot_file(path: Path, relative: str) -> FileSnapshot:
@@ -666,8 +693,8 @@ class WorkspaceTransaction:
         ).encode("utf-8")
         return sha256(encoded).hexdigest()
 
-    def _relative_path(self, path: Path) -> str:
-        relative = path.relative_to(self._repo).as_posix()
+    def _relative_path(self, path: Path, *, root: Path | None = None) -> str:
+        relative = path.relative_to(root or self._repo).as_posix()
         if unicodedata.normalize("NFC", relative) != relative:
             raise WorkspaceTransactionError("workspace path is not Unicode NFC normalized")
         try:
@@ -737,6 +764,52 @@ class WorkspaceTransaction:
         return self._git_metadata_seal
 
 
+def materialize_workspace_preimages(
+    repo: Path,
+    preimages: tuple[FilePreimage, ...],
+    *,
+    max_paths: int = 500,
+) -> None:
+    if not 1 <= max_paths <= 50_000:
+        raise ValueError("preimage path limit is invalid")
+    if len(preimages) > max_paths:
+        raise WorkspaceTransactionError("preimage materialization exceeds its path limit")
+    by_path = {preimage.path: preimage for preimage in preimages}
+    if len(by_path) != len(preimages):
+        raise WorkspaceTransactionError("preimage materialization contains duplicate paths")
+    root = repo.expanduser().resolve(strict=True)
+    policy = PathPolicy(root, max_scope_files=max_paths)
+    for preimage in preimages:
+        if (
+            len(preimage.content) != preimage.size_bytes
+            or sha256(preimage.content).hexdigest() != preimage.sha256
+        ):
+            raise WorkspaceTransactionError(
+                f"preimage content does not match its manifest: {preimage.path}"
+            )
+        validated = policy.validate_cleanup_path(preimage.path)
+        target = validated.absolute_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        validated = policy.validate_cleanup_path(preimage.path)
+        target = validated.absolute_path
+        if target.exists() or target.is_symlink():
+            metadata = target.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
+                raise WorkspaceRestoreError(
+                    f"preimage path is not a plain single-link file: {preimage.path}"
+                )
+        temporary = target.parent / f".{target.name}.agent-hub-{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(preimage.content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, preimage.mode)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 __all__ = [
     "CapturedWorkspaceChangeSet",
     "FilePreimage",
@@ -745,4 +818,5 @@ __all__ = [
     "WorkspaceRestoreError",
     "WorkspaceTransaction",
     "WorkspaceTransactionError",
+    "materialize_workspace_preimages",
 ]

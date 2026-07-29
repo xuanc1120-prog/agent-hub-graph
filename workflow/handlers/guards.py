@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
+import uuid
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
@@ -31,10 +33,14 @@ from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRecord, ChangeSetRepository
 from storage.errors import ConcurrencyConflict
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
-from workspace.change_set import ChangeSetManifest
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
-from workspace.transaction import WorkspaceTransaction
+from workspace.transaction import (
+    CapturedWorkspaceChangeSet,
+    WorkspaceTransaction,
+    WorkspaceTransactionError,
+    materialize_workspace_preimages,
+)
 
 
 class PatchGuardArtifact(FrozenStrictModel):
@@ -351,6 +357,7 @@ class TestNodeHandler(_ChangeSetHandler):
         record: ChangeSetRecord,
     ) -> tuple[TestRunResult | None, tuple[str, ...]]:
         _stored, patch = await self._change_sets.load_patch(record.change_set.change_set_id)
+        preimages = await self._change_sets.load_preimages(record.change_set.change_set_id)
         operation_error: BaseException | None = None
         result: TestRunResult | None = None
         async with self._locks.hold(
@@ -361,39 +368,81 @@ class TestNodeHandler(_ChangeSetHandler):
             ttl_seconds=self._workspace_lease_ttl_seconds,
             heartbeat_seconds=self._workspace_heartbeat_seconds,
         ) as held:
-            transaction = WorkspaceTransaction(
-                self._git,
-                Path(context.session.shared_repo_path),
-                base_commit=record.change_set.base_commit,
-                expected_branch=context.session.integration_branch,
-                temp_directory=(
-                    self._runtime_root / context.node_run.node_run_id / "workspace-transaction"
-                ),
-                **self._transaction_limits,
-            )
-            transaction.begin()
+            operation_root = self._runtime_root / context.node_run.node_run_id
+            operation_root.mkdir(parents=True, exist_ok=True)
+            validation_id = sha256(
+                f"{context.node_run.node_run_id}\0{uuid.uuid4().hex}".encode()
+            ).hexdigest()[:32]
+            validation_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=True)
+            shared_repo = Path(context.session.shared_repo_path).expanduser().resolve(strict=True)
             try:
-                self._git.apply_check(context.session.shared_repo_path, patch)
-                self._git.apply_patch(context.session.shared_repo_path, patch)
-                assert context.node.test_argv is not None
-                result = await self._runner.run(
-                    context.node.test_argv,
-                    repo=context.session.shared_repo_path,
-                    runtime_directory=(
-                        self._runtime_root / context.node_run.node_run_id / "test-process"
-                    ),
+                validation_common = Path(os.path.commonpath((shared_repo, validation_root)))
+            except ValueError:
+                validation_common = None
+            if validation_common == shared_repo:
+                raise ValueError("test validation root must be outside the shared repository")
+            validation_repo = validation_root / f"ah-test-{validation_id}" / "repo"
+            try:
+                held.assert_healthy()
+                source = self._git.inspect_source_repository(
+                    shared_repo,
+                    base_ref=record.change_set.base_commit,
                 )
-            except BaseException as error:
-                operation_error = error
-            try:
-                verification = transaction.capture_and_restore()
-            except BaseException as restore_error:
-                if operation_error is not None:
-                    restore_error.add_note(
-                        f"test operation also failed: {type(operation_error).__name__}"
+                self._git.create_session_repository(
+                    source=source,
+                    destination=validation_repo,
+                    session_id=validation_id,
+                )
+                materialize_workspace_preimages(
+                    validation_repo,
+                    preimages,
+                    max_paths=self._transaction_limits["max_changed_paths"],
+                )
+                self._git.apply_check(validation_repo, patch)
+                self._git.apply_patch(validation_repo, patch)
+                baseline = self._git.commit_validation_baseline(validation_repo)
+                transaction = WorkspaceTransaction(
+                    self._git,
+                    validation_repo,
+                    base_commit=baseline.commit,
+                    expected_branch=baseline.branch,
+                    temp_directory=operation_root / f"transaction-{validation_id}",
+                    seal_git_objects=True,
+                    **self._transaction_limits,
+                )
+                transaction.begin()
+                try:
+                    assert context.node.test_argv is not None
+                    result = await self._runner.run(
+                        context.node.test_argv,
+                        repo=validation_repo,
+                        runtime_directory=operation_root / f"process-{validation_id}",
                     )
-                raise
-            held.assert_healthy()
+                except BaseException as error:
+                    operation_error = error
+                try:
+                    verification = transaction.capture_and_restore()
+                except WorkspaceTransactionError as integrity_error:
+                    if operation_error is not None:
+                        integrity_error.add_note(
+                            f"test operation also failed: {type(operation_error).__name__}"
+                        )
+                    return result, ("test_workspace_integrity_failed",)
+                except BaseException as restore_error:
+                    if operation_error is not None:
+                        restore_error.add_note(
+                            f"test operation also failed: {type(operation_error).__name__}"
+                        )
+                    raise
+                held.assert_healthy()
+                if _workspace_changed(verification):
+                    return result, ("test_mutated_workspace",)
+            finally:
+                if validation_repo.parent.exists() or validation_repo.parent.is_symlink():
+                    self._git.remove_session_repository(
+                        validation_repo,
+                        allowed_root=validation_root,
+                    )
             if operation_error is not None:
                 if isinstance(
                     operation_error,
@@ -401,8 +450,6 @@ class TestNodeHandler(_ChangeSetHandler):
                 ):
                     raise operation_error
                 return None, (f"test_runner_error:{type(operation_error).__name__}",)
-            if not _same_change(record, verification.patch_bytes, verification.manifest):
-                return result, ("test_mutated_workspace",)
         assert result is not None
         if result.timed_out:
             return result, ("test_timeout",)
@@ -562,20 +609,14 @@ def _docs_static_reasons(record: ChangeSetRecord) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reasons))
 
 
-def _same_change(
-    record: ChangeSetRecord,
-    patch_bytes: bytes,
-    manifest: ChangeSetManifest,
-) -> bool:
-    expected = record.document.manifest
+def _workspace_changed(capture: CapturedWorkspaceChangeSet) -> bool:
+    manifest = capture.manifest
     return (
-        sha256(patch_bytes).hexdigest() == record.change_set.patch_sha256
-        and manifest.base_commit == expected.base_commit
-        and manifest.pre_state_hash == expected.pre_state_hash
-        and manifest.post_state_hash == expected.post_state_hash
-        and manifest.changes == expected.changes
-        and manifest.created_directories == expected.created_directories
-        and manifest.ignored_files_touched == expected.ignored_files_touched
+        bool(capture.patch_bytes)
+        or bool(manifest.changes)
+        or bool(manifest.created_directories)
+        or bool(manifest.ignored_files_touched)
+        or manifest.pre_state_hash != manifest.post_state_hash
     )
 
 
