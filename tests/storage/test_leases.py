@@ -226,18 +226,28 @@ async def test_workspace_fenced_operation_excludes_expired_takeover(
         assert not takeover_finished.is_set()
         return "captured"
 
-    result = await owner.run_fenced(
+    result, renewed = await owner.run_fenced(
         lease,
         fenced_operation,
+        ttl_seconds=10,
         now=BASE + timedelta(seconds=1),
     )
     await asyncio.to_thread(thread.join, 5)
 
     assert result == "captured"
+    assert renewed.fencing_token == lease.fencing_token
+    assert renewed.expires_at > lease.expires_at
     assert not thread.is_alive()
     assert len(outcomes) == 1
-    replacement = outcomes[0]
-    assert not isinstance(replacement, BaseException)
+    assert isinstance(outcomes[0], LeaseUnavailable)
+    replacement = await contender.acquire(
+        resource_key="session:fenced",
+        owner_kind="recovery",
+        owner_operation_id="recovery-fenced",
+        owner_process_id=202,
+        ttl_seconds=30,
+        now=BASE + timedelta(seconds=12),
+    )
     assert replacement.fencing_token == lease.fencing_token + 1
 
 
@@ -271,6 +281,7 @@ async def test_stale_workspace_lease_cannot_enter_fenced_operation(
         await repository.run_fenced(
             old,
             stale_operation,
+            ttl_seconds=5,
             now=BASE + timedelta(seconds=7),
         )
 

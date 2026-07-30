@@ -31,9 +31,13 @@ _SECRET_OUTPUT = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"),
     re.compile(
         r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)"
+        r"(?:\+[a-z0-9_.-]+)?"
         r"://[^\s,;]+"
     ),
-    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*[^\s,;]+"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|password|secret|database[_-]?url)"
+        r"\s*[=:]\s*[^\s,;]+"
+    ),
 )
 
 _REDACTION_OVERLAP_BYTES = 64 * 1024

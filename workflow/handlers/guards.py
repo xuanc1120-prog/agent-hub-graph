@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tempfile
-import uuid
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
@@ -370,18 +368,17 @@ class TestNodeHandler(_ChangeSetHandler):
         ) as held:
             operation_root = self._runtime_root / context.node_run.node_run_id
             operation_root.mkdir(parents=True, exist_ok=True)
-            validation_id = sha256(
-                f"{context.node_run.node_run_id}\0{uuid.uuid4().hex}".encode()
-            ).hexdigest()[:32]
-            validation_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=True)
+            validation_root = self._git.create_private_temporary_directory(prefix="ah-test-")
+            validation_id = validation_root.name.removeprefix("ah-test-")
             shared_repo = Path(context.session.shared_repo_path).expanduser().resolve(strict=True)
             try:
                 validation_common = Path(os.path.commonpath((shared_repo, validation_root)))
             except ValueError:
                 validation_common = None
             if validation_common == shared_repo:
+                self._git.remove_private_temporary_directory(validation_root)
                 raise ValueError("test validation root must be outside the shared repository")
-            validation_repo = validation_root / f"ah-test-{validation_id}" / "repo"
+            validation_repo = validation_root / "workspace" / "repo"
             try:
                 held.assert_healthy()
                 source = self._git.inspect_source_repository(
@@ -438,11 +435,7 @@ class TestNodeHandler(_ChangeSetHandler):
                 if _workspace_changed(verification):
                     return result, ("test_mutated_workspace",)
             finally:
-                if validation_repo.parent.exists() or validation_repo.parent.is_symlink():
-                    self._git.remove_session_repository(
-                        validation_repo,
-                        allowed_root=validation_root,
-                    )
+                self._git.remove_private_temporary_directory(validation_root)
             if operation_error is not None:
                 if isinstance(
                     operation_error,

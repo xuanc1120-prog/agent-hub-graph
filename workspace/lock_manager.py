@@ -115,16 +115,26 @@ class LockManager:
 
     async def run_fenced(
         self,
-        lease: WorkspaceLease,
+        held: HeldWorkspaceLease,
         *,
         session_id: str,
+        ttl_seconds: int,
         operation: Callable[[], _T],
         now: datetime | None = None,
     ) -> _T:
         """Run synchronous workspace I/O while preventing lease takeover."""
 
-        self._assert_session(lease, session_id)
-        return await self._repository.run_fenced(lease, operation, now=now)
+        held.assert_healthy()
+        self._assert_session(held.lease, session_id)
+        result, renewed = await self._repository.run_fenced(
+            held.lease,
+            operation,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+        held.lease = renewed
+        held.assert_healthy()
+        return result
 
     @asynccontextmanager
     async def hold(

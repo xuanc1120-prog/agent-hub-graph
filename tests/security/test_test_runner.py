@@ -163,6 +163,22 @@ async def test_output_redaction_spans_reader_chunks_and_output_boundary() -> Non
             "DATABASE_URL=postgresql://agent:secret-password@localhost/demo",
             "secret-password",
         ),
+        (
+            "DATABASE_URL=postgresql+psycopg://agent:driver-password@db/app",
+            "driver-password",
+        ),
+        (
+            "DATABASE_URL=mysql+pymysql://agent:mysql-password@db/app",
+            "mysql-password",
+        ),
+        (
+            "DATABASE_URL=mssql+pyodbc://agent:mssql-password@db/app",
+            "mssql-password",
+        ),
+        (
+            "DATABASE_URL=customdb://agent:fallback-password@db/app",
+            "fallback-password",
+        ),
         ("api_key=top-secret-value", "top-secret-value"),
     ],
 )
@@ -170,4 +186,38 @@ def test_structured_credentials_are_redacted(value: str, secret: str) -> None:
     redacted = _redact_output(value)
 
     assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_driver_database_url_redaction_spans_reader_chunks() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=512)
+    reader.feed_data(b"DATABASE_URL=postgresql+psy")
+    reader.feed_data(b"copg://agent:chunk-password@db/app")
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+
+    assert "chunk-password" not in redacted
+    assert "postgresql+psycopg://" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_private_key_redaction_spans_chunks_before_bounding() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=1024)
+    reader.feed_data(b"prefix -----BEGIN OPENSSH PRI")
+    reader.feed_data(b"VATE KEY-----\nsuper-secret-key-material\n")
+    reader.feed_data(b"-----END OPENSSH PRIVATE KEY----- suffix")
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+    bounded, _truncated = _bounded_utf8(redacted, 64)
+
+    assert "super-secret-key-material" not in redacted
+    assert "super-secret-key-material" not in bounded
     assert "[REDACTED]" in redacted

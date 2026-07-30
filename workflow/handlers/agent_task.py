@@ -25,7 +25,6 @@ from protocol import (
     NodeRunStatus,
     NodeSummary,
     RiskLevel,
-    SecuritySeverity,
     TaskPackage,
     TaskStatus,
     WorkflowNode,
@@ -404,8 +403,8 @@ class AgentTaskNodeHandler:
         assert self._git is not None
         assert self._locks is not None
         assert self._agent_runs_dir is not None
-        execution_error: BaseException | None = None
-        agent_result: AgentResult | None = None
+        capture = None
+        has_changes = False
         async with self._locks.hold(
             session_id=context.run.session_id,
             owner_kind=WorkspaceOwnerKind.AGENT_TASK,
@@ -414,76 +413,56 @@ class AgentTaskNodeHandler:
             ttl_seconds=self._workspace_lease_ttl_seconds,
             heartbeat_seconds=self._workspace_heartbeat_seconds,
         ) as held:
-            transaction = WorkspaceTransaction(
-                self._git,
-                Path(context.session.shared_repo_path),
-                base_commit=context.run.current_commit,
-                expected_branch=context.session.integration_branch,
-                temp_directory=self._agent_runs_dir / task.task_id / "workspace-transaction",
-                seal_git_objects=True,
-                **self._transaction_limits,
-            )
-            transaction.begin()
             try:
-                agent_result = await adapter.run(task, context_pack, collect)
-                if (
-                    agent_result.task_id != task.task_id
-                    or agent_result.node_run_id != task.node_run_id
-                    or agent_result.agent_id != task.agent_id
-                ):
-                    execution_error = _AgentTaskError("agent_identity_mismatch")
-            except BaseException as error:
-                execution_error = error
-
-            try:
-                held.assert_healthy()
-                capture = await self._locks.run_fenced(
-                    held.lease,
-                    session_id=context.run.session_id,
-                    operation=transaction.capture_and_restore,
+                transaction = WorkspaceTransaction(
+                    self._git,
+                    Path(context.session.shared_repo_path),
+                    base_commit=context.run.current_commit,
+                    expected_branch=context.session.integration_branch,
+                    temp_directory=(self._agent_runs_dir / task.task_id / "workspace-transaction"),
+                    seal_git_objects=True,
+                    **self._transaction_limits,
                 )
-            except BaseException as capture_error:
-                if execution_error is not None:
-                    capture_error.add_note(
-                        f"Agent execution also failed: {type(execution_error).__name__}"
-                    )
-                raise
+                await self._locks.run_fenced(
+                    held,
+                    session_id=context.run.session_id,
+                    ttl_seconds=self._workspace_lease_ttl_seconds,
+                    operation=transaction.begin,
+                )
+                execution_error: BaseException | None = None
+                agent_result: AgentResult | None = None
+                try:
+                    agent_result = await adapter.run(task, context_pack, collect)
+                    if (
+                        agent_result.task_id != task.task_id
+                        or agent_result.node_run_id != task.node_run_id
+                        or agent_result.agent_id != task.agent_id
+                    ):
+                        execution_error = _AgentTaskError("agent_identity_mismatch")
+                except BaseException as error:
+                    execution_error = error
 
-            has_changes = bool(
-                capture.manifest.changes
-                or capture.manifest.ignored_files_touched
-                or capture.manifest.created_directories
-            )
-            held.assert_healthy()
-            change_set_id: str | None = None
-            capture_live = False
-            try:
-                if has_changes:
-                    stored = await self._change_sets.persist_capture(
+                try:
+                    held.assert_healthy()
+                    capture = await self._locks.run_fenced(
+                        held,
                         session_id=context.run.session_id,
-                        workflow_run_id=context.run.workflow_run_id,
-                        node_run_id=context.node_run.node_run_id,
-                        task_id=task.task_id,
-                        capture=capture,
-                        master_lease=context.master_lease,
-                        workspace_lease=held.lease,
-                        status=(
-                            ChangeSetStatus.CAPTURED
-                            if execution_error is None
-                            and agent_result is not None
-                            and agent_result.status == AgentResultStatus.SUCCEEDED
-                            else ChangeSetStatus.ABANDONED_PARTIAL
-                        ),
-                        reason=(
-                            None
-                            if execution_error is None
-                            and agent_result is not None
-                            and agent_result.status == AgentResultStatus.SUCCEEDED
-                            else "Agent execution did not complete successfully"
-                        ),
+                        ttl_seconds=self._workspace_lease_ttl_seconds,
+                        operation=transaction.capture_and_restore,
                     )
-                    change_set_id = stored.change_set.change_set_id
-                    capture_live = stored.change_set.status == ChangeSetStatus.CAPTURED
+                except BaseException as capture_error:
+                    if execution_error is not None:
+                        capture_error.add_note(
+                            f"Agent execution also failed: {type(execution_error).__name__}"
+                        )
+                    raise
+
+                has_changes = bool(
+                    capture.manifest.changes
+                    or capture.manifest.ignored_files_touched
+                    or capture.manifest.created_directories
+                )
+                held.assert_healthy()
                 if execution_error is not None:
                     raise execution_error
                 assert agent_result is not None
@@ -512,11 +491,17 @@ class AgentTaskNodeHandler:
                         content=canonical_json(output),
                         redacted=True,
                     )
-                    await self._runs.finish_task(
-                        task.task_id,
-                        target=TaskStatus.SUCCEEDED,
-                        lease=context.master_lease,
+                    assert capture is not None
+                    await self._change_sets.persist_capture(
+                        session_id=context.run.session_id,
+                        workflow_run_id=context.run.workflow_run_id,
+                        node_run_id=context.node_run.node_run_id,
+                        task_id=task.task_id,
+                        capture=capture,
+                        master_lease=context.master_lease,
                         workspace_lease=held.lease,
+                        task_target=TaskStatus.SUCCEEDED,
+                        status=ChangeSetStatus.CAPTURED,
                     )
                     return NodeHandlerResult(
                         status=NodeRunStatus.COMPLETED,
@@ -529,13 +514,29 @@ class AgentTaskNodeHandler:
                     agent_result.status,
                     agent_result.error_code,
                 )
-                await self._runs.finish_task(
-                    task.task_id,
-                    target=target,
-                    error_code=code,
-                    lease=context.master_lease,
-                    workspace_lease=held.lease,
-                )
+                if has_changes:
+                    assert capture is not None
+                    await self._change_sets.persist_capture(
+                        session_id=context.run.session_id,
+                        workflow_run_id=context.run.workflow_run_id,
+                        node_run_id=context.node_run.node_run_id,
+                        task_id=task.task_id,
+                        capture=capture,
+                        master_lease=context.master_lease,
+                        workspace_lease=held.lease,
+                        task_target=target,
+                        task_error_code=code,
+                        status=ChangeSetStatus.ABANDONED_PARTIAL,
+                        reason="Agent execution did not complete successfully",
+                    )
+                else:
+                    await self._runs.finish_task(
+                        task.task_id,
+                        target=target,
+                        error_code=code,
+                        lease=context.master_lease,
+                        workspace_lease=held.lease,
+                    )
                 if target == TaskStatus.BLOCKED_BY_GUARD:
                     return _blocked(
                         code,
@@ -549,26 +550,36 @@ class AgentTaskNodeHandler:
                 )
             except LeaseLost:
                 raise
-            except Exception as error:
-                if capture_live and change_set_id is not None:
-                    await self._change_sets.transition(
-                        change_set_id,
-                        expected=ChangeSetStatus.CAPTURED,
-                        target=ChangeSetStatus.ABANDONED_PARTIAL,
-                        master_lease=context.master_lease,
-                        workspace_lease=held.lease,
-                        reason=(f"Write task failed after capture: {_handler_error_code(error)}"),
-                        severity=SecuritySeverity.HIGH,
-                    )
+            except BaseException as error:
                 current = await self._runs.get_task(task.task_id)
                 if current.status == TaskStatus.RUNNING:
-                    await self._runs.finish_task(
-                        task.task_id,
-                        target=TaskStatus.FAILED,
-                        error_code=_handler_error_code(error),
-                        lease=context.master_lease,
-                        workspace_lease=held.lease,
-                    )
+                    code = _handler_error_code(error)
+                    if capture is not None and has_changes:
+                        try:
+                            await self._change_sets.persist_capture(
+                                session_id=context.run.session_id,
+                                workflow_run_id=context.run.workflow_run_id,
+                                node_run_id=context.node_run.node_run_id,
+                                task_id=task.task_id,
+                                capture=capture,
+                                master_lease=context.master_lease,
+                                workspace_lease=held.lease,
+                                task_target=TaskStatus.FAILED,
+                                task_error_code=code,
+                                status=ChangeSetStatus.ABANDONED_PARTIAL,
+                                reason=f"Write task failed after capture: {code}",
+                            )
+                        except BaseException as finalization_error:
+                            finalization_error.add_note(f"original write task error: {error!r}")
+                            raise
+                    else:
+                        await self._runs.finish_task(
+                            task.task_id,
+                            target=TaskStatus.FAILED,
+                            error_code=code,
+                            lease=context.master_lease,
+                            workspace_lease=held.lease,
+                        )
                 raise
 
     async def _predecessor_refs(

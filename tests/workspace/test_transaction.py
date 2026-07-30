@@ -224,6 +224,82 @@ def test_deleted_ignored_file_and_parent_are_replayable_and_restored(
     assert manager.state(repo).dirty is False
 
 
+def test_untouched_ignored_baseline_is_not_exported_as_a_preimage(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    untouched = cache / "state.txt"
+    untouched.write_text("baseline-only\n", encoding="utf-8")
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    created = repo / "docs" / "new.md"
+    created.parent.mkdir()
+    created.write_text("new\n", encoding="utf-8")
+    result = transaction.capture_and_restore()
+
+    assert result.manifest.ignored_files_touched == ()
+    assert all(preimage.path != "cache/state.txt" for preimage in result.preimages)
+    assert untouched.read_text(encoding="utf-8") == "baseline-only\n"
+    assert not created.exists()
+    assert manager.state(repo).dirty is False
+
+
+@pytest.mark.parametrize(
+    "sensitive_path",
+    [
+        ".env",
+        ".env.local",
+        "credentials.json",
+        "secrets/deploy.key",
+    ],
+)
+def test_begin_rejects_sensitive_ignored_baseline_before_agent_execution(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    sensitive_path: str,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text(
+        f"{sensitive_path}\n",
+        encoding="utf-8",
+    )
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore sensitive file",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    sensitive = repo / sensitive_path
+    sensitive.parent.mkdir(parents=True, exist_ok=True)
+    sensitive.write_text("must-not-be-exported\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceNotClean, match="forbidden or unsafe"):
+        _transaction(manager, repo, commit, branch, tmp_path).begin()
+
+    assert sensitive.read_text(encoding="utf-8") == "must-not-be-exported\n"
+
+
 def test_resource_limit_failure_still_restores_task_paths(
     fixture_source_repo: Path,
     tmp_path: Path,

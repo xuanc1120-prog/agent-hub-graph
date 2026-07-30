@@ -117,7 +117,7 @@ async def test_passing_test_cannot_pollute_git_objects(
     def observe_validation_clone(**kwargs: object):
         state = original_create(**kwargs)
         destination = Path(kwargs["destination"])
-        if destination.parent.name.startswith("ah-test-"):
+        if destination.parent.parent.name.startswith("ah-test-"):
             validation_repositories.append(destination)
         return state
 

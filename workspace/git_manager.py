@@ -373,7 +373,7 @@ class GitManager:
         operation_root = temporary_root / f"canonical-{uuid.uuid4().hex}"
         operation_root.mkdir(parents=False, exist_ok=False)
         index_path = operation_root / "index"
-        object_directory = Path(tempfile.mkdtemp(prefix="ah-git-objects-")).resolve(strict=True)
+        object_directory = self.create_private_temporary_directory(prefix="ah-git-objects-")
         try:
             self._assert_directory_not_reparse(
                 object_directory,
@@ -472,7 +472,7 @@ class GitManager:
             try:
                 self._remove_tree(operation_root)
             finally:
-                self._remove_tree(object_directory)
+                self.remove_private_temporary_directory(object_directory)
         if self.index_sha256(root) != before_index:
             raise GitManagerError("canonical patch construction modified the real Git index")
         return CanonicalPatch(patch_bytes=patch, name_status_bytes=name_status)
@@ -577,6 +577,61 @@ class GitManager:
         if state.dirty:
             raise GitManagerError("validation baseline commit left a dirty repository")
         return state
+
+    def create_private_temporary_directory(self, *, prefix: str) -> Path:
+        if not re.fullmatch(r"ah-[a-z0-9-]{1,48}", prefix):
+            raise GitManagerError("private temporary directory prefix is invalid")
+        root = Path(tempfile.mkdtemp(prefix=prefix)).resolve(strict=True)
+        try:
+            self._assert_directory_not_reparse(root, label="private temporary directory")
+            self._set_private_directory(root)
+        except BaseException:
+            self._remove_tree(root)
+            raise
+        return root
+
+    def remove_private_temporary_directory(self, directory: Path) -> None:
+        temporary_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=True)
+        target = Path(os.path.abspath(directory.expanduser()))
+        if target.parent != temporary_root or not target.name.startswith("ah-"):
+            raise GitManagerError("private temporary cleanup path is not a generated root")
+        if target.exists() or target.is_symlink():
+            self._remove_tree(target)
+
+    @staticmethod
+    def _set_private_directory(path: Path) -> None:
+        if os.name != "nt":
+            try:
+                path.chmod(stat.S_IRWXU)
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except OSError as error:
+                raise GitManagerError(
+                    "failed to set private temporary directory permissions"
+                ) from error
+            if mode != stat.S_IRWXU:
+                raise GitManagerError("private temporary directory is not mode 0700")
+            return
+
+        system_root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+        user = os.environ.get("USERNAME")
+        if not system_root or not user:
+            raise GitManagerError("Windows ACL setup requires SYSTEMROOT and USERNAME")
+        icacls = Path(system_root) / "System32" / "icacls.exe"
+        result = subprocess.run(
+            [
+                str(icacls),
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:(OI)(CI)F",
+            ],
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise GitManagerError("failed to set private Windows ACL on temporary directory")
 
     def remove_session_repository(self, destination: Path, *, allowed_root: Path) -> None:
         target = destination.expanduser().resolve(strict=False)

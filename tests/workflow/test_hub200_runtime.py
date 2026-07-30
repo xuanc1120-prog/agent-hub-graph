@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -110,7 +111,152 @@ async def test_mock_write_reaches_hub210_gate_and_restores_shared_repo(
         )
 
 
-@pytest.mark.parametrize("failure_point", ["cleanup", "output_artifact", "finish_task"])
+@pytest.mark.asyncio
+async def test_capture_has_no_post_commit_read_before_task_terminal(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Verify atomic write capture publication.",
+        session_id="session-atomic-capture",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id="workflow-atomic-capture",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    original_get = application.services.change_sets.get
+    early_reads = 0
+
+    async def reject_read_while_task_running(change_set_id: str):
+        nonlocal early_reads
+        async with application.services.database.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT t.status
+                FROM change_sets cs
+                JOIN tasks t ON t.id = cs.task_id
+                WHERE cs.id = ?
+                """,
+                (change_set_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is not None and row["status"] == TaskStatus.RUNNING.value:
+            early_reads += 1
+            raise RuntimeError("post-commit read observed a running write task")
+        return await original_get(change_set_id)
+
+    monkeypatch.setattr(
+        application.services.change_sets,
+        "get",
+        reject_read_while_task_running,
+    )
+
+    async with application.temporary_master() as lease:
+        run = await application.run(
+            workflow.workflow_id,
+            lease=lease,
+            workflow_run_id="run-atomic-capture",
+        )
+
+    assert run.status == WorkflowRunStatus.BLOCKED
+    assert early_reads == 0
+    record = await original_get(
+        (
+            await application.services.change_sets.get_for_source_node(
+                workflow_run_id=run.workflow_run_id,
+                source_node_id="write-docs",
+            )
+        ).change_set.change_set_id
+    )
+    task = await application.services.runs.get_task(record.change_set.task_id)
+    assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+    assert task.status == TaskStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_sensitive_ignored_baseline_blocks_agent_and_preimage_artifacts(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "add", ".gitignore"],
+        cwd=fixture_source_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "user.name=Agent Hub Tests",
+            "-c",
+            "user.email=tests@agent-hub.local",
+            "commit",
+            "-m",
+            "ignore sensitive baseline",
+        ],
+        cwd=fixture_source_repo,
+        check=True,
+        capture_output=True,
+    )
+    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Never expose an ignored secret.",
+        session_id="session-sensitive-ignored",
+    )
+    (session.shared_repo_path / ".env").write_text(
+        "DATABASE_URL=postgresql://secret@db/app\n",
+        encoding="utf-8",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id="workflow-sensitive-ignored",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+
+    async with application.temporary_master() as lease:
+        run = await application.run(
+            workflow.workflow_id,
+            lease=lease,
+            workflow_run_id="run-sensitive-ignored",
+        )
+
+    assert run.status == WorkflowRunStatus.FAILED
+    assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
+    async with application.services.database.connection() as connection:
+        change_count = await connection.execute("SELECT COUNT(*) FROM change_sets")
+        assert (await change_count.fetchone())[0] == 0
+        await change_count.close()
+        preimage_count = await connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_type = 'change_preimage'"
+        )
+        assert (await preimage_count.fetchone())[0] == 0
+        await preimage_count.close()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["cleanup", "output_artifact", "capture_artifact", "finish_task"],
+)
 @pytest.mark.asyncio
 async def test_post_capture_failure_abandons_change_set_and_fails_task(
     fixture_source_repo: Path,
@@ -164,17 +310,36 @@ async def test_post_capture_failure_abandons_change_set_and_fails_task(
             return await original_create(**kwargs)
 
         monkeypatch.setattr(application.services.artifacts, "create", fail_output_once)
-    else:
-        original_finish = application.services.runs.finish_task
+    elif failure_point == "capture_artifact":
+        original_capture_artifact = application.services.change_sets._create_or_verify_artifact
 
-        async def fail_success_finish_once(task_id: str, **kwargs: object):
+        async def fail_capture_artifact_once(**kwargs: object):
+            nonlocal injected
+            if not injected and kwargs["artifact_type"] == ArtifactType.PATCH:
+                injected = True
+                raise RuntimeError("injected capture artifact failure")
+            return await original_capture_artifact(**kwargs)
+
+        monkeypatch.setattr(
+            application.services.change_sets,
+            "_create_or_verify_artifact",
+            fail_capture_artifact_once,
+        )
+    else:
+        original_finish = application.services.change_sets._finish_task_in
+
+        async def fail_success_finish_once(*args: object, **kwargs: object):
             nonlocal injected
             if not injected and kwargs["target"] == TaskStatus.SUCCEEDED:
                 injected = True
                 raise RuntimeError("injected task finalization failure")
-            return await original_finish(task_id, **kwargs)
+            return await original_finish(*args, **kwargs)
 
-        monkeypatch.setattr(application.services.runs, "finish_task", fail_success_finish_once)
+        monkeypatch.setattr(
+            application.services.change_sets,
+            "_finish_task_in",
+            fail_success_finish_once,
+        )
 
     async with application.temporary_master() as lease:
         run = await application.run(
@@ -214,6 +379,74 @@ async def test_post_capture_failure_abandons_change_set_and_fails_task(
 
 
 @pytest.mark.asyncio
+async def test_lease_loss_after_restore_never_publishes_live_capture(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Lose the lease after capture and before publication.",
+        session_id="session-lease-loss-after-capture",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id="workflow-lease-loss-after-capture",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    original_persist = application.services.change_sets.persist_capture
+    injected = False
+
+    async def lose_success_publication(**kwargs: object):
+        nonlocal injected
+        if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
+            injected = True
+            raise LeaseLost("injected lease loss after capture")
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(
+        application.services.change_sets,
+        "persist_capture",
+        lose_success_publication,
+    )
+
+    async with application.temporary_master() as lease:
+        with pytest.raises(LeaseLost, match="after capture"):
+            await application.run(
+                workflow.workflow_id,
+                lease=lease,
+                workflow_run_id="run-lease-loss-after-capture",
+            )
+
+    assert injected is True
+    run = await application.services.runs.get("run-lease-loss-after-capture")
+    assert run.status == WorkflowRunStatus.RUNNING
+    node_runs = await application.services.runs.list_nodes(run.workflow_run_id)
+    write_node = next(node for node in node_runs if node.node_id == "write-docs")
+    assert write_node.status == NodeRunStatus.RUNNING
+    async with application.services.database.connection() as connection:
+        task_cursor = await connection.execute(
+            "SELECT status FROM tasks WHERE node_run_id = ?",
+            (write_node.node_run_id,),
+        )
+        task = await task_cursor.fetchone()
+        await task_cursor.close()
+        change_cursor = await connection.execute("SELECT COUNT(*) FROM change_sets")
+        change_count = await change_cursor.fetchone()
+        await change_cursor.close()
+    assert task is not None and task["status"] == TaskStatus.RUNNING.value
+    assert change_count is not None and change_count[0] == 0
+    assert application.services.git.state(session.shared_repo_path).dirty is False
+    assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_workspace_lease_loss_does_not_finalize_task_or_node(
     fixture_source_repo: Path,
     tmp_path: Path,
@@ -236,8 +469,12 @@ async def test_workspace_lease_loss_does_not_finalize_task_or_node(
         )
     )
 
+    fenced_calls = 0
+
     async def lose_before_capture(*args: object, **kwargs: object) -> None:
+        nonlocal fenced_calls
         _ = args, kwargs
+        fenced_calls += 1
         raise LeaseLost("injected workspace lease loss")
 
     monkeypatch.setattr(application.services.locks, "run_fenced", lose_before_capture)
@@ -250,6 +487,7 @@ async def test_workspace_lease_loss_does_not_finalize_task_or_node(
                 workflow_run_id="run-write-lease-lost",
             )
 
+    assert fenced_calls == 1
     run = await application.services.runs.get("run-write-lease-lost")
     assert run.status == WorkflowRunStatus.RUNNING
     node_runs = await application.services.runs.list_nodes(run.workflow_run_id)
@@ -267,8 +505,8 @@ async def test_workspace_lease_loss_does_not_finalize_task_or_node(
         await change_cursor.close()
     assert task_row is not None and task_row["status"] == TaskStatus.RUNNING.value
     assert change_count is not None and change_count[0] == 0
-    assert application.services.git.state(session.shared_repo_path).dirty is True
-    assert (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
+    assert application.services.git.state(session.shared_repo_path).dirty is False
+    assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
 
 
 @pytest.mark.asyncio

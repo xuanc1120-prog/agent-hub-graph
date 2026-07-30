@@ -17,9 +17,12 @@ from protocol import (
     ArtifactType,
     ChangeSet,
     ChangeSetStatus,
+    CompiledGraph,
     FrozenStrictModel,
+    NodeType,
     RepoRelativePath,
     SecuritySeverity,
+    TaskStatus,
     canonical_json,
 )
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
@@ -27,7 +30,12 @@ from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ChangeSetIntegrityError, ConcurrencyConflict, RecordNotFound
 from storage.event_repository import EventRepository
 from storage.leases import MasterLease, MasterLeaseRepository, WorkspaceLease
-from workflow.events import CHANGE_SET_STATE_CHANGED, ChangeSetEventPayload
+from workflow.events import (
+    CHANGE_SET_STATE_CHANGED,
+    TASK_STATE_CHANGED,
+    ChangeSetEventPayload,
+    TaskEventPayload,
+)
 from workspace.change_set import ChangeSetManifest, FileAction
 from workspace.lock_manager import LockManager
 from workspace.transaction import CapturedWorkspaceChangeSet, FilePreimage
@@ -160,6 +168,8 @@ class ChangeSetRepository:
         capture: CapturedWorkspaceChangeSet,
         master_lease: MasterLease,
         workspace_lease: WorkspaceLease,
+        task_target: TaskStatus,
+        task_error_code: str | None = None,
         status: ChangeSetStatus = ChangeSetStatus.CAPTURED,
         reason: str | None = None,
         now: datetime | None = None,
@@ -171,6 +181,25 @@ class ChangeSetRepository:
             ChangeSetStatus.ABANDONED_PARTIAL,
         }:
             raise ValueError("capture status must be captured or abandoned_partial")
+        terminal_targets = {
+            TaskStatus.SUCCEEDED,
+            TaskStatus.PRIVILEGE_REQUESTED,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+            TaskStatus.CANCELLED,
+            TaskStatus.BLOCKED_BY_GUARD,
+            TaskStatus.PARSE_FAILED,
+            TaskStatus.ORPHANED,
+        }
+        if task_target not in terminal_targets:
+            raise ValueError("capture must atomically finalize its write task")
+        if task_target == TaskStatus.SUCCEEDED:
+            if status != ChangeSetStatus.CAPTURED or task_error_code is not None:
+                raise ValueError("successful write task requires a captured ChangeSet")
+        elif status != ChangeSetStatus.ABANDONED_PARTIAL:
+            raise ValueError("failed write task requires an abandoned ChangeSet")
+        elif not task_error_code:
+            raise ValueError("failed write task requires an error code")
         patch_sha256 = sha256(capture.patch_bytes).hexdigest()
         evidence = {
             "status": capture.status_evidence,
@@ -194,6 +223,7 @@ class ChangeSetRepository:
             patch_sha256,
         )
         created_artifacts: list[str] = []
+        database_boundary_entered = False
         try:
             patch, created = await self._create_or_verify_artifact(
                 artifact_id=_stable_id(
@@ -268,6 +298,18 @@ class ChangeSetRepository:
             )
             manifest_json = canonical_json(document).decode("utf-8")
             timestamp = utc_now_text(now)
+            result = self._record_from_document(
+                change_set_id=change_set_id,
+                session_id=session_id,
+                workflow_run_id=workflow_run_id,
+                node_run_id=node_run_id,
+                task_id=task_id,
+                status=status,
+                document=document,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            database_boundary_entered = True
             async with self._database.immediate_transaction() as transaction:
                 await self._master_leases.assert_valid_in(
                     transaction,
@@ -321,10 +363,30 @@ class ChangeSetRepository:
                         timestamp=timestamp,
                         now=now,
                     )
+                await self._finish_task_in(
+                    transaction,
+                    lineage=lineage,
+                    task_id=task_id,
+                    target=task_target,
+                    error_code=task_error_code,
+                    master_lease=master_lease,
+                    workspace_lease=workspace_lease,
+                    timestamp=timestamp,
+                    now=now,
+                )
         except BaseException as operation_error:
-            await self._cleanup_artifacts(created_artifacts, operation_error)
+            if database_boundary_entered:
+                operation_error.add_note(
+                    "capture artifacts retained because database commit outcome is uncertain"
+                )
+                _LOGGER.warning(
+                    "Retaining %d capture artifacts after database-boundary failure",
+                    len(created_artifacts),
+                )
+            else:
+                await self._cleanup_artifacts(created_artifacts, operation_error)
             raise
-        return await self.get(change_set_id)
+        return result
 
     async def transition(
         self,
@@ -574,6 +636,55 @@ class ChangeSetRepository:
                 now=now,
             )
 
+    async def _finish_task_in(
+        self,
+        transaction: Transaction,
+        *,
+        lineage: aiosqlite.Row,
+        task_id: str,
+        target: TaskStatus,
+        error_code: str | None,
+        master_lease: MasterLease,
+        workspace_lease: WorkspaceLease,
+        timestamp: str,
+        now: datetime | None,
+    ) -> None:
+        changed = await transaction.execute(
+            """
+            UPDATE tasks
+            SET status = ?, finished_at = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                target.value,
+                timestamp,
+                task_id,
+                TaskStatus.RUNNING.value,
+            ),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("capture lost the write task terminal-state CAS")
+        await self._events.append_in(
+            transaction,
+            session_id=str(lineage["session_id"]),
+            workflow_id=str(lineage["workflow_id"]),
+            workflow_run_id=str(lineage["workflow_run_id"]),
+            event_type=TASK_STATE_CHANGED,
+            actor_type=ActorType.MASTER,
+            actor_id=master_lease.instance_id,
+            payload=TaskEventPayload(
+                master_fencing_token=master_lease.fencing_token,
+                workspace_fencing_token=workspace_lease.fencing_token,
+                workflow_run_id=str(lineage["workflow_run_id"]),
+                node_run_id=str(lineage["node_run_id"]),
+                task_id=task_id,
+                previous_status=TaskStatus.RUNNING,
+                status=target,
+                error_code=error_code,
+            ),
+            now=now,
+        )
+
     @staticmethod
     async def _load_lineage_in(
         transaction: Transaction,
@@ -582,10 +693,11 @@ class ChangeSetRepository:
         row = await transaction.fetch_one(
             """
             SELECT t.id AS task_id, t.node_run_id, t.base_commit,
-                   t.status AS task_status, nr.node_type,
+                   t.status AS task_status, nr.node_id, nr.node_type,
                    nr.status AS node_status, nr.workflow_run_id,
                    wr.session_id, wr.workflow_id, wr.current_commit,
-                   wr.status AS run_status, wr.cancel_requested_at
+                   wr.status AS run_status, wr.cancel_requested_at,
+                   wr.compiled_snapshot_json, wr.compiled_snapshot_hash
             FROM tasks t
             JOIN node_runs nr ON t.node_run_id = nr.id
             JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
@@ -622,6 +734,23 @@ class ChangeSetRepository:
                 raise ChangeSetIntegrityError(f"ChangeSet lineage mismatch for {field}")
         if lineage["cancel_requested_at"] is not None:
             raise ConcurrencyConflict("workflow cancellation prevents ChangeSet capture")
+        try:
+            graph = CompiledGraph.model_validate_json(
+                str(lineage["compiled_snapshot_json"]),
+                strict=True,
+            )
+        except ValueError as error:
+            raise ChangeSetIntegrityError("compiled workflow snapshot is invalid") from error
+        if sha256(canonical_json(graph)).hexdigest() != str(lineage["compiled_snapshot_hash"]):
+            raise ChangeSetIntegrityError("compiled workflow snapshot hash mismatch")
+        node = next(
+            (item for item in graph.nodes if item.id == str(lineage["node_id"])),
+            None,
+        )
+        if node is None or node.node_type != NodeType.AGENT_TASK or not node.requires_write:
+            raise ChangeSetIntegrityError(
+                "capture task is not a write AgentTask in the immutable snapshot"
+            )
 
     async def _append_state_event_in(
         self,
@@ -883,6 +1012,54 @@ class ChangeSetRepository:
             document=document,
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _record_from_document(
+        *,
+        change_set_id: str,
+        session_id: str,
+        workflow_run_id: str,
+        node_run_id: str,
+        task_id: str,
+        status: ChangeSetStatus,
+        document: StoredChangeSetDocument,
+        created_at: str,
+        updated_at: str,
+    ) -> ChangeSetRecord:
+        manifest = document.manifest
+        patch_ref = document.canonical_patch_ref
+        created = [item.path for item in manifest.changes if item.action == FileAction.CREATED]
+        modified = [item.path for item in manifest.changes if item.action == FileAction.MODIFIED]
+        deleted = [item.path for item in manifest.changes if item.action == FileAction.DELETED]
+        renamed = [item.path for item in manifest.changes if item.action == FileAction.RENAMED]
+        change_set = ChangeSet(
+            change_set_id=change_set_id,
+            session_id=session_id,
+            workflow_run_id=workflow_run_id,
+            node_run_id=node_run_id,
+            task_id=task_id,
+            base_commit=manifest.base_commit,
+            pre_state_hash=manifest.pre_state_hash,
+            post_state_hash=manifest.post_state_hash,
+            patch_sha256=patch_ref.sha256,
+            status=status,
+            canonical_patch_ref=patch_ref,
+            evidence_refs=[item.artifact_ref for item in document.evidence],
+            created_files=created,
+            created_directories=list(manifest.created_directories),
+            modified_files=modified,
+            deleted_files=deleted,
+            renamed_files=renamed,
+            untracked_files=created,
+            ignored_files_touched=list(manifest.ignored_files_touched),
+            preimage_refs=[item.artifact_ref for item in document.preimages],
+        )
+        return ChangeSetRecord(
+            change_set=change_set,
+            document=document,
+            created_at=created_at,
+            updated_at=updated_at,
         )
 
 

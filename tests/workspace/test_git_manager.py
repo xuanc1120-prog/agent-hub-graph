@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -264,3 +266,35 @@ def test_git_metadata_seal_rejects_object_updates_when_requested(
             seal,
             include_objects=True,
         )
+
+
+def test_private_temporary_directory_is_owner_only_and_safely_removed(
+    tmp_path: Path,
+) -> None:
+    manager = GitManager(tmp_path / "git-profile")
+    private_root = manager.create_private_temporary_directory(prefix="ah-test-private-")
+
+    assert private_root.parent == Path(tempfile.gettempdir()).resolve(strict=True)
+    assert private_root.name.startswith("ah-test-private-")
+    if os.name != "nt":
+        assert stat.S_IMODE(private_root.stat().st_mode) == 0o700
+
+    nested = private_root / "workspace"
+    nested.mkdir()
+    (nested / "source.txt").write_text("private\n", encoding="utf-8")
+    manager.remove_private_temporary_directory(private_root)
+
+    assert not private_root.exists()
+
+
+def test_private_temporary_cleanup_rejects_non_generated_path(
+    tmp_path: Path,
+) -> None:
+    manager = GitManager(tmp_path / "git-profile")
+    unrelated = tmp_path / "ah-unrelated"
+    unrelated.mkdir()
+
+    with pytest.raises(GitManagerError, match="not a generated root"):
+        manager.remove_private_temporary_directory(unrelated)
+
+    assert unrelated.exists()
