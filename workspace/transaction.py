@@ -12,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from security.path_policy import PathPolicy, PathPolicyViolation
+from security.secret_policy import SecretPolicyViolation, assert_secret_free_bytes
 from workspace.change_set import ChangeSetManifest, FileAction, FileChange
 from workspace.git_manager import (
     CanonicalBaselineFile,
@@ -204,6 +205,7 @@ class WorkspaceTransaction:
             )
             after = self._scan_inventory()
             ignored_touched = self._ignored_changes(after, current_state)
+            self._validate_ignored_capture(ignored_touched, after)
             restore_paths.difference_update(ignored_candidates)
             restore_paths.update(ignored_touched)
             self._validate_changed_paths(restore_paths, after)
@@ -512,6 +514,15 @@ class WorkspaceTransaction:
                 continue
             validated = self._path_policy.validate_cleanup_path(path)
             content = validated.absolute_path.read_bytes()
+            try:
+                assert_secret_free_bytes(
+                    content,
+                    label=f"ignored workspace file {path!r}",
+                )
+            except SecretPolicyViolation as error:
+                raise WorkspaceNotClean(
+                    "ignored baseline contains content that cannot enter artifacts"
+                ) from error
             total += len(content)
             if total > self._max_ignored_preimage_bytes:
                 raise WorkspaceNotClean("ignored preimages exceed the workspace baseline limit")
@@ -524,6 +535,34 @@ class WorkspaceTransaction:
                 baseline_ignored=True,
             )
         return preimages
+
+    def _validate_ignored_capture(
+        self,
+        ignored_touched: tuple[str, ...],
+        after: _Inventory,
+    ) -> None:
+        for path in ignored_touched:
+            try:
+                self._path_policy.validate_captured_path(
+                    path,
+                    must_exist=path in after.files,
+                )
+                baseline = self._ignored_preimages.get(path)
+                if baseline is not None:
+                    assert_secret_free_bytes(
+                        baseline.content,
+                        label=f"ignored preimage {path!r}",
+                    )
+                if path in after.files:
+                    content = self._path_policy.validate_existing(path).absolute_path.read_bytes()
+                    assert_secret_free_bytes(
+                        content,
+                        label=f"ignored captured file {path!r}",
+                    )
+            except (PathPolicyViolation, SecretPolicyViolation) as error:
+                raise WorkspaceTransactionError(
+                    "ignored change contains a forbidden path or credential-like content"
+                ) from error
 
     def _ignored_changes(
         self,

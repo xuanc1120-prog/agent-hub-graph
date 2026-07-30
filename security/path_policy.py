@@ -19,14 +19,27 @@ _DOS_RESERVED_NAMES = frozenset(
 _SHORT_NAME_PATTERN = re.compile(r"^.+~[0-9]+(?:\..*)?$", re.IGNORECASE)
 _SECRET_BASENAMES = frozenset(
     {
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".yarnrc",
+        ".yarnrc.yml",
+        "_netrc",
+        "application_default_credentials.json",
+        "auth.json",
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
         "id_ed25519",
         "credentials",
         "credentials.json",
+        "nuget.config",
+        "pip.conf",
+        "pip.ini",
+        "service-account.json",
     }
 )
+_SECRET_COMPONENTS = frozenset({".aws", ".azure", ".docker", ".kube", "gcloud"})
 _FORBIDDEN_COMPONENTS = frozenset(
     {".agent-hub", ".aider", ".claude", ".codex", ".git", ".opencode", ".ssh"}
 )
@@ -224,6 +237,8 @@ class PathPolicy:
         lowered = tuple(part.casefold() for part in parts)
         if any(part in _FORBIDDEN_COMPONENTS for part in lowered):
             raise PathPolicyViolation("Git/runtime metadata and SSH paths are forbidden")
+        if not allow_sensitive and any(part in _SECRET_COMPONENTS for part in lowered):
+            raise PathPolicyViolation("cloud and package credential paths are forbidden")
         basename = lowered[-1]
         if not allow_control and basename in _FORBIDDEN_BASENAMES:
             raise PathPolicyViolation("Git/Agent control files are forbidden")

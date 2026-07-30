@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -311,18 +312,18 @@ async def test_post_capture_failure_abandons_change_set_and_fails_task(
 
         monkeypatch.setattr(application.services.artifacts, "create", fail_output_once)
     elif failure_point == "capture_artifact":
-        original_capture_artifact = application.services.change_sets._create_or_verify_artifact
+        original_stage_artifact = application.services.change_sets._stage_artifact
 
-        async def fail_capture_artifact_once(**kwargs: object):
+        def fail_capture_artifact_once(**kwargs: object):
             nonlocal injected
             if not injected and kwargs["artifact_type"] == ArtifactType.PATCH:
                 injected = True
                 raise RuntimeError("injected capture artifact failure")
-            return await original_capture_artifact(**kwargs)
+            return original_stage_artifact(**kwargs)
 
         monkeypatch.setattr(
             application.services.change_sets,
-            "_create_or_verify_artifact",
+            "_stage_artifact",
             fail_capture_artifact_once,
         )
     else:
@@ -401,13 +402,22 @@ async def test_lease_loss_after_restore_never_publishes_live_capture(
         )
     )
     original_persist = application.services.change_sets.persist_capture
+    replacement = None
     injected = False
 
     async def lose_success_publication(**kwargs: object):
-        nonlocal injected
+        nonlocal injected, replacement
         if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
             injected = True
-            raise LeaseLost("injected lease loss after capture")
+            old_lease = kwargs["workspace_lease"]
+            await application.services.locks.release(old_lease)
+            replacement = await application.services.locks.acquire(
+                session_id=session.session_id,
+                owner_kind=WorkspaceOwnerKind.RECOVERY,
+                owner_operation_id="recovery-replaces-agent-task",
+                owner_process_id=os.getpid(),
+                ttl_seconds=30,
+            )
         return await original_persist(**kwargs)
 
     monkeypatch.setattr(
@@ -416,13 +426,17 @@ async def test_lease_loss_after_restore_never_publishes_live_capture(
         lose_success_publication,
     )
 
-    async with application.temporary_master() as lease:
-        with pytest.raises(LeaseLost, match="after capture"):
-            await application.run(
-                workflow.workflow_id,
-                lease=lease,
-                workflow_run_id="run-lease-loss-after-capture",
-            )
+    try:
+        async with application.temporary_master() as lease:
+            with pytest.raises(LeaseLost):
+                await application.run(
+                    workflow.workflow_id,
+                    lease=lease,
+                    workflow_run_id="run-lease-loss-after-capture",
+                )
+    finally:
+        if replacement is not None:
+            await application.services.locks.release(replacement)
 
     assert injected is True
     run = await application.services.runs.get("run-lease-loss-after-capture")
@@ -440,8 +454,23 @@ async def test_lease_loss_after_restore_never_publishes_live_capture(
         change_cursor = await connection.execute("SELECT COUNT(*) FROM change_sets")
         change_count = await change_cursor.fetchone()
         await change_cursor.close()
+        artifact_cursor = await connection.execute(
+            "SELECT COUNT(*) FROM artifacts "
+            "WHERE artifact_type IN ('patch', 'diff', 'change_preimage')"
+        )
+        capture_artifact_count = await artifact_cursor.fetchone()
+        await artifact_cursor.close()
     assert task is not None and task["status"] == TaskStatus.RUNNING.value
     assert change_count is not None and change_count[0] == 0
+    assert capture_artifact_count is not None and capture_artifact_count[0] == 0
+    for artifact_type in (
+        ArtifactType.PATCH,
+        ArtifactType.DIFF,
+        ArtifactType.CHANGE_PREIMAGE,
+    ):
+        artifact_directory = application.services.artifacts.store.base_dir / artifact_type.value
+        if artifact_directory.exists():
+            assert list(artifact_directory.iterdir()) == []
     assert application.services.git.state(session.shared_repo_path).dirty is False
     assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
 

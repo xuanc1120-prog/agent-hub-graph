@@ -25,7 +25,11 @@ from protocol import (
     TaskStatus,
     canonical_json,
 )
-from storage.artifact_repository import ArtifactRecord, ArtifactRepository
+from storage.artifact_repository import (
+    ArtifactRecord,
+    ArtifactRepository,
+    StagedArtifact,
+)
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ChangeSetIntegrityError, ConcurrencyConflict, RecordNotFound
 from storage.event_repository import EventRepository
@@ -222,10 +226,11 @@ class ChangeSetRepository:
             capture.manifest.post_state_hash,
             patch_sha256,
         )
-        created_artifacts: list[str] = []
-        database_boundary_entered = False
+        staged_artifacts: list[StagedArtifact] = []
+        published_artifacts: list[StagedArtifact] = []
+        transaction_body_completed = False
         try:
-            patch, created = await self._create_or_verify_artifact(
+            patch_staged = self._stage_artifact(
                 artifact_id=_stable_id(
                     "change-patch",
                     task_id,
@@ -237,12 +242,12 @@ class ChangeSetRepository:
                 content=capture.patch_bytes,
                 redacted=False,
             )
-            if created:
-                created_artifacts.append(patch.artifact_id)
+            staged_artifacts.append(patch_staged)
+            patch = patch_staged.record
 
             evidence_bindings: list[EvidenceBinding] = []
             for kind in ("status", "staged", "unstaged"):
-                record, created = await self._create_or_verify_artifact(
+                staged = self._stage_artifact(
                     artifact_id=_stable_id(
                         f"change-{kind}",
                         task_id,
@@ -254,8 +259,8 @@ class ChangeSetRepository:
                     content=evidence[kind],
                     redacted=True,
                 )
-                if created:
-                    created_artifacts.append(record.artifact_id)
+                staged_artifacts.append(staged)
+                record = staged.record
                 evidence_bindings.append(
                     EvidenceBinding(kind=kind, artifact_ref=_artifact_ref(record))
                 )
@@ -266,7 +271,7 @@ class ChangeSetRepository:
                     raise ChangeSetIntegrityError(
                         f"captured preimage hash mismatch: {preimage.path}"
                     )
-                record, created = await self._create_or_verify_artifact(
+                staged = self._stage_artifact(
                     artifact_id=_stable_id(
                         "change-preimage",
                         task_id,
@@ -279,8 +284,8 @@ class ChangeSetRepository:
                     content=preimage.content,
                     redacted=False,
                 )
-                if created:
-                    created_artifacts.append(record.artifact_id)
+                staged_artifacts.append(staged)
+                record = staged.record
                 preimage_bindings.append(
                     PreimageBinding(
                         path=preimage.path,
@@ -309,7 +314,6 @@ class ChangeSetRepository:
                 created_at=timestamp,
                 updated_at=timestamp,
             )
-            database_boundary_entered = True
             async with self._database.immediate_transaction() as transaction:
                 await self._master_leases.assert_valid_in(
                     transaction,
@@ -341,14 +345,21 @@ class ChangeSetRepository:
                     "SELECT * FROM change_sets WHERE task_id = ?",
                     (task_id,),
                 )
-                if existing is not None:
-                    if (
-                        str(existing["id"]) != change_set_id
-                        or str(existing["manifest_json"]) != manifest_json
-                        or str(existing["status"]) != status.value
-                    ):
-                        raise ConcurrencyConflict("task already owns a different ChangeSet capture")
-                else:
+                if existing is not None and (
+                    str(existing["id"]) != change_set_id
+                    or str(existing["manifest_json"]) != manifest_json
+                    or str(existing["status"]) != status.value
+                ):
+                    raise ConcurrencyConflict("task already owns a different ChangeSet capture")
+                for staged in staged_artifacts:
+                    _record, created = await self._artifacts.publish_staged_in(
+                        transaction,
+                        staged,
+                        allow_existing=True,
+                    )
+                    if created:
+                        published_artifacts.append(staged)
+                if existing is None:
                     await self._insert_capture_in(
                         transaction,
                         lineage=lineage,
@@ -374,18 +385,21 @@ class ChangeSetRepository:
                     timestamp=timestamp,
                     now=now,
                 )
+                transaction_body_completed = True
         except BaseException as operation_error:
-            if database_boundary_entered:
+            if transaction_body_completed:
                 operation_error.add_note(
                     "capture artifacts retained because database commit outcome is uncertain"
                 )
                 _LOGGER.warning(
                     "Retaining %d capture artifacts after database-boundary failure",
-                    len(created_artifacts),
+                    len(published_artifacts),
                 )
             else:
-                await self._cleanup_artifacts(created_artifacts, operation_error)
+                self._abort_staged_artifacts(staged_artifacts, operation_error)
             raise
+        for staged in published_artifacts:
+            self._artifacts.finalize_staged(staged)
         return result
 
     async def transition(
@@ -831,7 +845,7 @@ class ChangeSetRepository:
             ),
         )
 
-    async def _create_or_verify_artifact(
+    def _stage_artifact(
         self,
         *,
         artifact_id: str,
@@ -840,45 +854,26 @@ class ChangeSetRepository:
         artifact_type: ArtifactType,
         content: bytes,
         redacted: bool,
-    ) -> tuple[ArtifactRecord, bool]:
-        try:
-            record = await self._artifacts.create(
-                artifact_id=artifact_id,
-                session_id=session_id,
-                task_id=task_id,
-                artifact_type=artifact_type,
-                content=content,
-                redacted=redacted,
-            )
-            return record, True
-        except Exception as create_error:
-            try:
-                record, existing = await self._artifacts.get_and_verify(
-                    artifact_id,
-                    expected_session_id=session_id,
-                    expected_task_id=task_id,
-                )
-            except Exception:
-                raise create_error from None
-            if (
-                record.task_id != task_id
-                or record.planner_run_id is not None
-                or record.artifact_type != artifact_type.value
-                or record.redacted != redacted
-                or existing != content
-            ):
-                raise create_error from None
-            return record, False
+    ) -> StagedArtifact:
+        return self._artifacts.stage(
+            artifact_id=artifact_id,
+            session_id=session_id,
+            task_id=task_id,
+            artifact_type=artifact_type,
+            content=content,
+            redacted=redacted,
+        )
 
-    async def _cleanup_artifacts(
+    def _abort_staged_artifacts(
         self,
-        artifact_ids: list[str],
+        artifacts: list[StagedArtifact],
         operation_error: BaseException,
     ) -> None:
-        for artifact_id in reversed(artifact_ids):
+        for staged in reversed(artifacts):
             try:
-                await self._artifacts.delete(artifact_id)
+                self._artifacts.abort_staged(staged)
             except Exception as cleanup_error:
+                artifact_id = staged.record.artifact_id
                 operation_error.add_note(
                     f"ChangeSet artifact cleanup failed for {artifact_id}: {cleanup_error!r}"
                 )

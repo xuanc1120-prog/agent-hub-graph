@@ -17,13 +17,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 
 import aiosqlite
 from pydantic import TypeAdapter
 
 from protocol import ArtifactType, EntityId
-from storage.artifact_store import ArtifactStore
-from storage.db import Database, utc_now_text
+from storage.artifact_store import ArtifactStore, TempWriteResult
+from storage.db import Database, Transaction, utc_now_text
 from storage.errors import (
     ArtifactNotFound,
     ContainmentViolation,
@@ -54,6 +55,12 @@ class ArtifactRecord:
     size_bytes: int
     redacted: bool
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class StagedArtifact:
+    record: ArtifactRecord
+    handle: TempWriteResult
 
 
 class ArtifactRepository:
@@ -91,6 +98,218 @@ class ArtifactRepository:
     @property
     def store(self) -> ArtifactStore:
         return self._store
+
+    def stage(
+        self,
+        *,
+        artifact_id: str,
+        session_id: str,
+        artifact_type: ArtifactType,
+        content: bytes,
+        task_id: str | None = None,
+        planner_run_id: str | None = None,
+        redacted: bool = True,
+        now: datetime | None = None,
+    ) -> StagedArtifact:
+        """Write an invisible temp artifact for a caller-owned transaction."""
+
+        resolved_id = _entity_id(artifact_id)
+        resolved_session = _entity_id(session_id)
+        resolved_task = _entity_id(task_id) if task_id else None
+        resolved_planner = _entity_id(planner_run_id) if planner_run_id else None
+        if resolved_task is not None and resolved_planner is not None:
+            raise ValueError("task_id and planner_run_id are mutually exclusive")
+
+        handle = self._store.write_temp(resolved_id, artifact_type.value, content)
+        try:
+            final_path = self._store.resolve(handle.artifact_id, handle.artifact_type)
+            relative = final_path.relative_to(self._store.base_dir).as_posix()
+        except BaseException as operation_error:
+            try:
+                self._store.abort(handle)
+            except Exception as cleanup_error:
+                operation_error.add_note(
+                    f"artifact staging cleanup failed for {artifact_type.value}/{resolved_id}: "
+                    f"{cleanup_error!r}"
+                )
+            raise
+        return StagedArtifact(
+            record=ArtifactRecord(
+                artifact_id=resolved_id,
+                session_id=resolved_session,
+                task_id=resolved_task,
+                planner_run_id=resolved_planner,
+                artifact_type=artifact_type.value,
+                relative_path=relative,
+                sha256=handle.sha256,
+                size_bytes=handle.size_bytes,
+                redacted=redacted,
+                created_at=utc_now_text(now),
+            ),
+            handle=handle,
+        )
+
+    async def publish_staged_in(
+        self,
+        transaction: Transaction,
+        staged: StagedArtifact,
+        *,
+        allow_existing: bool = False,
+    ) -> tuple[ArtifactRecord, bool]:
+        """Publish and register one staged artifact in the caller's transaction."""
+
+        record = staged.record
+        handle = staged.handle
+        if (
+            record.artifact_id != handle.artifact_id
+            or record.artifact_type != handle.artifact_type
+            or record.sha256 != handle.sha256
+            or record.size_bytes != handle.size_bytes
+        ):
+            raise ContainmentViolation("staged artifact handle and metadata do not match")
+        expected_relative = (
+            self._store.resolve(
+                handle.artifact_id,
+                handle.artifact_type,
+            )
+            .relative_to(self._store.base_dir)
+            .as_posix()
+        )
+        if record.relative_path != expected_relative:
+            raise ContainmentViolation("staged artifact relative path does not match its handle")
+
+        await self._validate_owner_in(transaction, record)
+        existing_row = await transaction.fetch_one(
+            "SELECT * FROM artifacts WHERE id = ?",
+            (record.artifact_id,),
+        )
+        if existing_row is not None:
+            if not allow_existing:
+                raise PathEscapeError(
+                    f"artifact already exists: {record.artifact_id}; immutable, cannot overwrite"
+                )
+            existing = self._to_record(existing_row)
+            if not self._same_artifact(existing, record):
+                raise ContainmentViolation(
+                    f"existing artifact metadata mismatch: {record.artifact_id}"
+                )
+            content = self._store.read_bytes(
+                existing.artifact_id,
+                existing.artifact_type,
+            )
+            if (
+                len(content) != existing.size_bytes
+                or sha256(content).hexdigest() != existing.sha256
+            ):
+                raise ContainmentViolation(
+                    f"existing artifact content mismatch: {record.artifact_id}"
+                )
+            self._store.discard_staged(handle)
+            return existing, False
+
+        if record.size_bytes > self._max_artifact_bytes:
+            raise QuotaExceeded(
+                f"artifact size {record.size_bytes} exceeds "
+                f"per-artifact limit {self._max_artifact_bytes}"
+            )
+        row = await transaction.fetch_one(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM artifacts WHERE session_id = ?",
+            (record.session_id,),
+        )
+        current_total = int(row["total"]) if row else 0
+        if current_total + record.size_bytes > self._max_session_artifact_bytes:
+            raise QuotaExceeded(
+                f"session {record.session_id} artifact quota exceeded: "
+                f"{current_total} + {record.size_bytes} > "
+                f"{self._max_session_artifact_bytes}"
+            )
+
+        self._store.publish(handle)
+        await transaction.execute(
+            """
+            INSERT INTO artifacts(
+                id, session_id, task_id, planner_run_id,
+                artifact_type, relative_path, sha256, size_bytes,
+                redacted, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.artifact_id,
+                record.session_id,
+                record.task_id,
+                record.planner_run_id,
+                record.artifact_type,
+                record.relative_path,
+                record.sha256,
+                record.size_bytes,
+                1 if record.redacted else 0,
+                record.created_at,
+            ),
+        )
+        return record, True
+
+    def finalize_staged(self, staged: StagedArtifact) -> None:
+        self._store.finalize(staged.handle)
+
+    def abort_staged(self, staged: StagedArtifact) -> None:
+        self._store.abort(staged.handle)
+
+    async def _validate_owner_in(
+        self,
+        transaction: Transaction,
+        record: ArtifactRecord,
+    ) -> None:
+        session_row = await transaction.fetch_one(
+            "SELECT id FROM sessions WHERE id = ?",
+            (record.session_id,),
+        )
+        if session_row is None:
+            raise RecordNotFound(f"session not found: {record.session_id}")
+        if record.task_id is not None:
+            task_row = await transaction.fetch_one(
+                "SELECT t.id, t.node_run_id FROM tasks t "
+                "JOIN node_runs nr ON t.node_run_id = nr.id "
+                "WHERE t.id = ?",
+                (record.task_id,),
+            )
+            if task_row is None:
+                raise RecordNotFound(f"task not found: {record.task_id}")
+            owner = await transaction.fetch_one(
+                "SELECT wr.session_id FROM node_runs nr "
+                "JOIN workflow_runs wr ON nr.workflow_run_id = wr.id "
+                "WHERE nr.id = ?",
+                (task_row["node_run_id"],),
+            )
+            if owner is None or str(owner["session_id"]) != record.session_id:
+                raise ContainmentViolation(
+                    f"task {record.task_id} does not belong to session {record.session_id}"
+                )
+        if record.planner_run_id is not None:
+            owner = await transaction.fetch_one(
+                "SELECT session_id FROM planner_runs WHERE id = ?",
+                (record.planner_run_id,),
+            )
+            if owner is None:
+                raise RecordNotFound(f"planner run not found: {record.planner_run_id}")
+            if str(owner["session_id"]) != record.session_id:
+                raise ContainmentViolation(
+                    f"planner run {record.planner_run_id} does not belong "
+                    f"to session {record.session_id}"
+                )
+
+    @staticmethod
+    def _same_artifact(left: ArtifactRecord, right: ArtifactRecord) -> bool:
+        return (
+            left.artifact_id == right.artifact_id
+            and left.session_id == right.session_id
+            and left.task_id == right.task_id
+            and left.planner_run_id == right.planner_run_id
+            and left.artifact_type == right.artifact_type
+            and left.relative_path == right.relative_path
+            and left.sha256 == right.sha256
+            and left.size_bytes == right.size_bytes
+            and left.redacted == right.redacted
+        )
 
     # ------------------------------------------------------------------
     # Write path

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shutil
 import signal
 import sys
@@ -18,27 +17,7 @@ from pydantic import Field
 
 from protocol import FrozenStrictModel
 from security.command_guard import ApprovedCommand, CommandGuard
-
-_SECRET_OUTPUT = (
-    re.compile(
-        r"-----BEGIN [^-\r\n]{0,64}PRIVATE KEY-----[\s\S]*?"
-        r"(?:-----END [^-\r\n]{0,64}PRIVATE KEY-----|\Z)",
-        re.I,
-    ),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,255}\b"),
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"),
-    re.compile(
-        r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)"
-        r"(?:\+[a-z0-9_.-]+)?"
-        r"://[^\s,;]+"
-    ),
-    re.compile(
-        r"(?i)\b(api[_-]?key|access[_-]?token|password|secret|database[_-]?url)"
-        r"\s*[=:]\s*[^\s,;]+"
-    ),
-)
+from security.secret_policy import redact_secret_text
 
 _REDACTION_OVERLAP_BYTES = 64 * 1024
 
@@ -218,9 +197,7 @@ class TestRunner:
 
 
 def _redact_output(value: str) -> str:
-    for pattern in _SECRET_OUTPUT:
-        value = pattern.sub("[REDACTED]", value)
-    return value
+    return redact_secret_text(value)
 
 
 def _bounded_utf8(value: str, limit: int) -> tuple[str, bool]:

@@ -266,7 +266,17 @@ def test_untouched_ignored_baseline_is_not_exported_as_a_preimage(
         ".env",
         ".env.local",
         "credentials.json",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".yarnrc.yml",
+        ".aws/credentials",
+        ".azure/accessTokens.json",
+        ".docker/config.json",
+        ".kube/config",
         "secrets/deploy.key",
+        "NuGet.Config",
+        "pip.conf",
     ],
 )
 def test_begin_rejects_sensitive_ignored_baseline_before_agent_execution(
@@ -298,6 +308,74 @@ def test_begin_rejects_sensitive_ignored_baseline_before_agent_execution(
         _transaction(manager, repo, commit, branch, tmp_path).begin()
 
     assert sensitive.read_text(encoding="utf-8") == "must-not-be-exported\n"
+
+
+def test_begin_rejects_credential_content_in_generic_ignored_file(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    ignored = cache / "local.cfg"
+    ignored.write_text(
+        "api_key=credential-value-that-must-not-persist\n",
+        encoding="utf-8",
+    )
+
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    with pytest.raises(WorkspaceNotClean, match="cannot enter artifacts"):
+        transaction.begin()
+
+
+def test_changed_ignored_credential_content_is_rejected_and_restored(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    ignored = cache / "local.cfg"
+    ignored.write_text("mode=demo\n", encoding="utf-8")
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    ignored.write_text(
+        "sqlalchemy.url = oracle+cx_oracle://agent:secret@db/app\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        WorkspaceTransactionError,
+        match="credential-like content",
+    ):
+        transaction.capture_and_restore()
+
+    assert ignored.read_text(encoding="utf-8") == "mode=demo\n"
+    assert manager.state(repo).dirty is False
 
 
 def test_resource_limit_failure_still_restores_task_paths(

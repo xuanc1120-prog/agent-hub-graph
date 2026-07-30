@@ -179,6 +179,22 @@ async def test_output_redaction_spans_reader_chunks_and_output_boundary() -> Non
             "DATABASE_URL=customdb://agent:fallback-password@db/app",
             "fallback-password",
         ),
+        (
+            "sqlite+pysqlite://agent:sqlite-password@localhost/app",
+            "sqlite-password",
+        ),
+        (
+            "oracle+cx_oracle://agent:oracle-password@db/app",
+            "oracle-password",
+        ),
+        (
+            "cockroachdb+psycopg://agent:roach-password@db/app",
+            "roach-password",
+        ),
+        (
+            "sqlalchemy.url = oracle+cx_oracle://agent:ini-password@db/app",
+            "ini-password",
+        ),
         ("api_key=top-secret-value", "top-secret-value"),
     ],
 )
@@ -202,6 +218,22 @@ async def test_driver_database_url_redaction_spans_reader_chunks() -> None:
 
     assert "chunk-password" not in redacted
     assert "postgresql+psycopg://" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_bare_unknown_dialect_url_redaction_spans_reader_chunks() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=512)
+    reader.feed_data(b"oracle+cx_oracle://agent:cross-")
+    reader.feed_data(b"chunk-password@db/app")
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+
+    assert "cross-chunk-password" not in redacted
+    assert "oracle+cx_oracle://" not in redacted
     assert "[REDACTED]" in redacted
 
 
