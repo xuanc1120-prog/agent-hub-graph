@@ -21,6 +21,7 @@ _SECRET_BASENAMES = frozenset(
     {
         ".netrc",
         ".npmrc",
+        ".terraformrc",
         ".pypirc",
         ".yarnrc",
         ".yarnrc.yml",
@@ -33,13 +34,38 @@ _SECRET_BASENAMES = frozenset(
         "id_ed25519",
         "credentials",
         "credentials.json",
+        "credentials.toml",
+        "credentials.tfrc.json",
+        "gradle.properties",
         "nuget.config",
         "pip.conf",
         "pip.ini",
         "service-account.json",
+        "settings-security.xml",
     }
 )
-_SECRET_COMPONENTS = frozenset({".aws", ".azure", ".docker", ".kube", "gcloud"})
+_SECRET_COMPONENTS = frozenset(
+    {
+        ".aws",
+        ".azure",
+        ".cargo",
+        ".docker",
+        ".gradle",
+        ".kube",
+        ".m2",
+        ".terraform.d",
+        "gcloud",
+    }
+)
+_SECRET_PATH_PREFIXES = frozenset(
+    {
+        (".config", "gh"),
+        (".config", "glab"),
+        (".config", "gcloud"),
+        (".config", "pypoetry"),
+        (".config", "rclone"),
+    }
+)
 _FORBIDDEN_COMPONENTS = frozenset(
     {".agent-hub", ".aider", ".claude", ".codex", ".git", ".opencode", ".ssh"}
 )
@@ -239,6 +265,12 @@ class PathPolicy:
             raise PathPolicyViolation("Git/runtime metadata and SSH paths are forbidden")
         if not allow_sensitive and any(part in _SECRET_COMPONENTS for part in lowered):
             raise PathPolicyViolation("cloud and package credential paths are forbidden")
+        if not allow_sensitive and any(
+            lowered[index : index + len(prefix)] == prefix
+            for prefix in _SECRET_PATH_PREFIXES
+            for index in range(len(lowered) - len(prefix) + 1)
+        ):
+            raise PathPolicyViolation("credential configuration directories are forbidden")
         basename = lowered[-1]
         if not allow_control and basename in _FORBIDDEN_BASENAMES:
             raise PathPolicyViolation("Git/Agent control files are forbidden")

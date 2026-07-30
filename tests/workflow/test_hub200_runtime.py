@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from protocol import (
     WorkflowNode,
     WorkflowRunStatus,
 )
+from storage.db import Transaction
 from storage.errors import (
     ConcurrencyConflict,
     ContainmentViolation,
@@ -377,6 +380,124 @@ async def test_post_capture_failure_abandons_change_set_and_fails_task(
     assert len(security_events) == 1
     assert security_events[0]["severity"] == "high"
     assert '"status":"abandoned_partial"' in security_events[0]["payload_json"]
+
+
+@pytest.mark.parametrize("commit_persisted", [False, True])
+@pytest.mark.asyncio
+async def test_capture_commit_exception_reconciles_durable_outcome(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_persisted: bool,
+) -> None:
+    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Reconcile an ambiguous SQLite commit result.",
+        session_id=f"session-commit-reconcile-{commit_persisted}",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id=f"workflow-commit-reconcile-{commit_persisted}",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    database = application.services.database
+    original_transaction = database.immediate_transaction
+    original_persist = application.services.change_sets.persist_capture
+    injected = False
+
+    @asynccontextmanager
+    async def faulting_transaction() -> AsyncIterator[Transaction]:
+        async with database.connection() as connection:
+            cursor = await connection.execute("BEGIN IMMEDIATE")
+            await cursor.close()
+            try:
+                yield Transaction(connection)
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                if commit_persisted:
+                    await connection.commit()
+                else:
+                    await connection.rollback()
+                raise RuntimeError("injected commit-path exception")
+
+    async def persist_with_commit_fault(**kwargs: object):
+        nonlocal injected
+        if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
+            injected = True
+            monkeypatch.setattr(
+                database,
+                "immediate_transaction",
+                faulting_transaction,
+            )
+            try:
+                return await original_persist(**kwargs)
+            finally:
+                monkeypatch.setattr(
+                    database,
+                    "immediate_transaction",
+                    original_transaction,
+                )
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(
+        application.services.change_sets,
+        "persist_capture",
+        persist_with_commit_fault,
+    )
+
+    async with application.temporary_master() as lease:
+        run = await application.run(
+            workflow.workflow_id,
+            lease=lease,
+            workflow_run_id=f"run-commit-reconcile-{commit_persisted}",
+        )
+
+    assert injected is True
+    record = await application.services.change_sets.get_for_source_node(
+        workflow_run_id=run.workflow_run_id,
+        source_node_id="write-docs",
+    )
+    assert record is not None
+    task = await application.services.runs.get_task(record.change_set.task_id)
+    if commit_persisted:
+        assert run.status == WorkflowRunStatus.BLOCKED
+        assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+        assert task.status == TaskStatus.SUCCEEDED
+    else:
+        assert run.status == WorkflowRunStatus.FAILED
+        assert record.change_set.status == ChangeSetStatus.ABANDONED_PARTIAL
+        assert task.status == TaskStatus.FAILED
+
+    capture_types = {
+        ArtifactType.PATCH.value,
+        ArtifactType.DIFF.value,
+        ArtifactType.CHANGE_PREIMAGE.value,
+    }
+    task_artifacts = await application.services.artifacts.list_by_task(record.change_set.task_id)
+    capture_artifacts = [
+        artifact for artifact in task_artifacts if artifact.artifact_type in capture_types
+    ]
+    assert len(capture_artifacts) == 4
+    expected_by_type: dict[str, set[str]] = {}
+    for artifact in capture_artifacts:
+        expected_by_type.setdefault(artifact.artifact_type, set()).add(artifact.artifact_id)
+        await application.services.artifacts.get_and_verify(
+            artifact.artifact_id,
+            expected_session_id=session.session_id,
+            expected_task_id=record.change_set.task_id,
+        )
+    for artifact_type in capture_types:
+        directory = application.services.artifacts.store.base_dir / artifact_type
+        actual = {path.name for path in directory.iterdir()} if directory.exists() else set()
+        assert actual == expected_by_type.get(artifact_type, set())
 
 
 @pytest.mark.asyncio

@@ -69,3 +69,7 @@ class SnapshotIntegrityError(StorageError):
 
 class ChangeSetIntegrityError(StorageError):
     """A persisted ChangeSet or one of its artifact references is inconsistent."""
+
+
+class ChangeSetReconciliationRequired(ChangeSetIntegrityError):
+    """Capture commit outcome is inconsistent and requires recovery cleanup."""

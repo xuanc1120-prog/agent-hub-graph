@@ -32,7 +32,7 @@ from protocol import (
 )
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRepository
-from storage.errors import LeaseLost
+from storage.errors import ChangeSetReconciliationRequired, LeaseLost
 from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
@@ -551,6 +551,8 @@ class AgentTaskNodeHandler:
             except LeaseLost:
                 raise
             except BaseException as error:
+                if isinstance(error, ChangeSetReconciliationRequired):
+                    raise
                 current = await self._runs.get_task(task.task_id)
                 if current.status == TaskStatus.RUNNING:
                     code = _handler_error_code(error)

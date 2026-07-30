@@ -16,6 +16,7 @@ from security.secret_policy import SecretPolicyViolation, assert_secret_free_byt
 from workspace.change_set import ChangeSetManifest, FileAction, FileChange
 from workspace.git_manager import (
     CanonicalBaselineFile,
+    CanonicalCapturedFile,
     GitManager,
     GitManagerError,
     GitMetadataSeal,
@@ -45,6 +46,14 @@ class FileSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class _SealedFile:
+    content: bytes
+    sha256: str
+    size_bytes: int
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
 class FilePreimage:
     path: str
     sha256: str
@@ -70,6 +79,7 @@ class _Inventory:
     directories: tuple[str, ...]
     state_hash: str
     total_bytes: int
+    sealed_files: dict[str, _SealedFile]
 
 
 class WorkspaceTransaction:
@@ -114,6 +124,11 @@ class WorkspaceTransaction:
         self._max_inventory_paths = max_inventory_paths
         self._max_inventory_bytes = max_inventory_bytes
         self._max_ignored_preimage_bytes = max_ignored_preimage_bytes
+        self._max_sealed_bytes = max(
+            max_patch_bytes,
+            max_created_bytes,
+            max_ignored_preimage_bytes,
+        )
         self._seal_git_objects = seal_git_objects
         self._path_policy = PathPolicy(self._repo, max_scope_files=max_changed_paths)
         self._phase = "new"
@@ -145,7 +160,7 @@ class WorkspaceTransaction:
         if len(ignored) > self._max_changed_paths:
             raise WorkspaceNotClean("ignored baseline exceeds the replayable workspace path limit")
         self._validate_ignored_baseline(ignored)
-        inventory = self._scan_inventory()
+        inventory = self._scan_inventory(seal_paths=ignored)
         tracked = frozenset(self._git.tracked_paths(self._repo))
         preimages = self._capture_ignored_preimages(ignored, inventory)
         self._baseline_state = state
@@ -203,12 +218,13 @@ class WorkspaceTransaction:
                     key=lambda path: (path.count("/"), path),
                 )
             )
-            after = self._scan_inventory()
+            after = self._scan_inventory(seal_paths=frozenset(restore_paths))
             ignored_touched = self._ignored_changes(after, current_state)
             self._validate_ignored_capture(ignored_touched, after)
             restore_paths.difference_update(ignored_candidates)
             restore_paths.update(ignored_touched)
             self._validate_changed_paths(restore_paths, after)
+            self._assert_sealed_paths_current(restore_paths, after)
             excluded_ignored = (
                 self._baseline_ignored | frozenset(current_state.ignored_files)
             ) - frozenset(ignored_touched)
@@ -240,6 +256,15 @@ class WorkspaceTransaction:
                     )
                     for path in ignored_touched
                     if (preimage := self._ignored_preimages.get(path)) is not None
+                ),
+                captured_files=tuple(
+                    CanonicalCapturedFile(
+                        path=path,
+                        content=after.sealed_files[path].content,
+                        mode=after.sealed_files[path].mode,
+                    )
+                    for path in sorted(restore_paths)
+                    if path in after.files
                 ),
             )
             if len(canonical.patch_bytes) > self._max_patch_bytes:
@@ -426,7 +451,7 @@ class WorkspaceTransaction:
             raise WorkspaceRestoreError("workspace Git state differs from its baseline")
         if self._git.index_sha256(self._repo) != self._baseline_index_sha256:
             raise WorkspaceRestoreError("real Git index differs from its baseline")
-        if self._scan_inventory() != baseline_inventory:
+        if self._scan_inventory(seal_paths=self._baseline_ignored) != baseline_inventory:
             raise WorkspaceRestoreError("workspace file inventory differs from its baseline")
 
     def _scan_directories(self, *, repo: Path | None = None) -> tuple[str, ...]:
@@ -453,11 +478,18 @@ class WorkspaceTransaction:
             directory_names[:] = safe_directories
         return tuple(sorted(directories))
 
-    def _scan_inventory(self, *, repo: Path | None = None) -> _Inventory:
+    def _scan_inventory(
+        self,
+        *,
+        repo: Path | None = None,
+        seal_paths: frozenset[str] = frozenset(),
+    ) -> _Inventory:
         root = self._repo if repo is None else repo.expanduser().resolve(strict=True)
         files: dict[str, FileSnapshot] = {}
+        sealed_files: dict[str, _SealedFile] = {}
         directories: list[str] = []
         total_bytes = 0
+        sealed_bytes = 0
         for current_root, directory_names, file_names in os.walk(
             root,
             topdown=True,
@@ -477,8 +509,19 @@ class WorkspaceTransaction:
                 child = current / name
                 self._assert_plain_entry(child, expect_directory=False)
                 relative = self._relative_path(child, root=root)
-                snapshot = self._snapshot_file(child, relative)
+                snapshot, content = self._snapshot_file(
+                    child,
+                    relative,
+                    capture_content=relative in seal_paths,
+                )
                 files[relative] = snapshot
+                if content is not None:
+                    sealed_files[relative] = content
+                    sealed_bytes += content.size_bytes
+                    if sealed_bytes > self._max_sealed_bytes:
+                        raise WorkspaceTransactionError(
+                            "workspace sealed content byte limit exceeded"
+                        )
                 total_bytes += snapshot.size_bytes
                 if len(files) > self._max_inventory_paths:
                     raise WorkspaceTransactionError("workspace inventory path limit exceeded")
@@ -490,6 +533,7 @@ class WorkspaceTransaction:
             directories=tuple(sorted(directories)),
             state_hash=state_hash,
             total_bytes=total_bytes,
+            sealed_files=sealed_files,
         )
 
     def _validate_ignored_baseline(self, ignored: frozenset[str]) -> None:
@@ -512,18 +556,20 @@ class WorkspaceTransaction:
             snapshot = inventory.files.get(path)
             if snapshot is None:
                 continue
-            validated = self._path_policy.validate_cleanup_path(path)
-            content = validated.absolute_path.read_bytes()
+            content = inventory.sealed_files.get(path)
+            if content is None:
+                raise WorkspaceNotClean("ignored baseline content was not sealed")
+            self._assert_sealed_content(path, snapshot, content)
             try:
                 assert_secret_free_bytes(
-                    content,
+                    content.content,
                     label=f"ignored workspace file {path!r}",
                 )
             except SecretPolicyViolation as error:
                 raise WorkspaceNotClean(
                     "ignored baseline contains content that cannot enter artifacts"
                 ) from error
-            total += len(content)
+            total += content.size_bytes
             if total > self._max_ignored_preimage_bytes:
                 raise WorkspaceNotClean("ignored preimages exceed the workspace baseline limit")
             preimages[path] = FilePreimage(
@@ -531,7 +577,7 @@ class WorkspaceTransaction:
                 sha256=snapshot.sha256,
                 size_bytes=snapshot.size_bytes,
                 mode=snapshot.mode,
-                content=content,
+                content=content.content,
                 baseline_ignored=True,
             )
         return preimages
@@ -553,16 +599,70 @@ class WorkspaceTransaction:
                         baseline.content,
                         label=f"ignored preimage {path!r}",
                     )
-                if path in after.files:
-                    content = self._path_policy.validate_existing(path).absolute_path.read_bytes()
+                snapshot = after.files.get(path)
+                if snapshot is not None:
+                    content = after.sealed_files.get(path)
+                    if content is None:
+                        raise SecretPolicyViolation("ignored captured content was not sealed")
+                    self._assert_sealed_content(path, snapshot, content)
                     assert_secret_free_bytes(
-                        content,
+                        content.content,
                         label=f"ignored captured file {path!r}",
                     )
             except (PathPolicyViolation, SecretPolicyViolation) as error:
                 raise WorkspaceTransactionError(
                     "ignored change contains a forbidden path or credential-like content"
                 ) from error
+
+    @staticmethod
+    def _assert_sealed_content(
+        path: str,
+        snapshot: FileSnapshot,
+        sealed: _SealedFile,
+    ) -> None:
+        if (
+            snapshot.path != path
+            or snapshot.size_bytes != sealed.size_bytes
+            or snapshot.sha256 != sealed.sha256
+            or snapshot.mode != sealed.mode
+            or sealed.size_bytes != len(sealed.content)
+            or sealed.sha256 != sha256(sealed.content).hexdigest()
+        ):
+            raise WorkspaceTransactionError(
+                f"sealed workspace content does not match inventory: {path}"
+            )
+
+    def _assert_sealed_paths_current(
+        self,
+        paths: set[str],
+        inventory: _Inventory,
+    ) -> None:
+        for path in sorted(paths):
+            expected = inventory.files.get(path)
+            validated = self._path_policy.validate_cleanup_path(path)
+            if expected is None:
+                if validated.exists:
+                    raise WorkspaceTransactionError(
+                        f"workspace path appeared after inventory: {path}"
+                    )
+                continue
+            if not validated.exists:
+                raise WorkspaceTransactionError(
+                    f"workspace path disappeared after inventory: {path}"
+                )
+            current, sealed = self._snapshot_file(
+                validated.absolute_path,
+                path,
+                capture_content=True,
+            )
+            expected_sealed = inventory.sealed_files.get(path)
+            if (
+                sealed is None
+                or expected_sealed is None
+                or current != expected
+                or sealed != expected_sealed
+            ):
+                raise WorkspaceTransactionError(f"workspace path changed after inventory: {path}")
 
     def _ignored_changes(
         self,
@@ -723,23 +823,58 @@ class WorkspaceTransaction:
         )
 
     @staticmethod
-    def _snapshot_file(path: Path, relative: str) -> FileSnapshot:
+    def _snapshot_file(
+        path: Path,
+        relative: str,
+        *,
+        capture_content: bool,
+    ) -> tuple[FileSnapshot, _SealedFile | None]:
         digest = sha256()
         size = 0
         binary = False
+        captured = bytearray() if capture_content else None
         with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink > 1:
+                raise WorkspaceTransactionError(
+                    f"workspace file changed identity during inventory: {relative}"
+                )
             while chunk := stream.read(1024 * 1024):
                 if size == 0 and b"\0" in chunk[:8192]:
                     binary = True
                 digest.update(chunk)
                 size += len(chunk)
-        return FileSnapshot(
+                if captured is not None:
+                    captured.extend(chunk)
+            after = os.fstat(stream.fileno())
+        path_metadata = path.stat()
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise WorkspaceTransactionError(
+                f"workspace file changed while inventory was read: {relative}"
+            )
+        if not os.path.samestat(after, path_metadata):
+            raise WorkspaceTransactionError(
+                f"workspace file was replaced while inventory was read: {relative}"
+            )
+        snapshot = FileSnapshot(
             path=relative,
             sha256=digest.hexdigest(),
             size_bytes=size,
-            mode=stat.S_IMODE(path.stat().st_mode),
+            mode=stat.S_IMODE(after.st_mode),
             binary=binary,
         )
+        content = (
+            _SealedFile(
+                content=bytes(captured),
+                sha256=snapshot.sha256,
+                size_bytes=snapshot.size_bytes,
+                mode=snapshot.mode,
+            )
+            if captured is not None
+            else None
+        )
+        return snapshot, content
 
     @staticmethod
     def _inventory_hash(files: dict[str, FileSnapshot]) -> str:
@@ -777,6 +912,9 @@ class WorkspaceTransaction:
             directories=tuple(sorted(directories)),
             state_hash=cls._inventory_hash(files),
             total_bytes=sum(snapshot.size_bytes for snapshot in files.values()),
+            sealed_files={
+                path: content for path, content in inventory.sealed_files.items() if path in files
+            },
         )
 
     def _relative_path(self, path: Path, *, root: Path | None = None) -> str:

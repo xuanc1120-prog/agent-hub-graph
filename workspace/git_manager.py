@@ -84,6 +84,13 @@ class CanonicalBaselineFile:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalCapturedFile:
+    path: str
+    content: bytes
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
 class GitMetadataSeal:
     sha256: str
     entry_count: int
@@ -347,20 +354,29 @@ class GitManager:
         changed_paths: Sequence[str],
         temp_directory: Path,
         baseline_files: Sequence[CanonicalBaselineFile] = (),
+        captured_files: Sequence[CanonicalCapturedFile] = (),
     ) -> CanonicalPatch:
         self._require_object_id(base_commit)
         root = repo.expanduser().resolve(strict=True)
         paths = tuple(sorted(set(changed_paths)))
         if not paths:
+            if captured_files:
+                raise GitManagerError("captured files require changed paths")
             return CanonicalPatch(patch_bytes=b"", name_status_bytes=b"")
-        pathspec = self._pathspec_bytes(paths)
+        self._pathspec_bytes(paths)
         baseline_by_path = {item.path: item for item in baseline_files}
         if len(baseline_by_path) != len(baseline_files):
             raise GitManagerError("canonical baseline file paths must be unique")
+        captured_by_path = {item.path: item for item in captured_files}
+        if len(captured_by_path) != len(captured_files):
+            raise GitManagerError("canonical captured file paths must be unique")
+        if not set(captured_by_path).issubset(paths):
+            raise GitManagerError("canonical captured files must be changed paths")
         self._pathspec_bytes(tuple(baseline_by_path))
-        for item in baseline_files:
+        self._pathspec_bytes(tuple(captured_by_path))
+        for item in (*baseline_files, *captured_files):
             if item.mode < 0 or item.mode > 0o777:
-                raise GitManagerError("canonical baseline file mode is invalid")
+                raise GitManagerError("canonical file mode is invalid")
         temporary_root = temp_directory.expanduser().resolve(strict=False)
         try:
             temporary_common = Path(os.path.commonpath((root, temporary_root)))
@@ -428,18 +444,35 @@ class GitManager:
                 ).stdout
             ).strip()
             self._require_object_id(baseline_tree)
-            self._run(
-                (
-                    "add",
-                    "-A",
-                    "-f",
-                    "--pathspec-from-file=-",
-                    "--pathspec-file-nul",
-                ),
-                cwd=root,
-                input_bytes=pathspec,
-                extra_environment=environment,
-            )
+            for path in paths:
+                captured = captured_by_path.get(path)
+                if captured is None:
+                    self._run(
+                        ("update-index", "--force-remove", "--", path),
+                        cwd=root,
+                        extra_environment=environment,
+                    )
+                    continue
+                object_id = self._decode(
+                    self._run(
+                        ("hash-object", "-w", "--stdin"),
+                        cwd=root,
+                        input_bytes=captured.content,
+                        extra_environment=environment,
+                    ).stdout
+                ).strip()
+                self._require_object_id(object_id)
+                git_mode = "100755" if captured.mode & 0o111 else "100644"
+                self._run(
+                    (
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"{git_mode},{object_id},{captured.path}",
+                    ),
+                    cwd=root,
+                    extra_environment=environment,
+                )
             patch = self._run(
                 (
                     "diff",
@@ -1047,6 +1080,7 @@ class GitManager:
 
 __all__ = [
     "CanonicalBaselineFile",
+    "CanonicalCapturedFile",
     "CanonicalPatch",
     "GitCommandError",
     "GitEvidence",

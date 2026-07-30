@@ -272,9 +272,15 @@ def test_untouched_ignored_baseline_is_not_exported_as_a_preimage(
         ".yarnrc.yml",
         ".aws/credentials",
         ".azure/accessTokens.json",
+        ".cargo/credentials.toml",
+        ".config/gh/hosts.yml",
         ".docker/config.json",
+        ".gradle/gradle.properties",
         ".kube/config",
+        ".m2/settings.xml",
+        ".terraform.d/credentials.tfrc.json",
         "secrets/deploy.key",
+        "gradle.properties",
         "NuGet.Config",
         "pip.conf",
     ],
@@ -308,6 +314,66 @@ def test_begin_rejects_sensitive_ignored_baseline_before_agent_execution(
         _transaction(manager, repo, commit, branch, tmp_path).begin()
 
     assert sensitive.read_text(encoding="utf-8") == "must-not-be-exported\n"
+
+
+@pytest.mark.parametrize(
+    "credential_path,content",
+    [
+        (
+            ".cargo/credentials.toml",
+            '[registry]\ntoken = "cioabcdefghijklmnopqrstuvwxyz0123456789"\n',
+        ),
+        (
+            ".m2/settings.xml",
+            "<settings><password>maven-secret</password></settings>\n",
+        ),
+        (
+            ".config/gh/hosts.yml",
+            "github.com:\n  oauth_token: github-cli-secret\n",
+        ),
+        (
+            ".terraform.d/credentials.tfrc.json",
+            '{"credentials":{"app.terraform.io":{"token":"terraform-secret"}}}\n',
+        ),
+        (
+            ".gradle/gradle.properties",
+            "repositoryPassword=gradle-secret\n",
+        ),
+    ],
+)
+def test_new_ignored_credential_store_is_rejected_and_removed(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    credential_path: str,
+    content: str,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text(
+        f"{credential_path}\n",
+        encoding="utf-8",
+    )
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore credential store",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+    credential = repo / credential_path
+    credential.parent.mkdir(parents=True, exist_ok=True)
+    credential.write_text(content, encoding="utf-8")
+
+    with pytest.raises(WorkspaceTransactionError, match="forbidden path"):
+        transaction.capture_and_restore()
+
+    assert not credential.exists()
+    assert manager.state(repo).dirty is False
 
 
 def test_begin_rejects_credential_content_in_generic_ignored_file(
@@ -375,6 +441,57 @@ def test_changed_ignored_credential_content_is_rejected_and_restored(
         transaction.capture_and_restore()
 
     assert ignored.read_text(encoding="utf-8") == "mode=demo\n"
+    assert manager.state(repo).dirty is False
+
+
+def test_ignored_file_drift_after_secret_scan_fails_closed(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    ignored = cache / "state.toml"
+    ignored.write_text('mode = "before"\n', encoding="utf-8")
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+    ignored.write_text('mode = "safe-after"\n', encoding="utf-8")
+
+    original_validate = transaction._validate_ignored_capture
+
+    def replace_after_validation(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        ignored.write_text(
+            'token = "cioabcdefghijklmnopqrstuvwxyz0123456789"\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        transaction,
+        "_validate_ignored_capture",
+        replace_after_validation,
+    )
+
+    with pytest.raises(
+        WorkspaceTransactionError,
+        match="changed after inventory",
+    ):
+        transaction.capture_and_restore()
+
+    assert ignored.read_text(encoding="utf-8") == 'mode = "before"\n'
     assert manager.state(repo).dirty is False
 
 

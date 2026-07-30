@@ -31,7 +31,12 @@ from storage.artifact_repository import (
     StagedArtifact,
 )
 from storage.db import Database, Transaction, utc_now_text
-from storage.errors import ChangeSetIntegrityError, ConcurrencyConflict, RecordNotFound
+from storage.errors import (
+    ChangeSetIntegrityError,
+    ChangeSetReconciliationRequired,
+    ConcurrencyConflict,
+    RecordNotFound,
+)
 from storage.event_repository import EventRepository
 from storage.leases import MasterLease, MasterLeaseRepository, WorkspaceLease
 from workflow.events import (
@@ -387,19 +392,39 @@ class ChangeSetRepository:
                 )
                 transaction_body_completed = True
         except BaseException as operation_error:
-            if transaction_body_completed:
+            if not transaction_body_completed:
+                if not self._abort_staged_artifacts(staged_artifacts, operation_error):
+                    raise ChangeSetReconciliationRequired(
+                        "capture rollback left artifact cleanup incomplete"
+                    ) from operation_error
+                raise
+            outcome = await self._reconcile_capture_commit(
+                task_id=task_id,
+                node_run_id=node_run_id,
+                task_target=task_target,
+                change_set_id=change_set_id,
+                manifest_json=manifest_json,
+                status=status,
+                staged_artifacts=staged_artifacts,
+                published_artifacts=published_artifacts,
+                operation_error=operation_error,
+            )
+            if outcome == "rolled_back":
+                if not self._abort_staged_artifacts(staged_artifacts, operation_error):
+                    raise ChangeSetReconciliationRequired(
+                        "rolled-back capture left artifact cleanup incomplete"
+                    ) from operation_error
                 operation_error.add_note(
-                    "capture artifacts retained because database commit outcome is uncertain"
+                    "capture transaction rolled back; published artifacts were removed"
                 )
-                _LOGGER.warning(
-                    "Retaining %d capture artifacts after database-boundary failure",
-                    len(published_artifacts),
-                )
-            else:
-                self._abort_staged_artifacts(staged_artifacts, operation_error)
-            raise
-        for staged in published_artifacts:
-            self._artifacts.finalize_staged(staged)
+                raise
+            self._finalize_published(published_artifacts, operation_error)
+            _LOGGER.warning(
+                "Capture commit succeeded despite commit-path exception: %r",
+                operation_error,
+            )
+            return result
+        self._finalize_published(published_artifacts)
         return result
 
     async def transition(
@@ -845,6 +870,175 @@ class ChangeSetRepository:
             ),
         )
 
+    async def _reconcile_capture_commit(
+        self,
+        *,
+        task_id: str,
+        node_run_id: str,
+        task_target: TaskStatus,
+        change_set_id: str,
+        manifest_json: str,
+        status: ChangeSetStatus,
+        staged_artifacts: list[StagedArtifact],
+        published_artifacts: list[StagedArtifact],
+        operation_error: BaseException,
+    ) -> str:
+        """Determine whether SQLite committed after its commit path raised."""
+
+        artifact_rows: dict[str, aiosqlite.Row | None] = {}
+        try:
+            async with self._database.connection() as connection:
+                begin = await connection.execute("BEGIN")
+                await begin.close()
+                try:
+                    for staged in staged_artifacts:
+                        cursor = await connection.execute(
+                            "SELECT * FROM artifacts WHERE id = ?",
+                            (staged.record.artifact_id,),
+                        )
+                        artifact_rows[staged.record.artifact_id] = await cursor.fetchone()
+                        await cursor.close()
+                    cursor = await connection.execute(
+                        "SELECT * FROM change_sets WHERE task_id = ?",
+                        (task_id,),
+                    )
+                    change_row = await cursor.fetchone()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        "SELECT status FROM tasks WHERE id = ?",
+                        (task_id,),
+                    )
+                    task_row = await cursor.fetchone()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        "SELECT change_set_id FROM node_runs WHERE id = ?",
+                        (node_run_id,),
+                    )
+                    node_row = await cursor.fetchone()
+                    await cursor.close()
+                finally:
+                    await connection.rollback()
+        except BaseException as reconciliation_error:
+            failure = ChangeSetReconciliationRequired(
+                "capture commit outcome could not be read from durable storage"
+            )
+            failure.add_note(f"commit-path error: {operation_error!r}")
+            raise failure from reconciliation_error
+
+        artifacts_committed = all(
+            (row := artifact_rows[staged.record.artifact_id]) is not None
+            and self._artifact_row_matches(row, staged.record)
+            for staged in staged_artifacts
+        )
+        change_committed = (
+            change_row is not None
+            and str(change_row["id"]) == change_set_id
+            and str(change_row["task_id"]) == task_id
+            and str(change_row["manifest_json"]) == manifest_json
+            and str(change_row["status"]) == status.value
+        )
+        task_committed = task_row is not None and str(task_row["status"]) == task_target.value
+        node_committed = node_row is not None and str(node_row["change_set_id"]) == change_set_id
+        if artifacts_committed and change_committed and task_committed and node_committed:
+            try:
+                for staged in staged_artifacts:
+                    metadata, content = await self._artifacts.get_and_verify(
+                        staged.record.artifact_id,
+                        expected_session_id=staged.record.session_id,
+                        expected_task_id=task_id,
+                    )
+                    if (
+                        not self._artifact_records_match(metadata, staged.record)
+                        or len(content) != staged.record.size_bytes
+                        or sha256(content).hexdigest() != staged.record.sha256
+                    ):
+                        raise ChangeSetIntegrityError(
+                            "committed artifact does not match staged capture"
+                        )
+            except BaseException as verification_error:
+                failure = ChangeSetReconciliationRequired(
+                    "committed capture artifact failed post-commit verification"
+                )
+                failure.add_note(f"commit-path error: {operation_error!r}")
+                raise failure from verification_error
+            return "committed"
+
+        published_rows_absent = all(
+            artifact_rows[staged.record.artifact_id] is None for staged in published_artifacts
+        )
+        transaction_rolled_back = (
+            published_rows_absent
+            and change_row is None
+            and task_row is not None
+            and str(task_row["status"]) == TaskStatus.RUNNING.value
+            and node_row is not None
+            and node_row["change_set_id"] is None
+        )
+        if transaction_rolled_back:
+            return "rolled_back"
+
+        failure = ChangeSetReconciliationRequired(
+            "capture commit produced inconsistent durable state; recovery cleanup is required"
+        )
+        failure.add_note(f"commit-path error: {operation_error!r}")
+        failure.add_note(
+            "reconciliation flags: "
+            f"artifacts={artifacts_committed}, change_set={change_committed}, "
+            f"task={task_committed}, node={node_committed}"
+        )
+        raise failure
+
+    @staticmethod
+    def _artifact_row_matches(
+        row: aiosqlite.Row,
+        expected: ArtifactRecord,
+    ) -> bool:
+        return (
+            str(row["id"]) == expected.artifact_id
+            and str(row["session_id"]) == expected.session_id
+            and (str(row["task_id"]) if row["task_id"] is not None else None) == expected.task_id
+            and (str(row["planner_run_id"]) if row["planner_run_id"] is not None else None)
+            == expected.planner_run_id
+            and str(row["artifact_type"]) == expected.artifact_type
+            and str(row["relative_path"]) == expected.relative_path
+            and str(row["sha256"]) == expected.sha256
+            and int(row["size_bytes"]) == expected.size_bytes
+            and bool(row["redacted"]) == expected.redacted
+        )
+
+    @staticmethod
+    def _artifact_records_match(
+        actual: ArtifactRecord,
+        expected: ArtifactRecord,
+    ) -> bool:
+        return (
+            actual.artifact_id == expected.artifact_id
+            and actual.session_id == expected.session_id
+            and actual.task_id == expected.task_id
+            and actual.planner_run_id == expected.planner_run_id
+            and actual.artifact_type == expected.artifact_type
+            and actual.relative_path == expected.relative_path
+            and actual.sha256 == expected.sha256
+            and actual.size_bytes == expected.size_bytes
+            and actual.redacted == expected.redacted
+        )
+
+    def _finalize_published(
+        self,
+        artifacts: list[StagedArtifact],
+        operation_error: BaseException | None = None,
+    ) -> None:
+        for staged in artifacts:
+            try:
+                self._artifacts.finalize_staged(staged)
+            except BaseException as finalize_error:
+                failure = ChangeSetReconciliationRequired(
+                    "committed capture artifact could not be finalized"
+                )
+                if operation_error is not None:
+                    failure.add_note(f"commit-path error: {operation_error!r}")
+                raise failure from finalize_error
+
     def _stage_artifact(
         self,
         *,
@@ -868,11 +1062,13 @@ class ChangeSetRepository:
         self,
         artifacts: list[StagedArtifact],
         operation_error: BaseException,
-    ) -> None:
+    ) -> bool:
+        cleaned = True
         for staged in reversed(artifacts):
             try:
                 self._artifacts.abort_staged(staged)
             except Exception as cleanup_error:
+                cleaned = False
                 artifact_id = staged.record.artifact_id
                 operation_error.add_note(
                     f"ChangeSet artifact cleanup failed for {artifact_id}: {cleanup_error!r}"
@@ -881,6 +1077,7 @@ class ChangeSetRepository:
                     "ChangeSet artifact cleanup failed for %s",
                     artifact_id,
                 )
+        return cleaned
 
     async def _verified_record(self, row: aiosqlite.Row) -> ChangeSetRecord:
         try:

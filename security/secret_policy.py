@@ -21,12 +21,24 @@ _SECRET_PATTERNS = (
         r"[^\s/?#@]{1,1024}@[^\s<>'\"`,;]{1,2048}"
     ),
     re.compile(
-        r"(?i)\b(?:"
+        r"(?i)(?<![a-z0-9_])[\"']?[a-z0-9_.-]{0,64}(?:"
         r"api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
-        r"password|passwd|private[_-]?key|secret|"
+        r"oauth[_-]?token|refresh[_-]?token|password|passwd|"
+        r"private[_-]?key|secret|token|"
         r"database[_-]?url|db[_-]?url|sqlalchemy\.url"
-        r")\b\s*[=:]\s*"
+        r")[\"']?\s*[=:]\s*"
         r"(?:[\"'][^\"'\r\n]{1,4096}[\"']|[^\s,;]{1,4096})"
+    ),
+    re.compile(
+        r"(?is)<(?:"
+        r"accessToken|authToken|clientSecret|oauthToken|password|"
+        r"privateKey|refreshToken|secret|token"
+        r")\b[^>]{0,1024}>"
+        r".{1,4096}?"
+        r"</(?:"
+        r"accessToken|authToken|clientSecret|oauthToken|password|"
+        r"privateKey|refreshToken|secret|token"
+        r")\s*>"
     ),
 )
 

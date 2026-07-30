@@ -195,6 +195,26 @@ async def test_output_redaction_spans_reader_chunks_and_output_boundary() -> Non
             "sqlalchemy.url = oracle+cx_oracle://agent:ini-password@db/app",
             "ini-password",
         ),
+        (
+            'token = "cioabcdefghijklmnopqrstuvwxyz0123456789"',
+            "cioabcdefghijklmnopqrstuvwxyz0123456789",
+        ),
+        (
+            '"oauth_token": "oauth-value-that-must-be-redacted"',
+            "oauth-value-that-must-be-redacted",
+        ),
+        (
+            '{"accessToken":"camel-case-secret-value"}',
+            "camel-case-secret-value",
+        ),
+        (
+            "<server><password>maven-password-value</password></server>",
+            "maven-password-value",
+        ),
+        (
+            "repositoryPassword=gradle-password-value",
+            "gradle-password-value",
+        ),
         ("api_key=top-secret-value", "top-secret-value"),
     ],
 )
