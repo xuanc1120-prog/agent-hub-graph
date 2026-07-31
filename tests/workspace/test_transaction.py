@@ -141,6 +141,155 @@ def test_capture_delete_and_rename_then_restore(
     assert manager.state(repo).dirty is False
 
 
+def test_staged_rename_restores_source_target_and_index(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    baseline_index = manager.index_sha256(repo)
+    original = (repo / "src" / "example.py").read_bytes()
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    _git(repo, "mv", "src/example.py", "src/renamed.py")
+    result = transaction.capture_and_restore()
+
+    assert any(
+        change.action == FileAction.RENAMED
+        and change.old_path == "src/example.py"
+        and change.path == "src/renamed.py"
+        for change in result.manifest.changes
+    )
+    assert (repo / "src" / "example.py").read_bytes() == original
+    assert not (repo / "src" / "renamed.py").exists()
+    assert manager.index_sha256(repo) == baseline_index
+    assert manager.state(repo).dirty is False
+
+
+def test_staged_rename_then_edit_restores_both_inventory_paths(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    baseline_index = manager.index_sha256(repo)
+    original = (repo / "src" / "example.py").read_bytes()
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    _git(repo, "mv", "src/example.py", "src/renamed.py")
+    (repo / "src" / "renamed.py").write_text(
+        "renamed_and_modified = True\n",
+        encoding="utf-8",
+    )
+    result = transaction.capture_and_restore()
+
+    assert b"renamed_and_modified = True" in result.patch_bytes
+    assert (repo / "src" / "example.py").read_bytes() == original
+    assert not (repo / "src" / "renamed.py").exists()
+    assert manager.index_sha256(repo) == baseline_index
+    assert manager.state(repo).dirty is False
+
+
+def test_non_git_mode_change_fails_closed_after_exact_restore(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    target = repo / "src" / "example.py"
+    baseline_mode = target.stat().st_mode & 0o777
+    changed_mode = baseline_mode & ~0o222
+    if changed_mode == baseline_mode:
+        changed_mode = baseline_mode | 0o200
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    target.chmod(changed_mode)
+    assert target.stat().st_mode & 0o777 == changed_mode
+    with pytest.raises(WorkspaceTransactionError):
+        transaction.capture_and_restore()
+
+    assert target.stat().st_mode & 0o777 == baseline_mode
+    assert manager.state(repo).dirty is False
+
+
+def test_lstat_to_open_hardlink_swap_never_reads_or_overwrites_external_file(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    target = repo / "src" / "example.py"
+    original = target.read_bytes()
+    external = tmp_path / "outside-secret.txt"
+    external_secret = b"AWS_SECRET_ACCESS_KEY=OUTSIDE_SECRET\n"
+    external.write_bytes(external_secret)
+    displaced = tmp_path / "displaced-task-file.txt"
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+    original_assert = transaction._assert_plain_entry
+    target.write_text("task_change = True\n", encoding="utf-8")
+    swapped = False
+
+    def swap_after_lstat(path: Path, *, expect_directory: bool) -> None:
+        nonlocal swapped
+        original_assert(path, expect_directory=expect_directory)
+        if path == target and not expect_directory and not swapped:
+            swapped = True
+            os.replace(target, displaced)
+            os.link(external, target)
+
+    monkeypatch.setattr(transaction, "_assert_plain_entry", swap_after_lstat)
+
+    with pytest.raises(WorkspaceTransactionError):
+        transaction.capture_and_restore()
+
+    assert swapped is True
+    assert external.read_bytes() == external_secret
+    assert target.read_bytes() == original
+    assert manager.state(repo).dirty is False
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows symlink creation requires host-specific privileges",
+)
+def test_lstat_to_open_symlink_swap_never_reads_external_file(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    target = repo / "src" / "example.py"
+    original = target.read_bytes()
+    external = tmp_path / "outside-secret.txt"
+    external_secret = b"AWS_SECRET_ACCESS_KEY=OUTSIDE_SECRET\n"
+    external.write_bytes(external_secret)
+    displaced = tmp_path / "displaced-task-file.txt"
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+    original_assert = transaction._assert_plain_entry
+    target.write_text("task_change = True\n", encoding="utf-8")
+    swapped = False
+
+    def swap_after_lstat(path: Path, *, expect_directory: bool) -> None:
+        nonlocal swapped
+        original_assert(path, expect_directory=expect_directory)
+        if path == target and not expect_directory and not swapped:
+            swapped = True
+            os.replace(target, displaced)
+            target.symlink_to(external)
+
+    monkeypatch.setattr(transaction, "_assert_plain_entry", swap_after_lstat)
+
+    with pytest.raises(WorkspaceTransactionError):
+        transaction.capture_and_restore()
+
+    assert swapped is True
+    assert external.read_bytes() == external_secret
+    assert target.read_bytes() == original
+    assert manager.state(repo).dirty is False
+
+
 def test_ignored_preimages_are_restored_and_new_ignored_files_removed(
     fixture_source_repo: Path,
     tmp_path: Path,
@@ -183,6 +332,46 @@ def test_ignored_preimages_are_restored_and_new_ignored_files_removed(
     assert ignored_preimage.content == b"before\n"
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert not (cache / "new.txt").exists()
+    assert manager.state(repo).dirty is False
+
+
+def test_ignored_non_git_mode_change_fails_closed_after_exact_restore(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "-m",
+        "ignore cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    cache = repo / "cache"
+    cache.mkdir()
+    target = cache / "state.txt"
+    target.write_text("baseline\n", encoding="utf-8")
+    baseline_mode = target.stat().st_mode & 0o777
+    changed_mode = baseline_mode & ~0o222
+    if changed_mode == baseline_mode:
+        changed_mode = baseline_mode | 0o200
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    target.chmod(changed_mode)
+    assert target.stat().st_mode & 0o777 == changed_mode
+    with pytest.raises(WorkspaceTransactionError) as captured:
+        transaction.capture_and_restore()
+
+    assert target.read_text(encoding="utf-8") == "baseline\n"
+    assert target.stat().st_mode & 0o777 == baseline_mode, (
+        f"capture={captured.value!r}; cause={captured.value.__cause__!r}"
+    )
     assert manager.state(repo).dirty is False
 
 
@@ -265,6 +454,8 @@ def test_untouched_ignored_baseline_is_not_exported_as_a_preimage(
     [
         ".env",
         ".env.local",
+        ".envrc",
+        ".envrc.local",
         "credentials.json",
         ".netrc",
         ".npmrc",

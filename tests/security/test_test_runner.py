@@ -216,12 +216,33 @@ async def test_output_redaction_spans_reader_chunks_and_output_boundary() -> Non
             "gradle-password-value",
         ),
         ("api_key=top-secret-value", "top-secret-value"),
+        (
+            'export AWS_SECRET_ACCESS_KEY="aws-output-secret-value"',
+            "aws-output-secret-value",
+        ),
+        ('DB_PASS="database-output-password"', "database-output-password"),
     ],
 )
 def test_structured_credentials_are_redacted(value: str, secret: str) -> None:
     redacted = _redact_output(value)
 
     assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_normalized_assignment_redaction_spans_reader_chunks() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=512)
+    reader.feed_data(b"prefix export AWS_SECRET_ACC")
+    reader.feed_data(b'ESS_KEY="cross-chunk-aws-secret" suffix')
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+
+    assert "cross-chunk-aws-secret" not in redacted
+    assert "AWS_SECRET_ACCESS_KEY" not in redacted
     assert "[REDACTED]" in redacted
 
 

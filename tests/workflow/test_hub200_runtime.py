@@ -28,6 +28,7 @@ from protocol import (
 )
 from storage.db import Transaction
 from storage.errors import (
+    ChangeSetReconciliationRequired,
     ConcurrencyConflict,
     ContainmentViolation,
     LeaseLost,
@@ -498,6 +499,372 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         directory = application.services.artifacts.store.base_dir / artifact_type
         actual = {path.name for path in directory.iterdir()} if directory.exists() else set()
         assert actual == expected_by_type.get(artifact_type, set())
+
+
+@pytest.mark.parametrize(
+    "fault_kind",
+    [
+        "cancel_requested_at",
+        "duplicate_change_event",
+        "missing_finished_at",
+        "missing_change_event",
+        "missing_task_event",
+        "next_event_seq_gap",
+        "wrong_task_fencing_token",
+    ],
+)
+@pytest.mark.asyncio
+async def test_capture_commit_reconciliation_rejects_partial_durable_state(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_kind: str,
+) -> None:
+    application = WorkflowApplication(
+        Settings(
+            data_dir=tmp_path / "agent-hub-data",
+            master_lease_ttl_seconds=300,
+        )
+    )
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Reject an incomplete durable capture transaction.",
+        session_id=f"session-partial-commit-{fault_kind}",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id=f"workflow-partial-commit-{fault_kind}",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    database = application.services.database
+    original_transaction = database.immediate_transaction
+    original_persist = application.services.change_sets.persist_capture
+    injected = False
+    active_task_id: str | None = None
+    active_run_id: str | None = None
+
+    @asynccontextmanager
+    async def partially_committed_transaction() -> AsyncIterator[Transaction]:
+        async with database.connection() as connection:
+            cursor = await connection.execute("BEGIN IMMEDIATE")
+            await cursor.close()
+            try:
+                yield Transaction(connection)
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                assert active_task_id is not None
+                assert active_run_id is not None
+                await connection.commit()
+                cursor = await connection.execute("BEGIN IMMEDIATE")
+                await cursor.close()
+                if fault_kind == "cancel_requested_at":
+                    await connection.execute(
+                        """
+                        UPDATE workflow_runs
+                        SET cancel_requested_at = (
+                            SELECT finished_at FROM tasks WHERE id = ?
+                        )
+                        WHERE id = ?
+                        """,
+                        (active_task_id, active_run_id),
+                    )
+                elif fault_kind == "duplicate_change_event":
+                    await connection.execute(
+                        """
+                        INSERT INTO events(
+                            session_id, workflow_id, workflow_run_id, run_seq,
+                            event_type, actor_type, actor_id, payload_json, created_at
+                        )
+                        SELECT e.session_id, e.workflow_id, e.workflow_run_id,
+                               wr.next_event_seq, e.event_type, e.actor_type,
+                               e.actor_id, e.payload_json, e.created_at
+                        FROM events e
+                        JOIN workflow_runs wr ON wr.id = e.workflow_run_id
+                        WHERE e.workflow_run_id = ? AND e.event_type = ?
+                          AND json_extract(e.payload_json, '$.task_id') = ?
+                        ORDER BY e.run_seq DESC LIMIT 1
+                        """,
+                        (
+                            active_run_id,
+                            "workflow.change_set_state_changed",
+                            active_task_id,
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE workflow_runs SET next_event_seq = next_event_seq + 1
+                        WHERE id = ?
+                        """,
+                        (active_run_id,),
+                    )
+                elif fault_kind == "missing_finished_at":
+                    await connection.execute(
+                        "UPDATE tasks SET finished_at = NULL WHERE id = ?",
+                        (active_task_id,),
+                    )
+                elif fault_kind == "missing_change_event":
+                    await connection.execute(
+                        """
+                        DELETE FROM events
+                        WHERE workflow_run_id = ? AND event_type = ?
+                          AND json_extract(payload_json, '$.task_id') = ?
+                        """,
+                        (
+                            active_run_id,
+                            "workflow.change_set_state_changed",
+                            active_task_id,
+                        ),
+                    )
+                elif fault_kind == "missing_task_event":
+                    await connection.execute(
+                        """
+                        DELETE FROM events
+                        WHERE workflow_run_id = ? AND event_type = ?
+                          AND json_extract(payload_json, '$.task_id') = ?
+                        """,
+                        (
+                            active_run_id,
+                            "workflow.task_state_changed",
+                            active_task_id,
+                        ),
+                    )
+                elif fault_kind == "next_event_seq_gap":
+                    await connection.execute(
+                        "UPDATE workflow_runs SET next_event_seq = next_event_seq + 1 WHERE id = ?",
+                        (active_run_id,),
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE events
+                        SET payload_json = json_set(
+                            payload_json,
+                            '$.workspace_fencing_token',
+                            2147483647
+                        )
+                        WHERE workflow_run_id = ? AND event_type = ?
+                          AND json_extract(payload_json, '$.task_id') = ?
+                        """,
+                        (
+                            active_run_id,
+                            "workflow.task_state_changed",
+                            active_task_id,
+                        ),
+                    )
+                await connection.commit()
+                raise RuntimeError("injected partial commit-path exception")
+
+    async def persist_with_partial_commit(**kwargs: object):
+        nonlocal active_run_id, active_task_id, injected
+        if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
+            injected = True
+            active_task_id = str(kwargs["task_id"])
+            active_run_id = str(kwargs["workflow_run_id"])
+            monkeypatch.setattr(
+                database,
+                "immediate_transaction",
+                partially_committed_transaction,
+            )
+            try:
+                return await original_persist(**kwargs)
+            finally:
+                monkeypatch.setattr(
+                    database,
+                    "immediate_transaction",
+                    original_transaction,
+                )
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(
+        application.services.change_sets,
+        "persist_capture",
+        persist_with_partial_commit,
+    )
+
+    async with application.temporary_master() as lease:
+        with pytest.raises(ChangeSetReconciliationRequired):
+            await application.run(
+                workflow.workflow_id,
+                lease=lease,
+                workflow_run_id=f"run-partial-commit-{fault_kind}",
+            )
+
+    assert injected is True
+    assert application.services.git.state(session.shared_repo_path).dirty is False
+    assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
+    async with database.connection() as connection:
+        task = await connection.execute(
+            "SELECT status, finished_at FROM tasks WHERE id = ?",
+            (active_task_id,),
+        )
+        task_row = await task.fetchone()
+        await task.close()
+        node = await connection.execute(
+            "SELECT status, outcome, finished_at FROM node_runs WHERE workflow_run_id = ? "
+            "AND node_id = 'write-docs'",
+            (active_run_id,),
+        )
+        node_row = await node.fetchone()
+        await node.close()
+    assert task_row is not None and task_row["status"] == TaskStatus.SUCCEEDED.value
+    assert node_row is not None and node_row["status"] == NodeRunStatus.RUNNING.value
+    assert node_row["outcome"] is None
+    assert node_row["finished_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_abandoned_capture_reconciliation_requires_security_event(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = WorkflowApplication(
+        Settings(
+            data_dir=tmp_path / "agent-hub-data",
+            master_lease_ttl_seconds=300,
+        )
+    )
+    await application.initialize()
+    await application.register_mock_agent()
+    session = await application.create_session(
+        repo=fixture_source_repo,
+        goal="Require a complete audit trail for abandoned capture.",
+        session_id="session-abandoned-security-reconcile",
+    )
+    workflow = await application.services.workflows.create(
+        NewWorkflow(
+            workflow_id="workflow-abandoned-security-reconcile",
+            session_id=session.session_id,
+            author_graph=_docs_write_graph(),
+            layout=WorkflowLayout(),
+        )
+    )
+    agent_handler = application.services.registry.get_handler(_docs_write_graph().nodes[1])
+    original_cleanup = agent_handler._bundles.cleanup
+    cleanup_failed = False
+
+    async def fail_cleanup_once(task_id: str) -> CleanupResult:
+        nonlocal cleanup_failed
+        if not cleanup_failed:
+            cleanup_failed = True
+            return CleanupResult(removed_files=0, removed_dirs=0, errors=["injected"])
+        return await original_cleanup(task_id)
+
+    monkeypatch.setattr(agent_handler._bundles, "cleanup", fail_cleanup_once)
+    database = application.services.database
+    original_transaction = database.immediate_transaction
+    original_persist = application.services.change_sets.persist_capture
+    reconciliation_injected = False
+    active_task_id: str | None = None
+    active_run_id: str | None = None
+
+    @asynccontextmanager
+    async def missing_security_event_transaction() -> AsyncIterator[Transaction]:
+        async with database.connection() as connection:
+            cursor = await connection.execute("BEGIN IMMEDIATE")
+            await cursor.close()
+            try:
+                yield Transaction(connection)
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                assert active_task_id is not None
+                assert active_run_id is not None
+                await connection.commit()
+                cursor = await connection.execute("BEGIN IMMEDIATE")
+                await cursor.close()
+                await connection.execute(
+                    """
+                    DELETE FROM security_events
+                    WHERE workflow_run_id = ? AND task_id = ?
+                      AND event_type = 'changeset.state_rejected'
+                    """,
+                    (active_run_id, active_task_id),
+                )
+                await connection.commit()
+                raise RuntimeError("injected missing security event")
+
+    async def persist_without_security_event(**kwargs: object):
+        nonlocal active_run_id, active_task_id, reconciliation_injected
+        if not reconciliation_injected and kwargs["status"] == ChangeSetStatus.ABANDONED_PARTIAL:
+            reconciliation_injected = True
+            active_task_id = str(kwargs["task_id"])
+            active_run_id = str(kwargs["workflow_run_id"])
+            monkeypatch.setattr(
+                database,
+                "immediate_transaction",
+                missing_security_event_transaction,
+            )
+            try:
+                return await original_persist(**kwargs)
+            finally:
+                monkeypatch.setattr(
+                    database,
+                    "immediate_transaction",
+                    original_transaction,
+                )
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(
+        application.services.change_sets,
+        "persist_capture",
+        persist_without_security_event,
+    )
+
+    async with application.temporary_master() as lease:
+        with pytest.raises(ChangeSetReconciliationRequired):
+            await application.run(
+                workflow.workflow_id,
+                lease=lease,
+                workflow_run_id="run-abandoned-security-reconcile",
+            )
+
+    assert cleanup_failed is True
+    assert reconciliation_injected is True
+    assert application.services.git.state(session.shared_repo_path).dirty is False
+    assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
+    async with database.connection() as connection:
+        task = await connection.execute(
+            "SELECT status, finished_at FROM tasks WHERE id = ?",
+            (active_task_id,),
+        )
+        task_row = await task.fetchone()
+        await task.close()
+        change = await connection.execute(
+            "SELECT status FROM change_sets WHERE task_id = ?",
+            (active_task_id,),
+        )
+        change_row = await change.fetchone()
+        await change.close()
+        node = await connection.execute(
+            "SELECT status, outcome, finished_at FROM node_runs WHERE workflow_run_id = ? "
+            "AND node_id = 'write-docs'",
+            (active_run_id,),
+        )
+        node_row = await node.fetchone()
+        await node.close()
+        security = await connection.execute(
+            "SELECT COUNT(*) FROM security_events WHERE workflow_run_id = ? AND task_id = ?",
+            (active_run_id, active_task_id),
+        )
+        security_count = int((await security.fetchone())[0])
+        await security.close()
+    assert task_row is not None and task_row["status"] == TaskStatus.FAILED.value
+    assert task_row["finished_at"] is not None
+    assert change_row is not None
+    assert change_row["status"] == ChangeSetStatus.ABANDONED_PARTIAL.value
+    assert node_row is not None and node_row["status"] == NodeRunStatus.RUNNING.value
+    assert node_row["outcome"] is None
+    assert node_row["finished_at"] is None
+    assert security_count == 0
 
 
 @pytest.mark.asyncio

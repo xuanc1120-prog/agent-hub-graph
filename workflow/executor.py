@@ -13,7 +13,7 @@ from protocol import (
     canonical_json,
 )
 from storage.artifact_repository import ArtifactRepository
-from storage.errors import LeaseLost
+from storage.errors import ChangeSetReconciliationRequired, LeaseLost
 from storage.leases import MasterLease
 from storage.repositories import SessionRepository
 from storage.workflow_run_repository import (
@@ -91,7 +91,7 @@ class GraphExecutor:
             if not isinstance(raw_result, NodeHandlerResult):
                 raise TypeError("NodeHandler returned an untyped result")
             result = raw_result
-        except LeaseLost:
+        except (ChangeSetReconciliationRequired, LeaseLost):
             raise
         except Exception:
             result = NodeHandlerResult(

@@ -51,6 +51,8 @@ def test_validates_separate_existing_and_new_exact_scope(repo: Path) -> None:
         "CLAUDE.md",
         "opencode.json",
         ".env",
+        ".envrc",
+        ".envrc.local",
         ".netrc",
         ".npmrc",
         ".pypirc",

@@ -364,7 +364,7 @@ class AgentTaskNodeHandler:
                 summary=agent_result.summary or "MockAgent execution failed.",
                 error_code=code,
             )
-        except LeaseLost:
+        except (ChangeSetReconciliationRequired, LeaseLost):
             raise
         except Exception as exc:
             if task_started and not node.requires_write:

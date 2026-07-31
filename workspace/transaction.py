@@ -22,6 +22,12 @@ from workspace.git_manager import (
     GitMetadataSeal,
     RepositoryState,
 )
+from workspace.secure_file import (
+    SecureFileError,
+    assert_path_identity,
+    open_verified_binary,
+    set_verified_mode,
+)
 
 
 class WorkspaceTransactionError(RuntimeError):
@@ -208,7 +214,6 @@ class WorkspaceTransaction:
             sorted(self._baseline_ignored | frozenset(current_state.ignored_files))
         )
         ignored_touched = ignored_candidates
-        restore_paths.update(ignored_candidates)
         result: CapturedWorkspaceChangeSet | None = None
         capture_error: BaseException | None = None
         try:
@@ -218,11 +223,11 @@ class WorkspaceTransaction:
                     key=lambda path: (path.count("/"), path),
                 )
             )
-            after = self._scan_inventory(seal_paths=frozenset(restore_paths))
+            after = self._scan_inventory()
+            restore_paths.update(self._inventory_changed_paths(baseline, after))
+            after = self._seal_inventory_paths(after, restore_paths)
             ignored_touched = self._ignored_changes(after, current_state)
             self._validate_ignored_capture(ignored_touched, after)
-            restore_paths.difference_update(ignored_candidates)
-            restore_paths.update(ignored_touched)
             self._validate_changed_paths(restore_paths, after)
             self._assert_sealed_paths_current(restore_paths, after)
             excluded_ignored = (
@@ -408,6 +413,17 @@ class WorkspaceTransaction:
             base_commit=self._base_commit,
             paths=tracked_existing,
         )
+        baseline = self._require_baseline_inventory()
+        for path in tracked_existing:
+            snapshot = baseline.files.get(path)
+            if snapshot is None:
+                continue
+            try:
+                set_verified_mode(self._repo, path, snapshot.mode)
+            except SecureFileError as error:
+                raise WorkspaceRestoreError(
+                    f"tracked file mode restoration failed: {path}"
+                ) from error
         self._git.unstage_new_paths(self._repo, untracked_new)
         for path in untracked_new:
             self._remove_exact_new_file(path)
@@ -510,7 +526,7 @@ class WorkspaceTransaction:
                 self._assert_plain_entry(child, expect_directory=False)
                 relative = self._relative_path(child, root=root)
                 snapshot, content = self._snapshot_file(
-                    child,
+                    root,
                     relative,
                     capture_content=relative in seal_paths,
                 )
@@ -533,6 +549,38 @@ class WorkspaceTransaction:
             directories=tuple(sorted(directories)),
             state_hash=state_hash,
             total_bytes=total_bytes,
+            sealed_files=sealed_files,
+        )
+
+    def _seal_inventory_paths(
+        self,
+        inventory: _Inventory,
+        paths: set[str],
+    ) -> _Inventory:
+        sealed_files = dict(inventory.sealed_files)
+        sealed_bytes = sum(item.size_bytes for item in sealed_files.values())
+        for path in sorted(paths):
+            expected = inventory.files.get(path)
+            if expected is None or path in sealed_files:
+                continue
+            current, sealed = self._snapshot_file(
+                self._repo,
+                path,
+                capture_content=True,
+            )
+            if sealed is None or current != expected:
+                raise WorkspaceTransactionError(
+                    f"workspace path changed while content was sealed: {path}"
+                )
+            sealed_files[path] = sealed
+            sealed_bytes += sealed.size_bytes
+            if sealed_bytes > self._max_sealed_bytes:
+                raise WorkspaceTransactionError("workspace sealed content byte limit exceeded")
+        return _Inventory(
+            files=inventory.files,
+            directories=inventory.directories,
+            state_hash=inventory.state_hash,
+            total_bytes=inventory.total_bytes,
             sealed_files=sealed_files,
         )
 
@@ -651,7 +699,7 @@ class WorkspaceTransaction:
                     f"workspace path disappeared after inventory: {path}"
                 )
             current, sealed = self._snapshot_file(
-                validated.absolute_path,
+                self._repo,
                 path,
                 capture_content=True,
             )
@@ -663,6 +711,17 @@ class WorkspaceTransaction:
                 or sealed != expected_sealed
             ):
                 raise WorkspaceTransactionError(f"workspace path changed after inventory: {path}")
+
+    @staticmethod
+    def _inventory_changed_paths(
+        before: _Inventory,
+        after: _Inventory,
+    ) -> set[str]:
+        return {
+            path
+            for path in before.files.keys() | after.files.keys()
+            if before.files.get(path) != after.files.get(path)
+        }
 
     def _ignored_changes(
         self,
@@ -824,7 +883,7 @@ class WorkspaceTransaction:
 
     @staticmethod
     def _snapshot_file(
-        path: Path,
+        root: Path,
         relative: str,
         *,
         capture_content: bool,
@@ -833,30 +892,32 @@ class WorkspaceTransaction:
         size = 0
         binary = False
         captured = bytearray() if capture_content else None
-        with path.open("rb") as stream:
-            before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink > 1:
-                raise WorkspaceTransactionError(
-                    f"workspace file changed identity during inventory: {relative}"
-                )
-            while chunk := stream.read(1024 * 1024):
-                if size == 0 and b"\0" in chunk[:8192]:
-                    binary = True
-                digest.update(chunk)
-                size += len(chunk)
-                if captured is not None:
-                    captured.extend(chunk)
-            after = os.fstat(stream.fileno())
-        path_metadata = path.stat()
+        try:
+            with open_verified_binary(root, relative) as stream:
+                before = os.fstat(stream.fileno())
+                while chunk := stream.read(1024 * 1024):
+                    if size == 0 and b"\0" in chunk[:8192]:
+                        binary = True
+                    digest.update(chunk)
+                    size += len(chunk)
+                    if captured is not None:
+                        captured.extend(chunk)
+                after = os.fstat(stream.fileno())
+        except SecureFileError as error:
+            raise WorkspaceTransactionError(
+                f"workspace file could not be safely opened: {relative}"
+            ) from error
         stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
         if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
             raise WorkspaceTransactionError(
                 f"workspace file changed while inventory was read: {relative}"
             )
-        if not os.path.samestat(after, path_metadata):
+        try:
+            assert_path_identity(root, relative, after)
+        except SecureFileError as error:
             raise WorkspaceTransactionError(
                 f"workspace file was replaced while inventory was read: {relative}"
-            )
+            ) from error
         snapshot = FileSnapshot(
             path=relative,
             sha256=digest.hexdigest(),
@@ -1022,6 +1083,12 @@ def materialize_workspace_preimages(
                 raise WorkspaceRestoreError(
                     f"preimage path is not a plain single-link file: {preimage.path}"
                 )
+            try:
+                set_verified_mode(root, preimage.path, preimage.mode | stat.S_IWUSR)
+            except SecureFileError as error:
+                raise WorkspaceRestoreError(
+                    f"preimage target could not be prepared: {preimage.path}"
+                ) from error
         temporary = target.parent / f".{target.name}.agent-hub-{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("xb") as stream:
@@ -1030,6 +1097,12 @@ def materialize_workspace_preimages(
                 os.fsync(stream.fileno())
             os.chmod(temporary, preimage.mode)
             os.replace(temporary, target)
+            try:
+                set_verified_mode(root, preimage.path, preimage.mode)
+            except SecureFileError as error:
+                raise WorkspaceRestoreError(
+                    f"preimage mode restoration failed: {preimage.path}"
+                ) from error
         finally:
             temporary.unlink(missing_ok=True)
 

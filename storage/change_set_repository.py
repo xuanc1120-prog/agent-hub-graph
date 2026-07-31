@@ -30,7 +30,7 @@ from storage.artifact_repository import (
     ArtifactRepository,
     StagedArtifact,
 )
-from storage.db import Database, Transaction, utc_now_text
+from storage.db import Database, Transaction, normalize_utc, utc_now_text
 from storage.errors import (
     ChangeSetIntegrityError,
     ChangeSetReconciliationRequired,
@@ -307,7 +307,8 @@ class ChangeSetRepository:
                 preimages=tuple(preimage_bindings),
             )
             manifest_json = canonical_json(document).decode("utf-8")
-            timestamp = utc_now_text(now)
+            event_now = normalize_utc(now)
+            timestamp = utc_now_text(event_now)
             result = self._record_from_document(
                 change_set_id=change_set_id,
                 session_id=session_id,
@@ -323,13 +324,13 @@ class ChangeSetRepository:
                 await self._master_leases.assert_valid_in(
                     transaction,
                     master_lease,
-                    now=now,
+                    now=event_now,
                 )
                 await self._locks.assert_valid_in(
                     transaction,
                     workspace_lease,
                     session_id=session_id,
-                    now=now,
+                    now=event_now,
                 )
                 if (
                     workspace_lease.owner_kind != "agent_task"
@@ -350,12 +351,8 @@ class ChangeSetRepository:
                     "SELECT * FROM change_sets WHERE task_id = ?",
                     (task_id,),
                 )
-                if existing is not None and (
-                    str(existing["id"]) != change_set_id
-                    or str(existing["manifest_json"]) != manifest_json
-                    or str(existing["status"]) != status.value
-                ):
-                    raise ConcurrencyConflict("task already owns a different ChangeSet capture")
+                if existing is not None:
+                    raise ConcurrencyConflict("running task already owns a ChangeSet capture")
                 for staged in staged_artifacts:
                     _record, created = await self._artifacts.publish_staged_in(
                         transaction,
@@ -364,21 +361,20 @@ class ChangeSetRepository:
                     )
                     if created:
                         published_artifacts.append(staged)
-                if existing is None:
-                    await self._insert_capture_in(
-                        transaction,
-                        lineage=lineage,
-                        document=document,
-                        change_set_id=change_set_id,
-                        task_id=task_id,
-                        node_run_id=node_run_id,
-                        status=status,
-                        reason=reason,
-                        master_lease=master_lease,
-                        workspace_lease=workspace_lease,
-                        timestamp=timestamp,
-                        now=now,
-                    )
+                await self._insert_capture_in(
+                    transaction,
+                    lineage=lineage,
+                    document=document,
+                    change_set_id=change_set_id,
+                    task_id=task_id,
+                    node_run_id=node_run_id,
+                    status=status,
+                    reason=reason,
+                    master_lease=master_lease,
+                    workspace_lease=workspace_lease,
+                    timestamp=timestamp,
+                    now=event_now,
+                )
                 await self._finish_task_in(
                     transaction,
                     lineage=lineage,
@@ -388,7 +384,7 @@ class ChangeSetRepository:
                     master_lease=master_lease,
                     workspace_lease=workspace_lease,
                     timestamp=timestamp,
-                    now=now,
+                    now=event_now,
                 )
                 transaction_body_completed = True
         except BaseException as operation_error:
@@ -399,6 +395,7 @@ class ChangeSetRepository:
                     ) from operation_error
                 raise
             outcome = await self._reconcile_capture_commit(
+                session_id=session_id,
                 task_id=task_id,
                 node_run_id=node_run_id,
                 task_target=task_target,
@@ -408,6 +405,13 @@ class ChangeSetRepository:
                 staged_artifacts=staged_artifacts,
                 published_artifacts=published_artifacts,
                 operation_error=operation_error,
+                expected_record=result,
+                task_error_code=task_error_code,
+                reason=reason,
+                timestamp=timestamp,
+                master_instance_id=master_lease.instance_id,
+                master_fencing_token=master_lease.fencing_token,
+                workspace_fencing_token=workspace_lease.fencing_token,
             )
             if outcome == "rolled_back":
                 if not self._abort_staged_artifacts(staged_artifacts, operation_error):
@@ -873,6 +877,7 @@ class ChangeSetRepository:
     async def _reconcile_capture_commit(
         self,
         *,
+        session_id: str,
         task_id: str,
         node_run_id: str,
         task_target: TaskStatus,
@@ -882,6 +887,13 @@ class ChangeSetRepository:
         staged_artifacts: list[StagedArtifact],
         published_artifacts: list[StagedArtifact],
         operation_error: BaseException,
+        expected_record: ChangeSetRecord,
+        task_error_code: str | None,
+        reason: str | None,
+        timestamp: str,
+        master_instance_id: str,
+        master_fencing_token: int,
+        workspace_fencing_token: int,
     ) -> str:
         """Determine whether SQLite committed after its commit path raised."""
 
@@ -905,16 +917,66 @@ class ChangeSetRepository:
                     change_row = await cursor.fetchone()
                     await cursor.close()
                     cursor = await connection.execute(
-                        "SELECT status FROM tasks WHERE id = ?",
+                        "SELECT * FROM tasks WHERE id = ?",
                         (task_id,),
                     )
                     task_row = await cursor.fetchone()
                     await cursor.close()
                     cursor = await connection.execute(
-                        "SELECT change_set_id FROM node_runs WHERE id = ?",
+                        "SELECT * FROM node_runs WHERE id = ?",
                         (node_run_id,),
                     )
                     node_row = await cursor.fetchone()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        """
+                        SELECT wr.session_id, wr.workflow_id, wr.status,
+                               wr.cancel_requested_at, wr.next_event_seq,
+                               COALESCE(
+                                   (
+                                       SELECT MAX(e.run_seq) + 1
+                                       FROM events e
+                                       WHERE e.workflow_run_id = wr.id
+                                   ),
+                                   1
+                               ) AS durable_next_event_seq
+                        FROM workflow_runs wr WHERE wr.id = ?
+                        """,
+                        (expected_record.change_set.workflow_run_id,),
+                    )
+                    run_row = await cursor.fetchone()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        """
+                        SELECT * FROM events
+                        WHERE workflow_run_id = ? AND created_at = ?
+                          AND event_type IN (?, ?)
+                        ORDER BY run_seq
+                        """,
+                        (
+                            expected_record.change_set.workflow_run_id,
+                            timestamp,
+                            CHANGE_SET_STATE_CHANGED,
+                            TASK_STATE_CHANGED,
+                        ),
+                    )
+                    event_rows = await cursor.fetchall()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        """
+                        SELECT * FROM security_events
+                        WHERE workflow_run_id = ? AND task_id = ?
+                          AND event_type = ? AND created_at = ?
+                        ORDER BY id
+                        """,
+                        (
+                            expected_record.change_set.workflow_run_id,
+                            task_id,
+                            "changeset.state_rejected",
+                            timestamp,
+                        ),
+                    )
+                    security_rows = await cursor.fetchall()
                     await cursor.close()
                 finally:
                     await connection.rollback()
@@ -930,16 +992,111 @@ class ChangeSetRepository:
             and self._artifact_row_matches(row, staged.record)
             for staged in staged_artifacts
         )
-        change_committed = (
-            change_row is not None
-            and str(change_row["id"]) == change_set_id
-            and str(change_row["task_id"]) == task_id
-            and str(change_row["manifest_json"]) == manifest_json
-            and str(change_row["status"]) == status.value
+        change_committed = change_row is not None and self._change_row_matches(
+            change_row,
+            expected_record,
+            manifest_json,
         )
-        task_committed = task_row is not None and str(task_row["status"]) == task_target.value
-        node_committed = node_row is not None and str(node_row["change_set_id"]) == change_set_id
-        if artifacts_committed and change_committed and task_committed and node_committed:
+        task_committed = (
+            task_row is not None
+            and str(task_row["id"]) == task_id
+            and str(task_row["node_run_id"]) == node_run_id
+            and str(task_row["status"]) == task_target.value
+            and str(task_row["finished_at"]) == timestamp
+        )
+        node_committed = (
+            node_row is not None
+            and str(node_row["id"]) == node_run_id
+            and str(node_row["workflow_run_id"]) == expected_record.change_set.workflow_run_id
+            and str(node_row["status"]) == "running"
+            and str(node_row["change_set_id"]) == change_set_id
+            and node_row["outcome"] is None
+            and node_row["error_code"] is None
+            and node_row["finished_at"] is None
+        )
+        expected_change_payload = canonical_json(
+            ChangeSetEventPayload(
+                master_fencing_token=master_fencing_token,
+                workspace_fencing_token=workspace_fencing_token,
+                workflow_run_id=expected_record.change_set.workflow_run_id,
+                node_run_id=node_run_id,
+                task_id=task_id,
+                change_set_id=change_set_id,
+                previous_status=None,
+                status=status,
+                patch_sha256=expected_record.change_set.patch_sha256,
+                reason=reason,
+            )
+        ).decode("utf-8")
+        expected_task_payload = canonical_json(
+            TaskEventPayload(
+                master_fencing_token=master_fencing_token,
+                workspace_fencing_token=workspace_fencing_token,
+                workflow_run_id=expected_record.change_set.workflow_run_id,
+                node_run_id=node_run_id,
+                task_id=task_id,
+                previous_status=TaskStatus.RUNNING,
+                status=task_target,
+                error_code=task_error_code,
+            )
+        ).decode("utf-8")
+        run_consistent = (
+            run_row is not None
+            and str(run_row["session_id"]) == session_id
+            and str(run_row["status"]) == "running"
+            and run_row["cancel_requested_at"] is None
+            and int(run_row["next_event_seq"]) == int(run_row["durable_next_event_seq"])
+        )
+        events_committed = (
+            run_consistent
+            and len(event_rows) == 2
+            and self._event_row_matches(
+                event_rows[0],
+                session_id=session_id,
+                workflow_id=str(run_row["workflow_id"]),
+                workflow_run_id=expected_record.change_set.workflow_run_id,
+                event_type=CHANGE_SET_STATE_CHANGED,
+                actor_type=ActorType.SYSTEM.value,
+                actor_id=None,
+                payload_json=expected_change_payload,
+                timestamp=timestamp,
+            )
+            and self._event_row_matches(
+                event_rows[1],
+                session_id=session_id,
+                workflow_id=str(run_row["workflow_id"]),
+                workflow_run_id=expected_record.change_set.workflow_run_id,
+                event_type=TASK_STATE_CHANGED,
+                actor_type=ActorType.MASTER.value,
+                actor_id=master_instance_id,
+                payload_json=expected_task_payload,
+                timestamp=timestamp,
+            )
+            and int(event_rows[1]["run_seq"]) == int(event_rows[0]["run_seq"]) + 1
+            and int(run_row["next_event_seq"]) == int(event_rows[1]["run_seq"]) + 1
+        )
+        security_committed = self._security_events_match(
+            security_rows,
+            session_id=session_id,
+            workflow_run_id=expected_record.change_set.workflow_run_id,
+            task_id=task_id,
+            change_set_id=change_set_id,
+            status=status,
+            reason=reason,
+            master_fencing_token=master_fencing_token,
+            workspace_fencing_token=workspace_fencing_token,
+            timestamp=timestamp,
+        )
+        if all(
+            (
+                artifacts_committed,
+                change_committed,
+                task_committed,
+                node_committed,
+                events_committed,
+                security_committed,
+            )
+        ):
             try:
                 for staged in staged_artifacts:
                     metadata, content = await self._artifacts.get_and_verify(
@@ -970,9 +1127,20 @@ class ChangeSetRepository:
             published_rows_absent
             and change_row is None
             and task_row is not None
+            and str(task_row["id"]) == task_id
+            and str(task_row["node_run_id"]) == node_run_id
             and str(task_row["status"]) == TaskStatus.RUNNING.value
+            and task_row["finished_at"] is None
             and node_row is not None
+            and str(node_row["id"]) == node_run_id
+            and str(node_row["status"]) == "running"
             and node_row["change_set_id"] is None
+            and node_row["outcome"] is None
+            and node_row["error_code"] is None
+            and node_row["finished_at"] is None
+            and run_consistent
+            and not event_rows
+            and not security_rows
         )
         if transaction_rolled_back:
             return "rolled_back"
@@ -984,9 +1152,96 @@ class ChangeSetRepository:
         failure.add_note(
             "reconciliation flags: "
             f"artifacts={artifacts_committed}, change_set={change_committed}, "
-            f"task={task_committed}, node={node_committed}"
+            f"task={task_committed}, node={node_committed}, "
+            f"events={events_committed}, security={security_committed}"
         )
         raise failure
+
+    @staticmethod
+    def _change_row_matches(
+        row: aiosqlite.Row,
+        expected: ChangeSetRecord,
+        manifest_json: str,
+    ) -> bool:
+        change_set = expected.change_set
+        return (
+            str(row["id"]) == change_set.change_set_id
+            and str(row["task_id"]) == change_set.task_id
+            and str(row["base_commit"]) == change_set.base_commit
+            and str(row["pre_state_hash"]) == change_set.pre_state_hash
+            and str(row["post_state_hash"]) == change_set.post_state_hash
+            and str(row["patch_sha256"]) == change_set.patch_sha256
+            and str(row["manifest_json"]) == manifest_json
+            and str(row["patch_artifact_id"]) == change_set.canonical_patch_ref.artifact_id
+            and str(row["status"]) == change_set.status.value
+            and str(row["created_at"]) == expected.created_at
+            and str(row["updated_at"]) == expected.updated_at
+        )
+
+    @staticmethod
+    def _event_row_matches(
+        row: aiosqlite.Row,
+        *,
+        session_id: str,
+        workflow_id: str,
+        workflow_run_id: str,
+        event_type: str,
+        actor_type: str,
+        actor_id: str | None,
+        payload_json: str,
+        timestamp: str,
+    ) -> bool:
+        return (
+            str(row["session_id"]) == session_id
+            and str(row["workflow_id"]) == workflow_id
+            and str(row["workflow_run_id"]) == workflow_run_id
+            and row["run_seq"] is not None
+            and int(row["run_seq"]) >= 1
+            and str(row["event_type"]) == event_type
+            and str(row["actor_type"]) == actor_type
+            and (str(row["actor_id"]) if row["actor_id"] is not None else None) == actor_id
+            and str(row["payload_json"]) == payload_json
+            and str(row["created_at"]) == timestamp
+        )
+
+    @staticmethod
+    def _security_events_match(
+        rows: list[aiosqlite.Row],
+        *,
+        session_id: str,
+        workflow_run_id: str,
+        task_id: str,
+        change_set_id: str,
+        status: ChangeSetStatus,
+        reason: str | None,
+        master_fencing_token: int,
+        workspace_fencing_token: int,
+        timestamp: str,
+    ) -> bool:
+        if status != ChangeSetStatus.ABANDONED_PARTIAL:
+            return not rows
+        if len(rows) != 1:
+            return False
+        expected_payload = canonical_json(
+            SecurityChangeSetPayload(
+                change_set_id=change_set_id,
+                previous_status=None,
+                status=status,
+                reason=reason or "AgentTask failed after modifying the workspace",
+                master_fencing_token=master_fencing_token,
+                workspace_fencing_token=workspace_fencing_token,
+            )
+        ).decode("utf-8")
+        row = rows[0]
+        return (
+            str(row["session_id"]) == session_id
+            and str(row["workflow_run_id"]) == workflow_run_id
+            and str(row["task_id"]) == task_id
+            and str(row["event_type"]) == "changeset.state_rejected"
+            and str(row["severity"]) == SecuritySeverity.HIGH.value
+            and str(row["payload_json"]) == expected_payload
+            and str(row["created_at"]) == timestamp
+        )
 
     @staticmethod
     def _artifact_row_matches(
@@ -1004,6 +1259,7 @@ class ChangeSetRepository:
             and str(row["sha256"]) == expected.sha256
             and int(row["size_bytes"]) == expected.size_bytes
             and bool(row["redacted"]) == expected.redacted
+            and str(row["created_at"]) == expected.created_at
         )
 
     @staticmethod

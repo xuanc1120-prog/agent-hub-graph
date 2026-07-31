@@ -19,6 +19,7 @@ _DOS_RESERVED_NAMES = frozenset(
 _SHORT_NAME_PATTERN = re.compile(r"^.+~[0-9]+(?:\..*)?$", re.IGNORECASE)
 _SECRET_BASENAMES = frozenset(
     {
+        ".envrc",
         ".netrc",
         ".npmrc",
         ".terraformrc",
@@ -277,6 +278,7 @@ class PathPolicy:
         if not allow_sensitive and (
             basename == ".env"
             or basename.startswith(".env.")
+            or basename.startswith(".envrc.")
             or basename in _SECRET_BASENAMES
             or basename.endswith((".pem", ".key", ".p12", ".pfx"))
         ):
