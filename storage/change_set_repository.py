@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -394,25 +395,40 @@ class ChangeSetRepository:
                         "capture rollback left artifact cleanup incomplete"
                     ) from operation_error
                 raise
-            outcome = await self._reconcile_capture_commit(
-                session_id=session_id,
-                task_id=task_id,
-                node_run_id=node_run_id,
-                task_target=task_target,
-                change_set_id=change_set_id,
-                manifest_json=manifest_json,
-                status=status,
-                staged_artifacts=staged_artifacts,
-                published_artifacts=published_artifacts,
-                operation_error=operation_error,
-                expected_record=result,
-                task_error_code=task_error_code,
-                reason=reason,
-                timestamp=timestamp,
-                master_instance_id=master_lease.instance_id,
-                master_fencing_token=master_lease.fencing_token,
-                workspace_fencing_token=workspace_lease.fencing_token,
+            reconciliation = asyncio.create_task(
+                self._reconcile_capture_commit(
+                    session_id=session_id,
+                    task_id=task_id,
+                    node_run_id=node_run_id,
+                    task_target=task_target,
+                    change_set_id=change_set_id,
+                    manifest_json=manifest_json,
+                    status=status,
+                    staged_artifacts=staged_artifacts,
+                    published_artifacts=published_artifacts,
+                    operation_error=operation_error,
+                    expected_record=result,
+                    task_error_code=task_error_code,
+                    reason=reason,
+                    timestamp=timestamp,
+                    master_instance_id=master_lease.instance_id,
+                    master_fencing_token=master_lease.fencing_token,
+                    workspace_fencing_token=workspace_lease.fencing_token,
+                )
             )
+            deferred_cancellation: asyncio.CancelledError | None = None
+            while not reconciliation.done():
+                try:
+                    await asyncio.shield(reconciliation)
+                except asyncio.CancelledError as cancellation:
+                    deferred_cancellation = cancellation
+            if reconciliation.cancelled():
+                failure = ChangeSetReconciliationRequired(
+                    "capture commit reconciliation was cancelled before producing an outcome"
+                )
+                failure.add_note(f"commit-path error: {operation_error!r}")
+                raise failure from deferred_cancellation
+            outcome = reconciliation.result()
             if outcome == "rolled_back":
                 if not self._abort_staged_artifacts(staged_artifacts, operation_error):
                     raise ChangeSetReconciliationRequired(
@@ -421,8 +437,24 @@ class ChangeSetRepository:
                 operation_error.add_note(
                     "capture transaction rolled back; published artifacts were removed"
                 )
+                if deferred_cancellation is not None:
+                    deferred_cancellation.add_note(
+                        "cancellation was deferred until capture rollback cleanup completed"
+                    )
+                    raise deferred_cancellation from None
                 raise
             self._finalize_published(published_artifacts, operation_error)
+            control_error: BaseException | None = deferred_cancellation
+            if control_error is None and isinstance(
+                operation_error,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                control_error = operation_error
+            if control_error is not None:
+                control_error.add_note(
+                    "control-flow interruption was deferred until committed artifacts finalized"
+                )
+                raise control_error from None
             _LOGGER.warning(
                 "Capture commit succeeded despite commit-path exception: %r",
                 operation_error,
@@ -949,31 +981,53 @@ class ChangeSetRepository:
                     cursor = await connection.execute(
                         """
                         SELECT * FROM events
-                        WHERE workflow_run_id = ? AND created_at = ?
-                          AND event_type IN (?, ?)
+                        WHERE workflow_run_id = ? AND event_type = ?
+                          AND json_extract(payload_json, '$.task_id') = ?
+                          AND json_extract(payload_json, '$.change_set_id') = ?
+                          AND json_type(payload_json, '$.previous_status') = 'null'
                         ORDER BY run_seq
                         """,
                         (
                             expected_record.change_set.workflow_run_id,
-                            timestamp,
                             CHANGE_SET_STATE_CHANGED,
-                            TASK_STATE_CHANGED,
+                            task_id,
+                            change_set_id,
                         ),
                     )
-                    event_rows = await cursor.fetchall()
+                    change_event_rows = await cursor.fetchall()
+                    await cursor.close()
+                    cursor = await connection.execute(
+                        """
+                        SELECT * FROM events
+                        WHERE workflow_run_id = ? AND event_type = ?
+                          AND json_extract(payload_json, '$.task_id') = ?
+                          AND json_extract(payload_json, '$.previous_status') = ?
+                          AND json_extract(payload_json, '$.status') = ?
+                        ORDER BY run_seq
+                        """,
+                        (
+                            expected_record.change_set.workflow_run_id,
+                            TASK_STATE_CHANGED,
+                            task_id,
+                            TaskStatus.RUNNING.value,
+                            task_target.value,
+                        ),
+                    )
+                    task_event_rows = await cursor.fetchall()
                     await cursor.close()
                     cursor = await connection.execute(
                         """
                         SELECT * FROM security_events
                         WHERE workflow_run_id = ? AND task_id = ?
-                          AND event_type = ? AND created_at = ?
+                          AND event_type = ?
+                          AND json_extract(payload_json, '$.change_set_id') = ?
                         ORDER BY id
                         """,
                         (
                             expected_record.change_set.workflow_run_id,
                             task_id,
                             "changeset.state_rejected",
-                            timestamp,
+                            change_set_id,
                         ),
                     )
                     security_rows = await cursor.fetchall()
@@ -1040,18 +1094,22 @@ class ChangeSetRepository:
                 error_code=task_error_code,
             )
         ).decode("utf-8")
-        run_consistent = (
+        run_sequence_consistent = (
             run_row is not None
             and str(run_row["session_id"]) == session_id
-            and str(run_row["status"]) == "running"
-            and run_row["cancel_requested_at"] is None
             and int(run_row["next_event_seq"]) == int(run_row["durable_next_event_seq"])
         )
+        run_accepts_capture = (
+            run_sequence_consistent
+            and str(run_row["status"]) == "running"
+            and run_row["cancel_requested_at"] is None
+        )
         events_committed = (
-            run_consistent
-            and len(event_rows) == 2
+            run_accepts_capture
+            and len(change_event_rows) == 1
+            and len(task_event_rows) == 1
             and self._event_row_matches(
-                event_rows[0],
+                change_event_rows[0],
                 session_id=session_id,
                 workflow_id=str(run_row["workflow_id"]),
                 workflow_run_id=expected_record.change_set.workflow_run_id,
@@ -1062,7 +1120,7 @@ class ChangeSetRepository:
                 timestamp=timestamp,
             )
             and self._event_row_matches(
-                event_rows[1],
+                task_event_rows[0],
                 session_id=session_id,
                 workflow_id=str(run_row["workflow_id"]),
                 workflow_run_id=expected_record.change_set.workflow_run_id,
@@ -1072,8 +1130,8 @@ class ChangeSetRepository:
                 payload_json=expected_task_payload,
                 timestamp=timestamp,
             )
-            and int(event_rows[1]["run_seq"]) == int(event_rows[0]["run_seq"]) + 1
-            and int(run_row["next_event_seq"]) == int(event_rows[1]["run_seq"]) + 1
+            and int(task_event_rows[0]["run_seq"]) == int(change_event_rows[0]["run_seq"]) + 1
+            and int(run_row["next_event_seq"]) == int(task_event_rows[0]["run_seq"]) + 1
         )
         security_committed = self._security_events_match(
             security_rows,
@@ -1138,8 +1196,8 @@ class ChangeSetRepository:
             and node_row["outcome"] is None
             and node_row["error_code"] is None
             and node_row["finished_at"] is None
-            and run_consistent
-            and not event_rows
+            and not change_event_rows
+            and not task_event_rows
             and not security_rows
         )
         if transaction_rolled_back:

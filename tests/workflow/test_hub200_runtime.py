@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from collections.abc import AsyncIterator
@@ -383,25 +384,43 @@ async def test_post_capture_failure_abandons_change_set_and_fails_task(
     assert '"status":"abandoned_partial"' in security_events[0]["payload_json"]
 
 
-@pytest.mark.parametrize("commit_persisted", [False, True])
+@pytest.mark.parametrize(
+    (
+        "commit_persisted",
+        "cancel_after_rollback",
+        "cancel_during_reconciliation",
+    ),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (False, False, True),
+        (True, False, True),
+    ],
+)
 @pytest.mark.asyncio
 async def test_capture_commit_exception_reconciles_durable_outcome(
     fixture_source_repo: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     commit_persisted: bool,
+    cancel_after_rollback: bool,
+    cancel_during_reconciliation: bool,
 ) -> None:
     application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
     await application.initialize()
     await application.register_mock_agent()
+    case_id = (
+        f"{int(commit_persisted)}-{int(cancel_after_rollback)}-{int(cancel_during_reconciliation)}"
+    )
     session = await application.create_session(
         repo=fixture_source_repo,
         goal="Reconcile an ambiguous SQLite commit result.",
-        session_id=f"session-commit-reconcile-{commit_persisted}",
+        session_id=f"session-commit-reconcile-{case_id}",
     )
     workflow = await application.services.workflows.create(
         NewWorkflow(
-            workflow_id=f"workflow-commit-reconcile-{commit_persisted}",
+            workflow_id=f"workflow-commit-reconcile-{case_id}",
             session_id=session.session_id,
             author_graph=_docs_write_graph(),
             layout=WorkflowLayout(),
@@ -411,6 +430,20 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
     original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
     injected = False
+    reconciliation_started = asyncio.Event()
+    original_reconcile = application.services.change_sets._reconcile_capture_commit
+
+    async def delayed_reconcile(**kwargs: object) -> str:
+        reconciliation_started.set()
+        await asyncio.sleep(0.05)
+        return await original_reconcile(**kwargs)
+
+    if cancel_during_reconciliation:
+        monkeypatch.setattr(
+            application.services.change_sets,
+            "_reconcile_capture_commit",
+            delayed_reconcile,
+        )
 
     @asynccontextmanager
     async def faulting_transaction() -> AsyncIterator[Transaction]:
@@ -427,6 +460,21 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
                     await connection.commit()
                 else:
                     await connection.rollback()
+                    if cancel_after_rollback:
+                        cursor = await connection.execute("BEGIN IMMEDIATE")
+                        await cursor.close()
+                        await connection.execute(
+                            """
+                            UPDATE workflow_runs
+                            SET cancel_requested_at = strftime(
+                                '%Y-%m-%dT%H:%M:%fZ',
+                                'now'
+                            )
+                            WHERE id = ?
+                            """,
+                            (workflow_run_id,),
+                        )
+                        await connection.commit()
                 raise RuntimeError("injected commit-path exception")
 
     async def persist_with_commit_fault(**kwargs: object):
@@ -454,12 +502,27 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         persist_with_commit_fault,
     )
 
+    workflow_run_id = f"run-commit-reconcile-{case_id}"
     async with application.temporary_master() as lease:
-        run = await application.run(
-            workflow.workflow_id,
-            lease=lease,
-            workflow_run_id=f"run-commit-reconcile-{commit_persisted}",
-        )
+        if cancel_during_reconciliation:
+            run_task = asyncio.create_task(
+                application.run(
+                    workflow.workflow_id,
+                    lease=lease,
+                    workflow_run_id=workflow_run_id,
+                )
+            )
+            await asyncio.wait_for(reconciliation_started.wait(), timeout=30)
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+            run = await application.services.runs.get(workflow_run_id)
+        else:
+            run = await application.run(
+                workflow.workflow_id,
+                lease=lease,
+                workflow_run_id=workflow_run_id,
+            )
 
     assert injected is True
     record = await application.services.change_sets.get_for_source_node(
@@ -469,11 +532,15 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
     assert record is not None
     task = await application.services.runs.get_task(record.change_set.task_id)
     if commit_persisted:
-        assert run.status == WorkflowRunStatus.BLOCKED
-        assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+        if cancel_during_reconciliation:
+            assert record.change_set.status == ChangeSetStatus.CAPTURED
+        else:
+            assert run.status == WorkflowRunStatus.BLOCKED
+            assert record.change_set.status == ChangeSetStatus.TEST_PASSED
         assert task.status == TaskStatus.SUCCEEDED
     else:
-        assert run.status == WorkflowRunStatus.FAILED
+        if not cancel_during_reconciliation:
+            assert run.status == WorkflowRunStatus.FAILED
         assert record.change_set.status == ChangeSetStatus.ABANDONED_PARTIAL
         assert task.status == TaskStatus.FAILED
 
@@ -506,6 +573,7 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
     [
         "cancel_requested_at",
         "duplicate_change_event",
+        "old_event",
         "missing_finished_at",
         "missing_change_event",
         "missing_task_event",
@@ -575,7 +643,13 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
                         """,
                         (active_task_id, active_run_id),
                     )
-                elif fault_kind == "duplicate_change_event":
+                elif fault_kind in {
+                    "duplicate_change_event",
+                    "old_event",
+                }:
+                    created_at = (
+                        "2000-01-01T00:00:00.000000Z" if fault_kind == "old_event" else None
+                    )
                     await connection.execute(
                         """
                         INSERT INTO events(
@@ -584,7 +658,8 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
                         )
                         SELECT e.session_id, e.workflow_id, e.workflow_run_id,
                                wr.next_event_seq, e.event_type, e.actor_type,
-                               e.actor_id, e.payload_json, e.created_at
+                               e.actor_id, e.payload_json,
+                               COALESCE(?, e.created_at)
                         FROM events e
                         JOIN workflow_runs wr ON wr.id = e.workflow_run_id
                         WHERE e.workflow_run_id = ? AND e.event_type = ?
@@ -592,6 +667,7 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
                         ORDER BY e.run_seq DESC LIMIT 1
                         """,
                         (
+                            created_at,
                             active_run_id,
                             "workflow.change_set_state_changed",
                             active_task_id,

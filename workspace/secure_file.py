@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import stat
+import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
@@ -14,69 +15,414 @@ class SecureFileError(OSError):
     """A workspace path could not be bound to a safe regular-file handle."""
 
 
+class SecureWorkspaceRoot:
+    """Pin one trusted workspace root for race-resistant file operations."""
+
+    def __init__(self, root: Path) -> None:
+        resolved = root.expanduser().resolve(strict=True)
+        metadata = os.lstat(resolved)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SecureFileError("workspace root is not a plain directory")
+        _assert_not_reparse(metadata, label="workspace root")
+        self.path = resolved
+        self._root_metadata = metadata
+        self._closed = False
+        self._windows_root_handle: int | None = None
+        self._posix_root_fd: int | None = None
+        if os.name == "nt":
+            self._windows_root_handle = _open_windows_directory_handle(resolved)
+        else:
+            self._posix_root_fd = _open_posix_root_fd(resolved)
+
+    def __enter__(self) -> SecureWorkspaceRoot:
+        self._assert_open()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._posix_root_fd is not None:
+            os.close(self._posix_root_fd)
+            self._posix_root_fd = None
+        if self._windows_root_handle is not None:
+            _close_windows_handle(self._windows_root_handle)
+            self._windows_root_handle = None
+
+    def assert_root_identity(self) -> None:
+        """Require the lexical repo root to still name the pinned directory."""
+
+        self._assert_open()
+        try:
+            current = os.lstat(self.path)
+        except OSError as error:
+            raise SecureFileError("workspace root identity is unavailable") from error
+        _assert_not_reparse(current, label="workspace root")
+        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(
+            self._root_metadata,
+            current,
+        ):
+            raise SecureFileError("workspace root identity changed")
+
+    @contextmanager
+    def open_binary(
+        self,
+        relative: str,
+        *,
+        write_attributes: bool = False,
+    ) -> Iterator[BinaryIO]:
+        """Open a regular file relative to this root without following links."""
+
+        self._assert_open()
+        self.assert_root_identity()
+        parts = _relative_parts(relative)
+        expected = self.path.joinpath(*parts)
+        if os.name == "nt":
+            with self._windows_parent(parts, create=False):
+                self.assert_root_identity()
+                fd = _open_windows_fd(
+                    expected,
+                    self.path,
+                    write_attributes=write_attributes,
+                )
+        else:
+            assert self._posix_root_fd is not None
+            fd = _open_posix_fd(self._posix_root_fd, parts)
+        try:
+            stream = os.fdopen(fd, "rb", closefd=True)
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            metadata = os.fstat(stream.fileno())
+            _assert_regular_single_link(metadata)
+            if os.name == "nt":
+                _assert_windows_handle_path(stream.fileno(), expected, root=self.path)
+            yield stream
+        finally:
+            stream.close()
+
+    def assert_path_identity(self, relative: str, expected: os.stat_result) -> None:
+        with self.open_binary(relative) as stream:
+            current = os.fstat(stream.fileno())
+            if not os.path.samestat(expected, current):
+                raise SecureFileError("workspace path identity changed")
+
+    def set_mode(self, relative: str, mode: int) -> None:
+        if mode < 0 or mode > 0o777:
+            raise SecureFileError("workspace file mode is invalid")
+        with self.open_binary(relative, write_attributes=True) as stream:
+            if os.name == "nt":
+                _set_windows_mode(stream.fileno(), mode)
+            else:
+                os.fchmod(stream.fileno(), mode)
+        with self.open_binary(relative) as stream:
+            restored = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+        if restored != mode:
+            raise SecureFileError("workspace file mode could not be restored")
+
+    def unlink_regular(self, relative: str, *, missing_ok: bool = True) -> bool:
+        """Delete one exact regular file without following a replaced parent."""
+
+        parts = _relative_parts(relative)
+        if os.name == "nt":
+            return self._unlink_windows(parts, missing_ok=missing_ok)
+        return self._unlink_posix(parts, missing_ok=missing_ok)
+
+    def replace_regular(self, relative: str, content: bytes, *, mode: int) -> None:
+        """Atomically replace one file through a parent bound to this root."""
+
+        if mode < 0 or mode > 0o777:
+            raise SecureFileError("workspace file mode is invalid")
+        parts = _relative_parts(relative)
+        if os.name == "nt":
+            self._replace_windows(parts, content, mode=mode)
+        else:
+            self._replace_posix(parts, content, mode=mode)
+
+    def remove_directory(self, relative: str, *, missing_ok: bool = True) -> bool:
+        """Remove one exact empty directory without following a directory link."""
+
+        parts = _relative_parts(relative)
+        if os.name == "nt":
+            with self._windows_parent(parts, create=False):
+                target = self.path.joinpath(*parts)
+                try:
+                    metadata = os.lstat(target)
+                except FileNotFoundError:
+                    if missing_ok:
+                        return False
+                    raise SecureFileError("workspace directory is absent") from None
+                _assert_not_reparse(metadata, label=relative)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise SecureFileError("workspace cleanup path is not a directory")
+                try:
+                    target.rmdir()
+                except OSError as error:
+                    raise SecureFileError("workspace directory removal failed") from error
+                return True
+        with self._posix_parent(parts, create=False) as (parent_fd, name):
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    return False
+                raise SecureFileError("workspace directory is absent") from None
+            _assert_not_reparse(metadata, label=relative)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise SecureFileError("workspace cleanup path is not a directory")
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError as error:
+                raise SecureFileError("workspace directory removal failed") from error
+            return True
+
+    def _assert_open(self) -> None:
+        if self._closed:
+            raise SecureFileError("workspace root handle is closed")
+
+    @contextmanager
+    def _posix_parent(
+        self,
+        parts: tuple[str, ...],
+        *,
+        create: bool,
+    ) -> Iterator[tuple[int, str]]:
+        self._assert_open()
+        self.assert_root_identity()
+        assert self._posix_root_fd is not None
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if nofollow is None or directory is None:
+            raise SecureFileError("platform lacks no-follow directory handle support")
+        flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+        current = os.dup(self._posix_root_fd)
+        try:
+            for part in parts[:-1]:
+                try:
+                    child = os.open(part, flags, dir_fd=current)
+                except FileNotFoundError:
+                    if not create:
+                        raise SecureFileError("workspace parent directory is absent") from None
+                    with suppress(FileExistsError):
+                        os.mkdir(part, mode=0o700, dir_fd=current)
+                    child = os.open(part, flags, dir_fd=current)
+                except OSError as error:
+                    raise SecureFileError("no-follow workspace parent open failed") from error
+                os.close(current)
+                current = child
+            yield current, parts[-1]
+        finally:
+            os.close(current)
+
+    @contextmanager
+    def _windows_parent(
+        self,
+        parts: tuple[str, ...],
+        *,
+        create: bool,
+    ) -> Iterator[Path]:
+        self._assert_open()
+        handles: list[int] = []
+        current = self.path
+        try:
+            handles.append(
+                _open_windows_directory_handle(
+                    self.path,
+                    deny_delete=True,
+                )
+            )
+            self.assert_root_identity()
+            for part in parts[:-1]:
+                child = current / part
+                try:
+                    handle = _open_windows_directory_handle(
+                        child,
+                        deny_delete=True,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise SecureFileError("workspace parent directory is absent") from None
+                    with suppress(FileExistsError):
+                        os.mkdir(child, mode=0o700)
+                    handle = _open_windows_directory_handle(
+                        child,
+                        deny_delete=True,
+                    )
+                handles.append(handle)
+                current = child
+            yield current
+        finally:
+            for handle in reversed(handles):
+                _close_windows_handle(handle)
+
+    def _unlink_posix(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool:
+        with self._posix_parent(parts, create=False) as (parent_fd, name):
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    return False
+                raise SecureFileError("workspace file is absent") from None
+            _assert_regular_single_link(metadata)
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except OSError as error:
+                raise SecureFileError("workspace file removal failed") from error
+            return True
+
+    def _unlink_windows(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool:
+        with self._windows_parent(parts, create=False):
+            target = self.path.joinpath(*parts)
+            try:
+                metadata = os.lstat(target)
+            except FileNotFoundError:
+                if missing_ok:
+                    return False
+                raise SecureFileError("workspace file is absent") from None
+            _assert_regular_single_link(metadata)
+            try:
+                target.unlink()
+            except OSError as error:
+                raise SecureFileError("workspace file removal failed") from error
+            return True
+
+    def _replace_posix(self, parts: tuple[str, ...], content: bytes, *, mode: int) -> None:
+        with self._posix_parent(parts, create=True) as (parent_fd, name):
+            try:
+                existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                _assert_regular_single_link(existing)
+            temporary = f".{name}.agent-hub-{uuid.uuid4().hex}.tmp"
+            descriptor = -1
+            try:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                descriptor = os.open(temporary, flags, mode, dir_fd=parent_fd)
+                _write_all(descriptor, content)
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+                os.replace(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                _verify_posix_file(parent_fd, name, content=content, mode=mode)
+            except OSError as error:
+                raise SecureFileError("workspace preimage replacement failed") from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=parent_fd)
+
+    def _replace_windows(self, parts: tuple[str, ...], content: bytes, *, mode: int) -> None:
+        with self._windows_parent(parts, create=True) as parent:
+            target = self.path.joinpath(*parts)
+            if target.exists() or target.is_symlink():
+                fd = _open_windows_fd(target, self.path, write_attributes=True)
+                try:
+                    _assert_regular_single_link(os.fstat(fd))
+                    _set_windows_mode(fd, mode | stat.S_IWUSR)
+                finally:
+                    os.close(fd)
+            temporary = parent / f".{parts[-1]}.agent-hub-{uuid.uuid4().hex}.tmp"
+            descriptor = -1
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                descriptor = os.open(temporary, flags, 0o600)
+                _write_all(descriptor, content)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = -1
+                os.chmod(temporary, mode)
+                os.replace(temporary, target)
+                fd = _open_windows_fd(target, self.path, write_attributes=True)
+                try:
+                    _set_windows_mode(fd, mode)
+                finally:
+                    os.close(fd)
+                fd = _open_windows_fd(target, self.path, write_attributes=False)
+                try:
+                    with os.fdopen(fd, "rb", closefd=True) as stream:
+                        restored = stream.read()
+                        restored_mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+                    fd = -1
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                if restored != content or restored_mode != mode:
+                    raise SecureFileError("workspace preimage verification failed")
+            except OSError as error:
+                if isinstance(error, SecureFileError):
+                    raise
+                raise SecureFileError("workspace preimage replacement failed") from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    temporary.unlink()
+
+
 @contextmanager
 def open_verified_binary(
-    root: Path,
+    root: Path | SecureWorkspaceRoot,
     relative: str,
     *,
     write_attributes: bool = False,
 ) -> Iterator[BinaryIO]:
     """Open a repo-relative regular file without following a path escape."""
 
-    resolved_root = root.expanduser().resolve(strict=True)
-    parts = _relative_parts(relative)
-    expected = resolved_root.joinpath(*parts)
-    fd = (
-        _open_windows_fd(expected, resolved_root, write_attributes=write_attributes)
-        if os.name == "nt"
-        else _open_posix_fd(resolved_root, parts)
-    )
-    try:
-        stream = os.fdopen(fd, "rb", closefd=True)
-    except BaseException:
-        os.close(fd)
-        raise
-    try:
-        metadata = os.fstat(stream.fileno())
-        _assert_regular_single_link(metadata)
-        if os.name == "nt":
-            _assert_windows_handle_path(stream.fileno(), expected)
+    if isinstance(root, SecureWorkspaceRoot):
+        with root.open_binary(relative, write_attributes=write_attributes) as stream:
+            yield stream
+        return
+    with (
+        SecureWorkspaceRoot(root) as secure_root,
+        secure_root.open_binary(relative, write_attributes=write_attributes) as stream,
+    ):
         yield stream
-    finally:
-        stream.close()
 
 
 def assert_path_identity(
-    root: Path,
+    root: Path | SecureWorkspaceRoot,
     relative: str,
     expected: os.stat_result,
 ) -> None:
     """Require the current path to resolve to the same safe file identity."""
 
-    with open_verified_binary(root, relative) as stream:
-        current = os.fstat(stream.fileno())
-        if not os.path.samestat(expected, current):
-            raise SecureFileError("workspace path identity changed")
+    if isinstance(root, SecureWorkspaceRoot):
+        root.assert_path_identity(relative, expected)
+        return
+    with SecureWorkspaceRoot(root) as secure_root:
+        secure_root.assert_path_identity(relative, expected)
 
 
 def set_verified_mode(
-    root: Path,
+    root: Path | SecureWorkspaceRoot,
     relative: str,
     mode: int,
 ) -> None:
     """Restore mode bits through a verified file handle."""
 
-    if mode < 0 or mode > 0o777:
-        raise SecureFileError("workspace file mode is invalid")
-    with open_verified_binary(root, relative, write_attributes=True) as stream:
-        if os.name == "nt":
-            _set_windows_mode(stream.fileno(), mode)
-        else:
-            os.fchmod(stream.fileno(), mode)
-    with open_verified_binary(root, relative) as stream:
-        restored = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
-    if restored != mode:
-        raise SecureFileError("workspace file mode could not be restored")
+    if isinstance(root, SecureWorkspaceRoot):
+        root.set_mode(relative, mode)
+        return
+    with SecureWorkspaceRoot(root) as secure_root:
+        secure_root.set_mode(relative, mode)
 
 
 def _relative_parts(relative: str) -> tuple[str, ...]:
@@ -97,7 +443,31 @@ def _assert_regular_single_link(metadata: os.stat_result) -> None:
         raise SecureFileError("workspace path is a reparse point")
 
 
-def _open_posix_fd(root: Path, parts: tuple[str, ...]) -> int:
+def _assert_not_reparse(metadata: os.stat_result, *, label: str) -> None:
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SecureFileError(f"{label} is a symbolic link")
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+        raise SecureFileError(f"{label} is a reparse point")
+
+
+def _open_posix_root_fd(root: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None or os.open not in os.supports_dir_fd:
+        raise SecureFileError("platform lacks no-follow directory handle support")
+    flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        raise SecureFileError("no-follow workspace root open failed") from error
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise SecureFileError("workspace root handle is not a directory")
+    return descriptor
+
+
+def _open_posix_fd(root_fd: int, parts: tuple[str, ...]) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory is None or os.open not in os.supports_dir_fd:
@@ -107,7 +477,7 @@ def _open_posix_fd(root: Path, parts: tuple[str, ...]) -> int:
     file_flags = os.O_RDONLY | nofollow | cloexec
     descriptors: list[int] = []
     try:
-        current = os.open(root, directory_flags)
+        current = os.dup(root_fd)
         descriptors.append(current)
         for part in parts[:-1]:
             current = os.open(part, directory_flags, dir_fd=current)
@@ -118,6 +488,95 @@ def _open_posix_fd(root: Path, parts: tuple[str, ...]) -> int:
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+def _open_windows_directory_handle(
+    path: Path,
+    *,
+    deny_delete: bool = False,
+) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    desired_access = 0x00000080  # FILE_READ_ATTRIBUTES
+    share_mode = 0x1 | 0x2 | 0x4  # FILE_SHARE_READ | WRITE | DELETE
+    if deny_delete:
+        desired_access |= 0x00010000  # DELETE
+        share_mode &= ~0x4
+    handle = create_file(
+        _extended_windows_path(path),
+        desired_access,
+        share_mode,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error_code = ctypes.get_last_error()
+        if error_code in {2, 3}:
+            raise FileNotFoundError(error_code, "workspace directory is absent", path)
+        raise SecureFileError("no-follow Windows workspace directory open failed") from (
+            ctypes.WinError(error_code)
+        )
+    native = int(handle)
+    try:
+        _assert_windows_directory_handle(native, path)
+    except BaseException:
+        _close_windows_handle(native)
+        raise
+    return native
+
+
+def _assert_windows_directory_handle(handle: int, expected: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    get_info = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandleEx
+    get_info.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_info.restype = wintypes.BOOL
+    info = FileAttributeTagInfo()
+    if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        raise SecureFileError("failed to inspect Windows directory handle") from ctypes.WinError(
+            ctypes.get_last_error()
+        )
+    if not info.FileAttributes & 0x10:
+        raise SecureFileError("workspace parent handle is not a directory")
+    if info.FileAttributes & 0x400:
+        raise SecureFileError("workspace parent handle is a reparse point")
+    if _windows_path_key(Path(_windows_final_path_from_handle(handle))) != _windows_path_key(
+        expected
+    ):
+        raise SecureFileError("Windows directory handle resolved outside its expected path")
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+
+    ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
 
 
 def _open_windows_fd(
@@ -200,8 +659,13 @@ def _assert_windows_handle_path(
 
 
 def _windows_final_path(fd: int) -> str:
-    import ctypes
     import msvcrt
+
+    return _windows_final_path_from_handle(msvcrt.get_osfhandle(fd))
+
+
+def _windows_final_path_from_handle(handle: int) -> str:
+    import ctypes
     from ctypes import wintypes
 
     get_final_path = ctypes.WinDLL(
@@ -215,7 +679,6 @@ def _windows_final_path(fd: int) -> str:
         wintypes.DWORD,
     )
     get_final_path.restype = wintypes.DWORD
-    handle = msvcrt.get_osfhandle(fd)
     size = 512
     while size <= 32_768:
         buffer = ctypes.create_unicode_buffer(size)
@@ -281,6 +744,39 @@ def _set_windows_mode(fd: int, mode: int) -> None:
         )
 
 
+def _write_all(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    offset = 0
+    while offset < len(view):
+        written = os.write(descriptor, view[offset:])
+        if written <= 0:
+            raise SecureFileError("workspace preimage write made no progress")
+        offset += written
+
+
+def _verify_posix_file(
+    parent_fd: int,
+    name: str,
+    *,
+    content: bytes,
+    mode: int,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        _assert_regular_single_link(metadata)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        if b"".join(chunks) != content:
+            raise SecureFileError("workspace preimage content verification failed")
+        if stat.S_IMODE(metadata.st_mode) != mode:
+            raise SecureFileError("workspace preimage mode verification failed")
+    finally:
+        os.close(descriptor)
+
+
 def _extended_windows_path(path: Path) -> str:
     value = os.path.abspath(path)
     if value.startswith("\\\\?\\"):
@@ -304,6 +800,7 @@ def _windows_path_key(path: Path) -> str:
 
 __all__ = [
     "SecureFileError",
+    "SecureWorkspaceRoot",
     "assert_path_identity",
     "open_verified_binary",
     "set_verified_mode",

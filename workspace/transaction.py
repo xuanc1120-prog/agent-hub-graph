@@ -6,7 +6,6 @@ import json
 import os
 import stat
 import unicodedata
-import uuid
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -24,6 +23,7 @@ from workspace.git_manager import (
 )
 from workspace.secure_file import (
     SecureFileError,
+    SecureWorkspaceRoot,
     assert_path_identity,
     open_verified_binary,
     set_verified_mode,
@@ -145,15 +145,27 @@ class WorkspaceTransaction:
         self._ignored_preimages: dict[str, FilePreimage] = {}
         self._baseline_index_sha256: str | None = None
         self._git_metadata_seal: GitMetadataSeal | None = None
+        self._secure_root: SecureWorkspaceRoot | None = None
 
     def begin(self) -> None:
         if self._phase != "new":
             raise WorkspaceTransactionError("workspace transaction can only begin once")
+        self._secure_root = SecureWorkspaceRoot(self._repo)
+        try:
+            self._begin_pinned()
+        except BaseException:
+            self._close_secure_root()
+            raise
+
+    def _begin_pinned(self) -> None:
+        secure_root = self._require_secure_root()
+        secure_root.assert_root_identity()
         metadata_seal = self._git.capture_metadata_seal(
             self._repo,
             include_objects=self._seal_git_objects,
         )
         state = self._git.state(self._repo)
+        secure_root.assert_root_identity()
         if state.commit != self._base_commit:
             raise WorkspaceNotClean("workspace HEAD does not match the task base commit")
         if self._expected_branch is not None and state.branch != self._expected_branch:
@@ -169,12 +181,14 @@ class WorkspaceTransaction:
         inventory = self._scan_inventory(seal_paths=ignored)
         tracked = frozenset(self._git.tracked_paths(self._repo))
         preimages = self._capture_ignored_preimages(ignored, inventory)
+        index_sha256 = self._git.index_sha256(self._repo)
+        secure_root.assert_root_identity()
         self._baseline_state = state
         self._baseline_inventory = inventory
         self._baseline_tracked = tracked
         self._baseline_ignored = ignored
         self._ignored_preimages = preimages
-        self._baseline_index_sha256 = self._git.index_sha256(self._repo)
+        self._baseline_index_sha256 = index_sha256
         self._git_metadata_seal = metadata_seal
         self._phase = "active"
 
@@ -185,9 +199,18 @@ class WorkspaceTransaction:
     def capture_and_restore(self) -> CapturedWorkspaceChangeSet:
         if self._phase != "active":
             raise WorkspaceTransactionError("workspace transaction is not active")
+        try:
+            return self._capture_and_restore_pinned()
+        finally:
+            self._close_secure_root()
+
+    def _capture_and_restore_pinned(self) -> CapturedWorkspaceChangeSet:
+        if self._phase != "active":
+            raise WorkspaceTransactionError("workspace transaction is not active")
         baseline_state = self._require_baseline_state()
         baseline = self._require_baseline_inventory()
         metadata_seal = self._require_git_metadata_seal()
+        self._require_secure_root().assert_root_identity()
         try:
             self._git.assert_metadata_seal(
                 self._repo,
@@ -419,7 +442,7 @@ class WorkspaceTransaction:
             if snapshot is None:
                 continue
             try:
-                set_verified_mode(self._repo, path, snapshot.mode)
+                set_verified_mode(self._require_secure_root(), path, snapshot.mode)
             except SecureFileError as error:
                 raise WorkspaceRestoreError(
                     f"tracked file mode restoration failed: {path}"
@@ -445,14 +468,15 @@ class WorkspaceTransaction:
             reverse=True,
         ):
             validated = self._path_policy.validate_cleanup_path(directory)
-            target = validated.absolute_path
-            if target.exists():
-                try:
-                    target.rmdir()
-                except OSError as error:
-                    raise WorkspaceRestoreError(
-                        f"created directory is not empty: {directory}"
-                    ) from error
+            try:
+                self._require_secure_root().remove_directory(
+                    validated.relative_path,
+                    missing_ok=True,
+                )
+            except SecureFileError as error:
+                raise WorkspaceRestoreError(
+                    f"created directory could not be safely removed: {directory}"
+                ) from error
 
     def _assert_restored(self) -> None:
         baseline_state = self._require_baseline_state()
@@ -501,6 +525,9 @@ class WorkspaceTransaction:
         seal_paths: frozenset[str] = frozenset(),
     ) -> _Inventory:
         root = self._repo if repo is None else repo.expanduser().resolve(strict=True)
+        snapshot_root: Path | SecureWorkspaceRoot = (
+            self._require_secure_root() if repo is None else root
+        )
         files: dict[str, FileSnapshot] = {}
         sealed_files: dict[str, _SealedFile] = {}
         directories: list[str] = []
@@ -526,7 +553,7 @@ class WorkspaceTransaction:
                 self._assert_plain_entry(child, expect_directory=False)
                 relative = self._relative_path(child, root=root)
                 snapshot, content = self._snapshot_file(
-                    root,
+                    snapshot_root,
                     relative,
                     capture_content=relative in seal_paths,
                 )
@@ -564,7 +591,7 @@ class WorkspaceTransaction:
             if expected is None or path in sealed_files:
                 continue
             current, sealed = self._snapshot_file(
-                self._repo,
+                self._require_secure_root(),
                 path,
                 capture_content=True,
             )
@@ -699,7 +726,7 @@ class WorkspaceTransaction:
                     f"workspace path disappeared after inventory: {path}"
                 )
             current, sealed = self._snapshot_file(
-                self._repo,
+                self._require_secure_root(),
                 path,
                 capture_content=True,
             )
@@ -866,24 +893,26 @@ class WorkspaceTransaction:
 
     def _remove_exact_new_file(self, path: str) -> None:
         validated = self._path_policy.validate_cleanup_path(path)
-        target = validated.absolute_path
-        if not target.exists() and not target.is_symlink():
-            return
-        metadata = target.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
-            raise WorkspaceRestoreError(f"new path is not a plain single-link file: {path}")
-        target.unlink()
+        try:
+            self._require_secure_root().unlink_regular(
+                validated.relative_path,
+                missing_ok=True,
+            )
+        except SecureFileError as error:
+            raise WorkspaceRestoreError(f"new path could not be safely removed: {path}") from error
 
     def _restore_preimage(self, preimage: FilePreimage) -> None:
         materialize_workspace_preimages(
             self._repo,
             (preimage,),
             max_paths=self._max_changed_paths,
+            secure_root=self._require_secure_root(),
+            path_policy=self._path_policy,
         )
 
     @staticmethod
     def _snapshot_file(
-        root: Path,
+        root: Path | SecureWorkspaceRoot,
         relative: str,
         *,
         capture_content: bool,
@@ -1048,12 +1077,25 @@ class WorkspaceTransaction:
             raise WorkspaceTransactionError("workspace Git metadata seal is unavailable")
         return self._git_metadata_seal
 
+    def _require_secure_root(self) -> SecureWorkspaceRoot:
+        if self._secure_root is None:
+            raise WorkspaceTransactionError("workspace root handle is unavailable")
+        return self._secure_root
+
+    def _close_secure_root(self) -> None:
+        secure_root = self._secure_root
+        self._secure_root = None
+        if secure_root is not None:
+            secure_root.close()
+
 
 def materialize_workspace_preimages(
     repo: Path,
     preimages: tuple[FilePreimage, ...],
     *,
     max_paths: int = 500,
+    secure_root: SecureWorkspaceRoot | None = None,
+    path_policy: PathPolicy | None = None,
 ) -> None:
     if not 1 <= max_paths <= 50_000:
         raise ValueError("preimage path limit is invalid")
@@ -1062,49 +1104,38 @@ def materialize_workspace_preimages(
     by_path = {preimage.path: preimage for preimage in preimages}
     if len(by_path) != len(preimages):
         raise WorkspaceTransactionError("preimage materialization contains duplicate paths")
-    root = repo.expanduser().resolve(strict=True)
-    policy = PathPolicy(root, max_scope_files=max_paths)
-    for preimage in preimages:
-        if (
-            len(preimage.content) != preimage.size_bytes
-            or sha256(preimage.content).hexdigest() != preimage.sha256
-        ):
+
+    owns_root = secure_root is None
+    anchor = secure_root or SecureWorkspaceRoot(repo)
+    try:
+        anchor.assert_root_identity()
+        policy = path_policy or PathPolicy(anchor.path, max_scope_files=max_paths)
+        if policy.repo_root != anchor.path:
             raise WorkspaceTransactionError(
-                f"preimage content does not match its manifest: {preimage.path}"
+                "preimage path policy does not match the pinned workspace root"
             )
-        validated = policy.validate_cleanup_path(preimage.path)
-        target = validated.absolute_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        validated = policy.validate_cleanup_path(preimage.path)
-        target = validated.absolute_path
-        if target.exists() or target.is_symlink():
-            metadata = target.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
-                raise WorkspaceRestoreError(
-                    f"preimage path is not a plain single-link file: {preimage.path}"
+        for preimage in preimages:
+            if (
+                len(preimage.content) != preimage.size_bytes
+                or sha256(preimage.content).hexdigest() != preimage.sha256
+            ):
+                raise WorkspaceTransactionError(
+                    f"preimage content does not match its manifest: {preimage.path}"
                 )
+            validated = policy.validate_cleanup_path(preimage.path)
             try:
-                set_verified_mode(root, preimage.path, preimage.mode | stat.S_IWUSR)
+                anchor.replace_regular(
+                    validated.relative_path,
+                    preimage.content,
+                    mode=preimage.mode,
+                )
             except SecureFileError as error:
                 raise WorkspaceRestoreError(
-                    f"preimage target could not be prepared: {preimage.path}"
+                    f"preimage could not be safely restored: {preimage.path}"
                 ) from error
-        temporary = target.parent / f".{target.name}.agent-hub-{uuid.uuid4().hex}.tmp"
-        try:
-            with temporary.open("xb") as stream:
-                stream.write(preimage.content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temporary, preimage.mode)
-            os.replace(temporary, target)
-            try:
-                set_verified_mode(root, preimage.path, preimage.mode)
-            except SecureFileError as error:
-                raise WorkspaceRestoreError(
-                    f"preimage mode restoration failed: {preimage.path}"
-                ) from error
-        finally:
-            temporary.unlink(missing_ok=True)
+    finally:
+        if owns_root:
+            anchor.close()
 
 
 __all__ = [

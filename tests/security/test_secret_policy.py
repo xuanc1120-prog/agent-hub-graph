@@ -54,3 +54,61 @@ def test_noncredential_configuration_is_preserved(value: str) -> None:
     assert_secret_free_bytes(value.encode(), label="test input")
 
     assert redact_secret_text(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    [
+        (
+            "<password><![CDATA[cdata-synthetic-value]]></password>",
+            "cdata-synthetic-value",
+        ),
+        ('"db pass" = "toml-synthetic-value"', "toml-synthetic-value"),
+        (
+            r'{"\u0070assword": "json-synthetic-value"}',
+            "json-synthetic-value",
+        ),
+        ('<server password="xml-attribute-value"/>', "xml-attribute-value"),
+    ],
+)
+def test_structured_key_encodings_are_rejected_and_redacted(
+    value: str,
+    secret: str,
+) -> None:
+    with pytest.raises(SecretPolicyViolation, match="credential-like content"):
+        assert_secret_free_bytes(value.encode(), label="structured input")
+
+    redacted = redact_secret_text(value)
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"mode":',
+        '"mode" = [',
+        "<server>",
+        '<!DOCTYPE server [<!ENTITY local "synthetic">]><server>&local;</server>',
+    ],
+)
+def test_malformed_or_unsafe_structured_documents_fail_closed(value: str) -> None:
+    with pytest.raises(SecretPolicyViolation):
+        assert_secret_free_bytes(value.encode(), label="structured input")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"mode":"development"}',
+        '"build mode" = "development"',
+        '[server]\nhost = "localhost"',
+        "<server><![CDATA[localhost]]></server>",
+        '<server host="localhost"/>',
+    ],
+)
+def test_safe_structured_documents_are_preserved(value: str) -> None:
+    assert_secret_free_bytes(value.encode(), label="structured input")
+
+    assert redact_secret_text(value) == value

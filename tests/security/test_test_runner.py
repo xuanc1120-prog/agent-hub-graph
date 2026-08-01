@@ -294,3 +294,42 @@ async def test_private_key_redaction_spans_chunks_before_bounding() -> None:
     assert "super-secret-key-material" not in redacted
     assert "super-secret-key-material" not in bounded
     assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second", "secret"),
+    [
+        (
+            b"<password><![CDATA[cdata-",
+            b"stream-value]]></password>",
+            "cdata-stream-value",
+        ),
+        (
+            b'"db pa',
+            b'ss" = "toml-stream-value"',
+            "toml-stream-value",
+        ),
+        (
+            b'{"\\u0070ass',
+            b'word": "json-stream-value"}',
+            "json-stream-value",
+        ),
+    ],
+)
+async def test_encoded_structured_secret_redaction_spans_reader_chunks(
+    first: bytes,
+    second: bytes,
+    secret: str,
+) -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=1024)
+    reader.feed_data(first)
+    reader.feed_data(second)
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
