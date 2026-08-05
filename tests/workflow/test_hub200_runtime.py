@@ -407,7 +407,12 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
     cancel_after_rollback: bool,
     cancel_during_reconciliation: bool,
 ) -> None:
-    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    application = WorkflowApplication(
+        Settings(
+            data_dir=tmp_path / "agent-hub-data",
+            master_lease_ttl_seconds=300,
+        )
+    )
     await application.initialize()
     await application.register_mock_agent()
     case_id = (
