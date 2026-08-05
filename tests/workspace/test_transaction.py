@@ -712,6 +712,22 @@ def test_resource_limit_failure_still_restores_task_paths(
     assert manager.state(repo).dirty is False
 
 
+def test_transaction_close_releases_root_after_begin(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    transaction = _transaction(manager, repo, commit, branch, tmp_path)
+    transaction.begin()
+
+    transaction.close()
+    transaction.abort()
+
+    assert transaction._secure_root is None
+    with pytest.raises(WorkspaceTransactionError, match="not active"):
+        transaction.capture_and_restore()
+
+
 def test_begin_rejects_dirty_or_wrong_base(
     fixture_source_repo: Path,
     tmp_path: Path,

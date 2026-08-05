@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
+import workspace.secure_file as secure_file
 from workspace.secure_file import (
     SecureFileError,
     SecureWorkspaceRoot,
@@ -212,3 +214,50 @@ def test_destructive_operations_reject_replaced_hardlink(tmp_path: Path) -> None
             secure_root.replace_regular("target.txt", b"replacement", mode=0o600)
 
     assert outside.read_bytes() == b"outside sentinel"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX root identity race")
+def test_posix_root_open_rejects_path_swap_before_handle_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    alternate = tmp_path / "alternate"
+    detached = tmp_path / "detached"
+    repo.mkdir()
+    alternate.mkdir()
+
+    original_open = secure_file._open_posix_root_fd
+
+    def swap_root_before_open(path: Path, *, expected: os.stat_result) -> int:
+        repo.rename(detached)
+        alternate.rename(repo)
+        try:
+            return original_open(path, expected=expected)
+        finally:
+            repo.rename(alternate)
+            detached.rename(repo)
+
+    monkeypatch.setattr(secure_file, "_open_posix_root_fd", swap_root_before_open)
+
+    with pytest.raises(SecureFileError, match="identity changed during open"):
+        SecureWorkspaceRoot(repo)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle identity race")
+def test_windows_replace_keeps_temporary_identity_bound() -> None:
+    with tempfile.TemporaryDirectory(prefix="agent-hub-win-race-") as temporary_root:
+        root = Path(temporary_root)
+        repo = root / "repo"
+        repo.mkdir()
+        target = repo / "target.txt"
+        target.write_bytes(b"before")
+        external = root / "external.txt"
+        external.write_bytes(b"external")
+
+        mode = stat.S_IMODE(target.stat().st_mode)
+        with SecureWorkspaceRoot(repo) as secure_root:
+            secure_root.replace_regular("target.txt", b"after", mode=mode)
+
+        assert target.read_bytes() == b"after"
+        assert external.read_bytes() == b"external"

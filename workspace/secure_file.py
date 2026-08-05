@@ -32,7 +32,10 @@ class SecureWorkspaceRoot:
         if os.name == "nt":
             self._windows_root_handle = _open_windows_directory_handle(resolved)
         else:
-            self._posix_root_fd = _open_posix_root_fd(resolved)
+            self._posix_root_fd = _open_posix_root_fd(
+                resolved,
+                expected=self._root_metadata,
+            )
 
     def __enter__(self) -> SecureWorkspaceRoot:
         self._assert_open()
@@ -341,22 +344,30 @@ class SecureWorkspaceRoot:
                     os.close(fd)
             temporary = parent / f".{parts[-1]}.agent-hub-{uuid.uuid4().hex}.tmp"
             descriptor = -1
+            renamed = False
             try:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-                descriptor = os.open(temporary, flags, 0o600)
+                descriptor = _create_windows_temporary_fd(temporary, root=self.path)
                 _write_all(descriptor, content)
+                _set_windows_mode(descriptor, mode)
                 os.fsync(descriptor)
-                os.close(descriptor)
-                descriptor = -1
-                os.chmod(temporary, mode)
-                os.replace(temporary, target)
-                fd = _open_windows_fd(target, self.path, write_attributes=True)
-                try:
-                    _set_windows_mode(fd, mode)
-                finally:
-                    os.close(fd)
+                temporary_identity = _windows_file_identity(descriptor)
+                _rename_windows_handle(
+                    descriptor,
+                    destination=target,
+                    replace=True,
+                )
+                renamed = True
+
+                if _windows_file_identity(descriptor) != temporary_identity:
+                    raise SecureFileError("workspace preimage identity changed during replacement")
                 fd = _open_windows_fd(target, self.path, write_attributes=False)
                 try:
+                    reopened_identity = _windows_file_identity(fd)
+                    if reopened_identity != temporary_identity:
+                        raise SecureFileError(
+                            "workspace preimage replacement identity mismatch: "
+                            f"expected {temporary_identity!r}, got {reopened_identity!r}"
+                        )
                     with os.fdopen(fd, "rb", closefd=True) as stream:
                         restored = stream.read()
                         restored_mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
@@ -372,9 +383,10 @@ class SecureWorkspaceRoot:
                 raise SecureFileError("workspace preimage replacement failed") from error
             finally:
                 if descriptor >= 0:
+                    if not renamed:
+                        with suppress(SecureFileError, OSError):
+                            _mark_windows_handle_for_delete(descriptor)
                     os.close(descriptor)
-                with suppress(FileNotFoundError):
-                    temporary.unlink()
 
 
 @contextmanager
@@ -451,7 +463,7 @@ def _assert_not_reparse(metadata: os.stat_result, *, label: str) -> None:
         raise SecureFileError(f"{label} is a reparse point")
 
 
-def _open_posix_root_fd(root: Path) -> int:
+def _open_posix_root_fd(root: Path, *, expected: os.stat_result) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory is None or os.open not in os.supports_dir_fd:
@@ -461,9 +473,16 @@ def _open_posix_root_fd(root: Path) -> int:
         descriptor = os.open(root, flags)
     except OSError as error:
         raise SecureFileError("no-follow workspace root open failed") from error
-    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SecureFileError("workspace root handle is not a directory")
+        _assert_not_reparse(metadata, label="workspace root")
+        if not os.path.samestat(expected, metadata):
+            raise SecureFileError("workspace root identity changed during open")
+    except BaseException:
         os.close(descriptor)
-        raise SecureFileError("workspace root handle is not a directory")
+        raise
     return descriptor
 
 
@@ -577,6 +596,162 @@ def _close_windows_handle(handle: int) -> None:
     import ctypes
 
     ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+
+
+def _create_windows_temporary_fd(path: Path, *, root: Path) -> int:
+    """Create a private temporary file and keep its native handle identity pinned."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    desired_access = 0x80000000 | 0x40000000 | 0x00010000  # READ | WRITE | DELETE
+    share_mode = 0x1 | 0x2  # keep delete/rename exclusive while the handle is open
+    flags = 0x00200000 | 0x08000000  # OPEN_REPARSE_POINT | SEQUENTIAL_SCAN
+    handle = create_file(
+        _extended_windows_path(path),
+        desired_access,
+        share_mode,
+        None,
+        1,  # CREATE_NEW
+        flags,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error_code = ctypes.get_last_error()
+        if error_code in {2, 3, 80}:
+            raise FileExistsError(error_code, "temporary workspace file already exists", path)
+        raise SecureFileError(
+            "Windows temporary workspace file creation failed"
+        ) from ctypes.WinError(error_code)
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            int(handle),
+            os.O_RDWR | getattr(os, "O_BINARY", 0),
+        )
+    except BaseException:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        raise
+    try:
+        _assert_windows_handle_path(descriptor, path, root=root)
+        _assert_regular_single_link(os.fstat(descriptor))
+    except BaseException:
+        with suppress(SecureFileError, OSError):
+            _mark_windows_handle_for_delete(descriptor)
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _windows_file_identity(fd: int) -> tuple[int, int, int]:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("CreationTime", wintypes.FILETIME),
+            ("LastAccessTime", wintypes.FILETIME),
+            ("LastWriteTime", wintypes.FILETIME),
+            ("VolumeSerialNumber", wintypes.DWORD),
+            ("FileSizeHigh", wintypes.DWORD),
+            ("FileSizeLow", wintypes.DWORD),
+            ("NumberOfLinks", wintypes.DWORD),
+            ("FileIndexHigh", wintypes.DWORD),
+            ("FileIndexLow", wintypes.DWORD),
+        ]
+
+    get_info = ctypes.WinDLL("kernel32", use_last_error=True).GetFileInformationByHandle
+    get_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_info.restype = wintypes.BOOL
+    info = ByHandleFileInformation()
+    handle = msvcrt.get_osfhandle(fd)
+    if not get_info(handle, ctypes.byref(info)):
+        raise SecureFileError("failed to inspect Windows file identity") from ctypes.WinError(
+            ctypes.get_last_error()
+        )
+    return info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow
+
+
+def _rename_windows_handle(
+    fd: int,
+    *,
+    destination: Path,
+    replace: bool,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOL),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    filename = os.path.abspath(destination).encode("utf-16-le")
+    header = FileRenameInfo()
+    header.ReplaceIfExists = bool(replace)
+    header.RootDirectory = None
+    header.FileNameLength = len(filename)
+    size = FileRenameInfo.FileName.offset + len(filename) + ctypes.sizeof(wintypes.WCHAR)
+    buffer = (ctypes.c_byte * size)()
+    ctypes.memmove(buffer, ctypes.byref(header), FileRenameInfo.FileName.offset)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + FileRenameInfo.FileName.offset, filename, len(filename)
+    )
+
+    set_info = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    set_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_info.restype = wintypes.BOOL
+    if not set_info(
+        msvcrt.get_osfhandle(fd),
+        3,  # FileRenameInfo
+        ctypes.byref(buffer),
+        size,
+    ):
+        error = ctypes.WinError(ctypes.get_last_error())
+        raise SecureFileError(
+            f"Windows handle-based workspace replacement failed: {error}"
+        ) from error
+
+
+def _mark_windows_handle_for_delete(fd: int) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+    info = FileDispositionInfo(True)
+    set_info = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    set_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_info.restype = wintypes.BOOL
+    if not set_info(
+        msvcrt.get_osfhandle(fd),
+        4,  # FileDispositionInfo
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        raise SecureFileError(
+            "failed to remove temporary Windows workspace file"
+        ) from ctypes.WinError(ctypes.get_last_error())
 
 
 def _open_windows_fd(

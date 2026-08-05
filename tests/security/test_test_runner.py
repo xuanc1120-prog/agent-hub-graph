@@ -333,3 +333,73 @@ async def test_encoded_structured_secret_redaction_spans_reader_chunks(
 
     assert secret not in redacted
     assert "[REDACTED]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_pretty_json_redaction_spans_reader_chunks() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=1024)
+    secret = "runner-cross-chunk-json-secret"
+    reader.feed_data(b'{\n  "config": {\n    "pass')
+    reader.feed_data(f'word": "{secret}"\n  }}}}\n'.encode())
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+
+    assert secret not in redacted
+    assert '"password":"[REDACTED]"' in redacted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second", "secret"),
+    [
+        (
+            b"runner: starting test\n[service]\ntok",
+            b'en = [\n  "toml-prefixed-runner-secret",\n  "second-value"\n]\n',
+            "toml-prefixed-runner-secret",
+        ),
+        (
+            b"runner: starting test\n<configuration>\n  <service pass",
+            b'word="xml-prefixed-runner-\nsecret" />\n</configuration>\n',
+            "xml-prefixed-runner-\nsecret",
+        ),
+    ],
+)
+async def test_prefixed_toml_xml_redaction_spans_chunks_and_bounded_output(
+    first: bytes,
+    second: bytes,
+    secret: str,
+) -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=1024)
+    reader.feed_data(first)
+    reader.feed_data(second)
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+    bounded, truncated = _bounded_utf8(redacted, 9)
+
+    assert redacted == "[REDACTED]"
+    assert secret not in bounded
+    assert truncated is True
+
+
+@pytest.mark.asyncio
+async def test_prefixed_pretty_json_redaction_spans_chunks_and_bounded_output() -> None:
+    reader = asyncio.StreamReader()
+    collector = _OutputCollector(limit=1024)
+    secret = "prefixed-runner-json-secret"
+    reader.feed_data(b'runner: starting test\n{\n  "service": {\n    "pass')
+    reader.feed_data(f'word":\n      "{secret}"\n  }}\n}}\n'.encode())
+    reader.feed_eof()
+
+    await collector.read(reader)
+    redacted = _redact_output(collector.value.decode("utf-8"))
+    bounded, truncated = _bounded_utf8(redacted, 9)
+
+    assert redacted == "[REDACTED]"
+    assert secret not in bounded
+    assert truncated is True

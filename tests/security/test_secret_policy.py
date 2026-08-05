@@ -112,3 +112,83 @@ def test_safe_structured_documents_are_preserved(value: str) -> None:
     assert_secret_free_bytes(value.encode(), label="structured input")
 
     assert redact_secret_text(value) == value
+
+
+def test_pretty_json_nested_secret_is_redacted_structurally() -> None:
+    value = """{
+  "service": {
+    "apiKey":
+      "pretty-json-secret"
+  }
+}"""
+
+    with pytest.raises(SecretPolicyViolation, match="credential-like content"):
+        assert_secret_free_bytes(value.encode(), label="pretty JSON")
+
+    redacted = redact_secret_text(value)
+    assert "pretty-json-secret" not in redacted
+    assert '"apiKey":"[REDACTED]"' in redacted
+
+
+def test_prefixed_pretty_json_secret_fails_closed() -> None:
+    value = """runner: starting test
+{
+  "service": {
+    "password":
+      "prefixed-json-secret"
+  }
+}
+"""
+
+    assert redact_secret_text(value) == "[REDACTED]"
+
+
+def test_prefixed_multiline_toml_secret_fails_closed() -> None:
+    value = """runner: starting test
+[service]
+token = [
+  "toml-prefixed-secret",
+  "second-value"
+]
+"""
+
+    assert redact_secret_text(value) == "[REDACTED]"
+
+
+def test_prefixed_multiline_xml_attribute_secret_fails_closed() -> None:
+    value = """runner: starting test
+<configuration>
+  <service password="xml-prefixed-
+secret" />
+</configuration>
+"""
+
+    assert redact_secret_text(value) == "[REDACTED]"
+
+
+def test_toml_multiline_secret_fails_closed_for_output_redaction() -> None:
+    value = '''[service]
+token = """
+toml-multiline-secret
+"""
+'''
+
+    with pytest.raises(SecretPolicyViolation, match="credential-like content"):
+        assert_secret_free_bytes(value.encode(), label="multiline TOML")
+
+    assert redact_secret_text(value) == "[REDACTED]"
+
+
+def test_nested_xml_multiline_attribute_is_redacted_structurally() -> None:
+    value = """<configuration>
+  <service
+    password="xml-multiline-secret"
+  >localhost</service>
+</configuration>"""
+
+    with pytest.raises(SecretPolicyViolation, match="credential-like content"):
+        assert_secret_free_bytes(value.encode(), label="nested XML")
+
+    redacted = redact_secret_text(value)
+    assert "xml-multiline-secret" not in redacted
+    assert 'password="[REDACTED]"' in redacted

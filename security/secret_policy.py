@@ -41,6 +41,23 @@ _QUOTED_ASSIGNMENT_PATTERN = re.compile(
     r"[ \t]*[=:][ \t]*"
     r"(?:\"(?:\\.|[^\"\\\r\n]){1,4096}\"|'[^'\r\n]{1,4096}'|[^\s,;]{1,4096})"
 )
+_QUOTED_KEY_SEPARATOR_PATTERN = re.compile(
+    r"(?is)(?<![a-z0-9_])"
+    r"(?P<key>\"(?:\\.|[^\"\\\r\n]){1,512}\"|'[^'\r\n]{1,512}')"
+    r"\s*[:=]"
+)
+_TOML_KEY_SEPARATOR_PATTERN = re.compile(
+    r"(?im)(?<![a-z0-9_])"
+    r"(?P<key>[a-z0-9_-]{1,128}(?:[ \t]*\.[ \t]*[a-z0-9_-]{1,128})*)"
+    r"[ \t]*="
+)
+_XML_ATTRIBUTE_KEY_PATTERN = re.compile(
+    r"(?is)(?<![a-z0-9_.:-])"
+    r"(?P<key>[a-z_][a-z0-9_.:-]{0,127})"
+    r"\s*=\s*(?P<quote>[\"'])"
+)
+_TOML_TABLE_KEY_PATTERN = re.compile(r"(?im)^\s*(?P<key>\[\[?[^\]\r\n]{1,512}\]\]?)")
+_XML_ELEMENT_KEY_PATTERN = re.compile(r"(?is)<(?P<key>[a-z_][a-z0-9_.:-]{0,127})\b")
 _XML_ELEMENT_PATTERN = re.compile(
     r"(?is)<(?P<tag>[a-z_][a-z0-9_.:-]{0,127})\b[^>]{0,1024}>"
     r"[^<]{1,4096}"
@@ -57,7 +74,8 @@ _XML_ATTRIBUTE_PATTERN = re.compile(
 )
 _TOML_DOCUMENT_HINT = re.compile(
     r"(?m)^\s*(?:\[\[?[^\]\r\n]{1,512}\]\]?|"
-    r"(?:\"(?:\\.|[^\"\\\r\n]){1,512}\"|'[^'\r\n]{1,512}')\s*=)"
+    r"(?:\"(?:\\.|[^\"\\\r\n]){1,512}\"|'[^'\r\n]{1,512}')\s*=|"
+    r"[A-Za-z0-9_-]{1,128}(?:\s*\.\s*[A-Za-z0-9_-]{1,128})*\s*=[^\r\n]*(?:\"\"\"|'''))"
 )
 _XML_UNSAFE_DECLARATION = re.compile(r"(?is)<!\s*(?:DOCTYPE|ENTITY)\b")
 _CAMEL_BOUNDARY_1 = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -94,8 +112,14 @@ class SecretPolicyViolation(ValueError):
 def redact_secret_text(value: str) -> str:
     """Replace every recognized credential form without exposing its value."""
 
+    if _contains_ambiguous_sensitive_key(value):
+        return "[REDACTED]"
+    structured = _redact_structured_document(value)
     for pattern in _FIXED_SECRET_PATTERNS:
-        value = pattern.sub("[REDACTED]", value)
+        structured = pattern.sub("[REDACTED]", structured)
+    if structured != value:
+        return structured
+    value = structured
     value = _QUOTED_ASSIGNMENT_PATTERN.sub(
         _redact_sensitive_quoted_assignment,
         value,
@@ -104,6 +128,163 @@ def redact_secret_text(value: str) -> str:
     value = _XML_CDATA_PATTERN.sub(_redact_sensitive_xml_element, value)
     value = _XML_ELEMENT_PATTERN.sub(_redact_sensitive_xml_element, value)
     return _XML_ATTRIBUTE_PATTERN.sub(_redact_sensitive_xml_attribute, value)
+
+
+def _contains_ambiguous_sensitive_key(value: str) -> bool:
+    """Fail closed when mixed console text contains an unparseable secret key."""
+
+    if _is_complete_structured_document(value):
+        return False
+    if any(
+        _is_sensitive_key(decoded_key)
+        for match in _QUOTED_KEY_SEPARATOR_PATTERN.finditer(value)
+        if (decoded_key := _decode_quoted_key(match.group("key"))) is not None
+    ):
+        return True
+    return any(
+        _is_sensitive_key(match.group("key"))
+        for pattern in (
+            _TOML_KEY_SEPARATOR_PATTERN,
+            _XML_ATTRIBUTE_KEY_PATTERN,
+            _TOML_TABLE_KEY_PATTERN,
+            _XML_ELEMENT_KEY_PATTERN,
+        )
+        for match in pattern.finditer(value)
+    )
+
+
+def _is_complete_structured_document(value: str) -> bool:
+    stripped = value.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(value)
+        except (json.JSONDecodeError, RecursionError):
+            if not _TOML_DOCUMENT_HINT.search(value):
+                return False
+            try:
+                tomllib.loads(value)
+            except (tomllib.TOMLDecodeError, RecursionError):
+                return False
+        return True
+    if stripped.startswith("<"):
+        if _XML_UNSAFE_DECLARATION.search(value):
+            return False
+        try:
+            ElementTree.fromstring(value)
+        except (ElementTree.ParseError, RecursionError):
+            return False
+        return True
+    if not _TOML_DOCUMENT_HINT.search(value):
+        return False
+    try:
+        tomllib.loads(value)
+    except (tomllib.TOMLDecodeError, RecursionError):
+        return False
+    return True
+
+
+def _redact_structured_document(value: str) -> str:
+    """Redact parsed structured documents, failing closed when parsing is unsafe."""
+
+    stripped = value.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            document = json.loads(value)
+        except (json.JSONDecodeError, RecursionError):
+            if _TOML_DOCUMENT_HINT.search(value):
+                return _redact_toml_document(value)
+            return "[REDACTED]" if stripped.endswith(("}", "]")) else value
+        try:
+            redacted, changed = _redact_json_value(document, budget=[0])
+        except SecretPolicyViolation:
+            return "[REDACTED]"
+        if not changed:
+            return value
+        return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+
+    if stripped.startswith("<"):
+        if _XML_UNSAFE_DECLARATION.search(value):
+            return "[REDACTED]"
+        try:
+            root = ElementTree.fromstring(value)
+        except (ElementTree.ParseError, RecursionError):
+            return "[REDACTED]"
+        changed = False
+        for element in list(root.iter()):
+            if isinstance(element.tag, str) and _is_sensitive_key(element.tag):
+                element.clear()
+                element.text = "[REDACTED]"
+                changed = True
+                continue
+            for key in list(element.attrib):
+                if _is_sensitive_key(key):
+                    element.attrib[key] = "[REDACTED]"
+                    changed = True
+        return ElementTree.tostring(root, encoding="unicode") if changed else value
+
+    if _TOML_DOCUMENT_HINT.search(value):
+        return _redact_toml_document(value)
+    return value
+
+
+def _redact_toml_document(value: str) -> str:
+    try:
+        document = tomllib.loads(value)
+    except (tomllib.TOMLDecodeError, RecursionError):
+        return "[REDACTED]"
+    try:
+        if _mapping_contains_sensitive_key(document, budget=[0]):
+            return "[REDACTED]"
+    except SecretPolicyViolation:
+        return "[REDACTED]"
+    return value
+
+
+def _redact_json_value(value: object, *, budget: list[int]) -> tuple[object, bool]:
+    budget[0] += 1
+    if budget[0] > _MAX_STRUCTURED_NODES:
+        raise SecretPolicyViolation("structured redaction exceeds the scan limit")
+    if isinstance(value, Mapping):
+        redacted: dict[object, object] = {}
+        changed = False
+        for key, child in value.items():
+            if isinstance(key, str) and _is_sensitive_key(key):
+                redacted[key] = "[REDACTED]"
+                changed = True
+                continue
+            replacement, child_changed = _redact_json_value(child, budget=budget)
+            redacted[key] = replacement
+            changed |= child_changed
+        return redacted, changed
+    if isinstance(value, list):
+        redacted_items: list[object] = []
+        changed = False
+        for child in value:
+            replacement, child_changed = _redact_json_value(child, budget=budget)
+            redacted_items.append(replacement)
+            changed |= child_changed
+        return redacted_items, changed
+    return value, False
+
+
+def _mapping_contains_sensitive_key(document: object, *, budget: list[int]) -> bool:
+    pending = [document]
+    while pending:
+        current = pending.pop()
+        budget[0] += 1
+        if budget[0] > _MAX_STRUCTURED_NODES:
+            raise SecretPolicyViolation("structured redaction exceeds the scan limit")
+        if isinstance(current, Mapping):
+            for key, child in current.items():
+                if isinstance(key, str) and _is_sensitive_key(key):
+                    return True
+                pending.append(child)
+        elif isinstance(current, Sequence) and not isinstance(
+            current,
+            (str, bytes, bytearray),
+        ):
+            pending.extend(current)
+    return False
 
 
 def _redact_sensitive_quoted_assignment(match: re.Match[str]) -> str:

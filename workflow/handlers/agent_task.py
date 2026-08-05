@@ -405,6 +405,7 @@ class AgentTaskNodeHandler:
         assert self._agent_runs_dir is not None
         capture = None
         has_changes = False
+        transaction: WorkspaceTransaction | None = None
         async with self._locks.hold(
             session_id=context.run.session_id,
             owner_kind=WorkspaceOwnerKind.AGENT_TASK,
@@ -583,6 +584,10 @@ class AgentTaskNodeHandler:
                             workspace_lease=held.lease,
                         )
                 raise
+
+            finally:
+                if transaction is not None:
+                    transaction.close()
 
     async def _predecessor_refs(
         self,

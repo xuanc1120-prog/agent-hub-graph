@@ -157,6 +157,18 @@ class WorkspaceTransaction:
             self._close_secure_root()
             raise
 
+    def close(self) -> None:
+        """Release the pinned workspace root without attempting a restore."""
+
+        self._close_secure_root()
+        if self._phase in {"new", "active"}:
+            self._phase = "closed"
+
+    def abort(self) -> None:
+        """Idempotent alias for callers that abandon a transaction before capture."""
+
+        self.close()
+
     def _begin_pinned(self) -> None:
         secure_root = self._require_secure_root()
         secure_root.assert_root_identity()

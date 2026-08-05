@@ -379,6 +379,7 @@ class TestNodeHandler(_ChangeSetHandler):
                 self._git.remove_private_temporary_directory(validation_root)
                 raise ValueError("test validation root must be outside the shared repository")
             validation_repo = validation_root / "workspace" / "repo"
+            transaction: WorkspaceTransaction | None = None
             try:
                 held.assert_healthy()
                 source = self._git.inspect_source_repository(
@@ -435,6 +436,8 @@ class TestNodeHandler(_ChangeSetHandler):
                 if _workspace_changed(verification):
                     return result, ("test_mutated_workspace",)
             finally:
+                if transaction is not None:
+                    transaction.close()
                 self._git.remove_private_temporary_directory(validation_root)
             if operation_error is not None:
                 if isinstance(
