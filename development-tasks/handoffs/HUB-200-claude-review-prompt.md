@@ -1,5 +1,7 @@
 # HUB-200 Claude Code 阻断式复审提示词
 
+> 历史任务证据：该复审已完成并批准，HUB-200 已通过 `d9d60ddd` 合入 `main`。不要把本提示词作为新的当前任务重复执行。
+
 你现在是 Agent Hub 的独立安全审查人。请使用 Claude Code + Claude Opus 4.8
 （架构和并发问题使用 xhigh）对 HUB-200 做阻断式交叉复审，只输出审查意见，
 不要直接修改 Owner 文件。

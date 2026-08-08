@@ -7,7 +7,9 @@
 - Base：`main@66c6bcc`
 - Branch：`codex/hub-200-workspace-security`
 - 依赖：HUB-110 已完成并集成
-- 状态：ready_for_review
+- Source head：`0e82e694e8bf00f80bc591544d0a32c40c9f4e1e`
+- Merge commit：`d9d60ddd3b91266b4523cadf0c231a05cdd9a8a7`
+- 状态：completed，最终独立复审无 P0/P1/P2，已合入 `main`
 
 ## 目标
 
