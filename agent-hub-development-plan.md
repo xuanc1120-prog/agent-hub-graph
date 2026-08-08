@@ -2342,18 +2342,11 @@ class BaseAgentAdapter:
     async def is_available(self) -> bool:
         raise NotImplementedError
 
-    def build_prompt(
-        self,
-        task_package: TaskPackage,
-        context_pack: ContextPack
-    ) -> str:
+    def build_prompt(self, task_package: TaskPackage, context_pack: ContextPack) -> str:
         raise NotImplementedError
 
     async def run(
-        self,
-        task_package: TaskPackage,
-        context_pack: ContextPack,
-        console_stream=None
+        self, task_package: TaskPackage, context_pack: ContextPack, console_stream=None
     ) -> AgentResult:
         raise NotImplementedError
 ```
