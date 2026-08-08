@@ -15,7 +15,7 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 1. 首个任务 `HUB-000` 完成前，其他 Agent 不写业务代码。
 2. `HUB-010` 协议冻结前，只允许开发脚手架、调研报告和 fixture。
-3. 每个任务使用从最新 `main` 创建的独立 branch/worktree。`HUB-130` worktree 已完成并只保留任务证据；`HUB-110` 必须从集成后的最新 `main` 新建，不能复用历史 worktree。
+3. 每个任务使用从最新 `main` 创建的独立 branch/worktree；历史 worktree 只保留任务证据，不能作为新任务基线。
 4. 同一文件只能有一个 Owner；Reviewer 只提交审查意见，不直接抢改 Owner 文件。
 5. 每个任务必须携带 base commit、允许路径、验收标准和测试命令。
 6. 每个任务一个提交，格式：`type(HUB-xxx): summary`。Agent 不直接 merge 或 push。
@@ -24,17 +24,17 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 ## 3. 阶段任务
 
-### 当前执行看板（2026-07-28）
+### 当前执行看板（2026-08-08）
 
 | 状态 | 任务 |
 |---|---|
-| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130` |
-| ready_for_review | `HUB-200`：Workspace、ChangeSet、LockManager、PatchGuard、CommandGuard 和 RiskClassifier |
-| next | Claude Code 阻断式复审；通过后并行启动 `HUB-210`、`HUB-220` |
+| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200` |
+| ready | `HUB-210`：Approval/Merge/Recovery；`HUB-220`：安全与恢复故障注入 |
+| queued | `HUB-300`：依赖已满足，阶段 2 gate 后进入当前开发波次 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，总任务已集成为 `8/25`。`HUB-200` 在 `codex/hub-200-workspace-security` 已完成实现并进入阻断式复审：Session 独立 clone、Path/Command/Patch Guard、RiskClassifier、canonical WorkspaceTransaction、ChangeSet 持久化、写型 AgentTask 和 Guard/Test NodeHandler 均已接线。当前任务分支 Python `491 passed, 7 skipped`，Ruff、前端 lint、Vitest、生产构建和 Playwright smoke 均通过；在复审和合并完成前，总集成数仍保持 `8/25`。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `1/3`，总任务已集成为 `9/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；最终 Linux gate 通过，`3 skipped`。合并后的 GitHub CI 被新披露的 `nanoid`/`undici` 高危公告拦截，本次状态刷新已将锁文件更新到无已知漏洞版本，仍需合并后重新验证远端 CI。
 
-协议冻结点为 `contracts-frozen-v1`。阶段 1 已完成并集成到 `main`；当前执行顺序为 `HUB-200 -> (HUB-210 与 HUB-220) -> 阶段 2 gate`，其中 HUB-210 与 HUB-220 均在 HUB-200 接口冻结后启动，可并行推进。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。当前执行顺序为 `(HUB-210 || HUB-220) -> 阶段 2 gate -> HUB-300`；HUB-210 与 HUB-220 已解除依赖，可从 `main@d9d60ddd` 创建独立任务分支并行推进。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 

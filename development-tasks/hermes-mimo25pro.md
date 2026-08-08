@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的测试、Context/Artifact 和交付保障负责人。重点是把计划中的安全与恢复承诺变成可重复测试。
 
-`HUB-130` 已完成并集成。下一任务为 `HUB-220`，需等待 `HUB-200` 的 Workspace/Guard 实现后启动。
+`HUB-130` 和前置的 `HUB-200` 均已完成并集成。当前任务为 `HUB-220`：立即从最新 `main` 建立独立 worktree，先覆盖 Workspace/Guard 失败注入，再随 HUB-210 接口补齐 Approval/Recovery 场景。
 
 ## 高级任务
 

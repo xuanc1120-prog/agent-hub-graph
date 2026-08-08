@@ -47,7 +47,7 @@ flowchart LR
 
 ## 当前进度
 
-截至 2026-07-26，阶段 0 和阶段 1 均已完成；`HUB-110` 已通过最终复审、集成到 `main`，阶段 1 CLI/Mock gate 已通过：
+截至 2026-08-08，阶段 0 和阶段 1 均已完成，阶段 2 已完成 `1/3`；`HUB-200` 已通过独立安全复审并合入 `main`：
 
 | 任务 | 状态 | 内容 |
 |---|---|---|
@@ -59,15 +59,16 @@ flowchart LR
 | `HUB-120` | 已完成 | RuleBasedPlanner、AgentRouter、fallback 与 lineage |
 | `HUB-130` | 已完成 | ContextPack、ArtifactStore、TaskContextBundle 与 EventRegistry |
 | `HUB-110` | 已完成 | Compiler、Scheduler、GraphExecutor 与只读 MockAgent 闭环 |
-| `HUB-200` | 进行中 | Session 独立 clone、Path/Command/Patch Guard、RiskClassifier 与 canonical WorkspaceTransaction；持久化和 NodeHandler 接线待完成 |
+| `HUB-200` | 已完成 | Session 独立 clone、canonical WorkspaceTransaction、ChangeSet 持久化、Guard/Test NodeHandler 与安全恢复链 |
 
-当前 HUB-200 分支已完成第一批共享工作区安全基础设施，但以下部分尚未完成：
+当前已集成 `9/25` 个任务。最小可写 demo 仍缺少以下关键路径：
 
-- ChangeSet/artifact 持久化、Guard/Test NodeHandler、审批和恢复链；
+- `HUB-210`：Approval、Capability、Merge、取消线性化与 RecoveryManager；
+- `HUB-220`：路径、租约、测试污染、审批冲突和崩溃恢复的系统化故障注入；
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步继续 `HUB-200` 第二批，实现 ChangeSet/artifact 持久化和 Guard/Test NodeHandler 接线。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步并行启动 `HUB-210` 和 `HUB-220`，两者通过后完成阶段 2 gate；`HUB-300` 的依赖已满足，但不抢占当前安全闭环。
 
 ## 技术栈
 

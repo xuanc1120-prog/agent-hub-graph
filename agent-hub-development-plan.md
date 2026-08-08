@@ -1,6 +1,6 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
-## 当前执行基线（2026-07-26）
+## 当前执行基线（2026-08-08）
 
 协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
@@ -14,17 +14,23 @@
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
 | HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
-| HUB-200 | in_progress | 独立 Session clone、Path/Command/Patch Guard、RiskClassifier 与 canonical WorkspaceTransaction 首批已实现 |
+| HUB-200 | completed | WorkspaceTransaction、canonical ChangeSet、Guard/Test NodeHandler 与安全恢复链已复审并集成 |
+| HUB-210 | ready | ApprovalManager、CapabilityBroker、MergePatch、取消线性化与 RecoveryManager |
+| HUB-220 | ready | Workspace/Guard/Recovery 安全回归与失败注入 |
 
-阶段 0 和阶段 1 已完成。`HUB-200` 已从 `main@f356e69` 在 `codex/hub-200-workspace-security` 启动；真实写任务仍保持 fail closed，直到 ChangeSet 持久化、NodeHandler 安全链以及 HUB-210 Approval/Merge/Recovery 全部完成。后续顺序为：
+阶段 0 和阶段 1 已完成，阶段 2 已完成 `1/3`，总进度为 `9/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`；真实写任务仍在 Approval/Merge 边界 fail closed，直到 HUB-210 完成。后续顺序为：
 
 ```text
-HUB-200（Workspace、ChangeSet、Guard）
-        ↓
-HUB-210（Approval、Merge、Cancel、Recovery）
+HUB-200（已完成）
+        ├── HUB-210（Approval、Merge、Cancel、Recovery）
+        └── HUB-220（安全回归与失败注入）
+                    ↓
+               阶段 2 gate
+                    ↓
+                 HUB-300
 ```
 
-当前执行 `HUB-200`，任务简报见 `development-tasks/next-wave/HUB-200-codex.md`。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+当前并行准备 `HUB-210` 与 `HUB-220`；`HUB-300` 虽已满足静态依赖，但排在阶段 2 gate 之后。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 
