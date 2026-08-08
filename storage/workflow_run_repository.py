@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from pathlib import Path
 
 import aiosqlite
 
@@ -13,6 +14,7 @@ from master.router import AgentCatalog
 from protocol import (
     ActorType,
     AuthorGraph,
+    ChangeSetStatus,
     CompiledGraph,
     EdgeCondition,
     NodeOutcome,
@@ -23,6 +25,8 @@ from protocol import (
     WorkflowRunStatus,
     canonical_json,
 )
+from security.command_guard import CommandGuard
+from security.path_policy import PathPolicy
 from storage.agent_repository import AgentRepository, compute_agent_catalog_hash
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ConcurrencyConflict, RecordNotFound, SnapshotIntegrityError
@@ -219,7 +223,8 @@ class WorkflowRunRepository:
                 SELECT w.session_id, w.semantic_version, w.layout_version,
                        w.author_graph_hash, w.layout_hash,
                        s.status AS session_status,
-                       s.integration_head_commit
+                       s.integration_head_commit,
+                       s.shared_repo_path
                 FROM workflows w
                 JOIN sessions s ON w.session_id = s.id
                 WHERE w.id = ?
@@ -247,6 +252,8 @@ class WorkflowRunRepository:
             authoritative = WorkflowCompiler(
                 current_catalog,
                 policy_version=self._policy_version,
+                path_policy=PathPolicy(Path(str(current["shared_repo_path"]))),
+                command_guard=CommandGuard(),
             ).compile(
                 workflow.author_graph,
                 integration_base_commit=value.current_commit,
@@ -550,7 +557,8 @@ class WorkflowRunRepository:
             current = await transaction.fetch_one(
                 """
                 SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
-                       wr.cancel_requested_at
+                       wr.cancel_requested_at, wr.compiled_snapshot_json,
+                       wr.compiled_snapshot_hash
                 FROM node_runs nr
                 JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
                 WHERE nr.id = ?
@@ -573,10 +581,52 @@ class WorkflowRunRepository:
                 )
                 if artifact is None:
                     raise RecordNotFound(f"output artifact not found: {output_artifact_id}")
+                graph = CompiledGraph.model_validate_json(
+                    str(current["compiled_snapshot_json"]),
+                    strict=True,
+                )
+                if sha256(canonical_json(graph)).hexdigest() != str(
+                    current["compiled_snapshot_hash"]
+                ):
+                    raise SnapshotIntegrityError("compiled workflow snapshot hash mismatch")
+                compiled_node = next(
+                    (node for node in graph.nodes if node.id == str(current["node_id"])),
+                    None,
+                )
+                if compiled_node is None:
+                    raise SnapshotIntegrityError(
+                        "running node is absent from compiled workflow snapshot"
+                    )
+                owner_node_run_id = node_run_id_value
+                source_bound = False
+                if compiled_node.system_managed and compiled_node.source_node_id is not None:
+                    source_bound = True
+                    owner = await transaction.fetch_one(
+                        """
+                        SELECT id FROM node_runs
+                        WHERE workflow_run_id = ? AND node_id = ?
+                        ORDER BY attempt DESC LIMIT 1
+                        """,
+                        (
+                            str(current["workflow_run_id"]),
+                            compiled_node.source_node_id,
+                        ),
+                    )
+                    if owner is None:
+                        raise SnapshotIntegrityError(
+                            "system node source run is absent from workflow run"
+                        )
+                    owner_node_run_id = str(owner["id"])
                 task_owner = await transaction.fetch_one(
                     "SELECT id FROM tasks WHERE node_run_id = ?",
-                    (node_run_id_value,),
+                    (owner_node_run_id,),
                 )
+                node_type = NodeType(str(current["node_type"]))
+                if task_owner is None and (
+                    source_bound
+                    or (node_type == NodeType.AGENT_TASK and target == NodeRunStatus.COMPLETED)
+                ):
+                    raise SnapshotIntegrityError("node output requires an existing source task")
                 expected_task_id = str(task_owner["id"]) if task_owner is not None else None
                 actual_task_id = (
                     str(artifact["task_id"]) if artifact["task_id"] is not None else None
@@ -588,12 +638,119 @@ class WorkflowRunRepository:
                     or (actual_task_id is not None and actual_task_id != expected_task_id)
                 ):
                     raise ValueError("node output artifact is not a redacted session artifact")
-                if (
-                    target == NodeRunStatus.COMPLETED
-                    and NodeType(str(current["node_type"])) == NodeType.AGENT_TASK
-                    and actual_task_id != expected_task_id
+                requires_owned_output = (
+                    target == NodeRunStatus.COMPLETED and node_type == NodeType.AGENT_TASK
+                ) or (source_bound and target != NodeRunStatus.FAILED)
+                if requires_owned_output and actual_task_id != expected_task_id:
+                    raise ValueError("node output artifact must belong to its source task")
+            if NodeType(str(current["node_type"])) == NodeType.AGENT_TASK:
+                graph = CompiledGraph.model_validate_json(
+                    str(current["compiled_snapshot_json"]),
+                    strict=True,
+                )
+                if sha256(canonical_json(graph)).hexdigest() != str(
+                    current["compiled_snapshot_hash"]
                 ):
-                    raise ValueError("completed AgentTask output must belong to its task")
+                    raise SnapshotIntegrityError("compiled workflow snapshot hash mismatch")
+                compiled_node = next(
+                    (node for node in graph.nodes if node.id == str(current["node_id"])),
+                    None,
+                )
+                if compiled_node is None:
+                    raise SnapshotIntegrityError(
+                        "running node is absent from compiled workflow snapshot"
+                    )
+                if compiled_node.requires_write:
+                    task_state = await transaction.fetch_one(
+                        """
+                        SELECT t.id AS task_id,
+                               t.status AS task_status,
+                               cs.status AS change_set_status
+                        FROM tasks t
+                        LEFT JOIN change_sets cs ON cs.task_id = t.id
+                        WHERE t.node_run_id = ?
+                        """,
+                        (node_run_id_value,),
+                    )
+                    if task_state is not None:
+                        task_status = TaskStatus(str(task_state["task_status"]))
+                        change_set_status = (
+                            ChangeSetStatus(str(task_state["change_set_status"]))
+                            if task_state["change_set_status"] is not None
+                            else None
+                        )
+                        if target == NodeRunStatus.COMPLETED:
+                            if (
+                                task_status != TaskStatus.SUCCEEDED
+                                or change_set_status != ChangeSetStatus.CAPTURED
+                            ):
+                                raise SnapshotIntegrityError(
+                                    "completed write node lacks a durable successful task"
+                                )
+                        elif (
+                            task_status
+                            in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.SUCCEEDED}
+                            or change_set_status == ChangeSetStatus.CAPTURED
+                        ):
+                            raise SnapshotIntegrityError(
+                                "failed write node has an unfinished task or live ChangeSet"
+                            )
+                        task_event = await transaction.fetch_one(
+                            """
+                            SELECT payload_json FROM events
+                            WHERE workflow_run_id = ?
+                              AND event_type = ?
+                              AND json_extract(payload_json, '$.task_id') = ?
+                            ORDER BY run_seq DESC
+                            LIMIT 1
+                            """,
+                            (
+                                str(current["workflow_run_id"]),
+                                TASK_STATE_CHANGED,
+                                str(task_state["task_id"]),
+                            ),
+                        )
+                        if task_event is None:
+                            raise SnapshotIntegrityError(
+                                "write task terminal state lacks a fencing event"
+                            )
+                        try:
+                            task_proof = TaskEventPayload.model_validate_json(
+                                str(task_event["payload_json"]),
+                                strict=True,
+                            )
+                        except ValueError as error:
+                            raise SnapshotIntegrityError(
+                                "write task fencing event is invalid"
+                            ) from error
+                        if (
+                            task_proof.status != task_status
+                            or task_proof.workspace_fencing_token is None
+                        ):
+                            raise SnapshotIntegrityError(
+                                "write task terminal state lacks a matching fencing token"
+                            )
+                        workspace_lock = await transaction.fetch_one(
+                            """
+                            SELECT owner_kind, owner_operation_id, fencing_token
+                            FROM file_locks WHERE resource_key = ?
+                            """,
+                            (f"session:{current['session_id']}:integration",),
+                        )
+                        if (
+                            workspace_lock is None
+                            or str(workspace_lock["owner_kind"]) != "agent_task"
+                            or str(workspace_lock["owner_operation_id"])
+                            != str(task_state["task_id"])
+                            or int(workspace_lock["fencing_token"])
+                            != task_proof.workspace_fencing_token
+                        ):
+                            raise SnapshotIntegrityError(
+                                "workspace fencing advanced before write node completion"
+                            )
+                    elif target == NodeRunStatus.COMPLETED:
+                        raise SnapshotIntegrityError("completed write node lacks a durable task")
+
             changed = await transaction.execute(
                 """
                 UPDATE node_runs
@@ -800,6 +957,7 @@ class WorkflowRunRepository:
         *,
         target: TaskStatus,
         lease: MasterLease,
+        workspace_lease: WorkspaceLease | None = None,
         error_code: str | None = None,
         now: datetime | None = None,
     ) -> TaskRecord:
@@ -822,6 +980,7 @@ class WorkflowRunRepository:
             target=target,
             lease=lease,
             error_code=error_code,
+            workspace_lease=workspace_lease,
             now=now,
         )
 
@@ -842,6 +1001,7 @@ class WorkflowRunRepository:
         target: TaskStatus,
         lease: MasterLease,
         error_code: str | None = None,
+        workspace_lease: WorkspaceLease | None = None,
         now: datetime | None = None,
     ) -> TaskRecord:
         finished_at = None if target == TaskStatus.RUNNING else utc_now_text(now)
@@ -849,9 +1009,11 @@ class WorkflowRunRepository:
             await self._leases.assert_valid_in(transaction, lease, now=now)
             current = await transaction.fetch_one(
                 """
-                SELECT t.*, nr.workflow_run_id, nr.status AS node_status,
+                SELECT t.*, nr.workflow_run_id, nr.node_id,
+                       nr.status AS node_status,
                        wr.workflow_id, wr.session_id, wr.cancel_requested_at,
-                       wr.status AS run_status
+                       wr.status AS run_status, wr.compiled_snapshot_json,
+                       wr.compiled_snapshot_hash
                 FROM tasks t
                 JOIN node_runs nr ON t.node_run_id = nr.id
                 JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
@@ -867,6 +1029,54 @@ class WorkflowRunRepository:
                 raise ConcurrencyConflict("task transition requires a running workflow")
             if NodeRunStatus(str(current["node_status"])) != NodeRunStatus.RUNNING:
                 raise ConcurrencyConflict("task transition requires a running node")
+            graph = CompiledGraph.model_validate_json(
+                str(current["compiled_snapshot_json"]),
+                strict=True,
+            )
+            if sha256(canonical_json(graph)).hexdigest() != str(current["compiled_snapshot_hash"]):
+                raise SnapshotIntegrityError("compiled workflow snapshot hash mismatch")
+            compiled_node = next(
+                (node for node in graph.nodes if node.id == str(current["node_id"])),
+                None,
+            )
+            if compiled_node is None:
+                raise SnapshotIntegrityError("task node is absent from compiled snapshot")
+            write_task = compiled_node.node_type == NodeType.AGENT_TASK and bool(
+                compiled_node.requires_write
+            )
+            if write_task:
+                if workspace_lease is None:
+                    raise ValueError("write task completion requires a workspace lease")
+                expected_resource = f"session:{current['session_id']}:integration"
+                if (
+                    workspace_lease.resource_key != expected_resource
+                    or workspace_lease.owner_kind != "agent_task"
+                    or workspace_lease.owner_operation_id != task_id
+                ):
+                    raise ValueError("workspace lease does not own this write task")
+                await self._workspace_leases.assert_valid_in(
+                    transaction,
+                    workspace_lease,
+                    now=now,
+                )
+                change_set = await transaction.fetch_one(
+                    "SELECT status FROM change_sets WHERE task_id = ?",
+                    (task_id,),
+                )
+                change_set_status = (
+                    ChangeSetStatus(str(change_set["status"])) if change_set is not None else None
+                )
+                if target == TaskStatus.SUCCEEDED:
+                    if change_set_status != ChangeSetStatus.CAPTURED:
+                        raise SnapshotIntegrityError(
+                            "successful write task requires a captured ChangeSet"
+                        )
+                elif change_set_status == ChangeSetStatus.CAPTURED:
+                    raise SnapshotIntegrityError(
+                        "failed write task cannot retain a captured ChangeSet"
+                    )
+            elif workspace_lease is not None:
+                raise ValueError("read-only task completion cannot use a workspace lease")
             changed = await transaction.execute(
                 """
                 UPDATE tasks
@@ -887,6 +1097,9 @@ class WorkflowRunRepository:
                 previous=expected,
                 target=target,
                 error_code=error_code,
+                workspace_fencing_token=(
+                    workspace_lease.fencing_token if workspace_lease is not None else None
+                ),
                 now=now,
             )
             row = await transaction.fetch_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -1096,6 +1309,7 @@ class WorkflowRunRepository:
         previous: TaskStatus | None,
         target: TaskStatus,
         error_code: str | None = None,
+        workspace_fencing_token: int | None = None,
         now: datetime | None,
     ) -> None:
         await self._events.append_in(
@@ -1108,6 +1322,7 @@ class WorkflowRunRepository:
             actor_id=lease.instance_id,
             payload=TaskEventPayload(
                 master_fencing_token=lease.fencing_token,
+                workspace_fencing_token=workspace_fencing_token,
                 workflow_run_id=str(row["workflow_run_id"]),
                 node_run_id=str(
                     row["node_run_id"] if "node_run_id" in tuple(row.keys()) else row["id"]

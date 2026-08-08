@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -31,9 +30,14 @@ from protocol import (
     WorkflowEdge,
     WorkflowLayout,
 )
+from security.command_guard import CommandGuard
+from security.path_policy import PathPolicy
+from security.risk_classifier import RiskClassifier
+from security.test_runner import TestRunner
 from storage.agent_repository import AgentRepository
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import ArtifactStore
+from storage.change_set_repository import ChangeSetRepository
 from storage.db import Database
 from storage.errors import LeaseLost
 from storage.event_repository import EventRecord, EventRepository
@@ -63,8 +67,16 @@ from workflow.executable_validator import ExecutableValidator
 from workflow.executor import GraphExecutor
 from workflow.handlers.agent_task import AgentTaskNodeHandler
 from workflow.handlers.factory import build_node_registry
+from workflow.handlers.guards import (
+    CommandGuardNodeHandler,
+    PatchGuardNodeHandler,
+    RiskClassifierNodeHandler,
+    TestNodeHandler,
+)
 from workflow.registry import NodeRegistry
 from workflow.scheduler import DurableScheduler
+from workspace.git_manager import GitManager
+from workspace.lock_manager import LockManager, WorkspaceOwnerKind
 
 _ENTITY_ID = TypeAdapter(EntityId)
 
@@ -81,6 +93,7 @@ class PlanResult:
 class RuntimeServices:
     paths: DataPaths
     database: Database
+    git: GitManager
     agents: AgentRepository
     sessions: SessionRepository
     workflows: WorkflowRepository
@@ -88,6 +101,9 @@ class RuntimeServices:
     events: EventRepository
     leases: MasterLeaseRepository
     workspace_leases: WorkspaceLeaseRepository
+    locks: LockManager
+    artifacts: ArtifactRepository
+    change_sets: ChangeSetRepository
     runs: WorkflowRunRepository
     registry: NodeRegistry
     scheduler: DurableScheduler
@@ -134,11 +150,16 @@ class WorkflowApplication:
             await self.services.leases.release(current)
 
     @asynccontextmanager
-    async def temporary_workspace(self, session_id: str, *, owner_kind: str):
-        lease = await self.services.workspace_leases.acquire(
-            resource_key=f"session:{session_id}:integration",
+    async def temporary_workspace(
+        self,
+        session_id: str,
+        *,
+        owner_kind: WorkspaceOwnerKind,
+    ):
+        lease = await self.services.locks.acquire(
+            session_id=session_id,
             owner_kind=owner_kind,
-            owner_operation_id=f"{owner_kind}-{uuid.uuid4().hex}",
+            owner_operation_id=f"{owner_kind.value}-{uuid.uuid4().hex}",
             owner_process_id=os.getpid(),
             ttl_seconds=self._settings.workspace_lease_ttl_seconds,
         )
@@ -152,7 +173,7 @@ class WorkflowApplication:
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=interval)
                 except TimeoutError:
-                    current = await self.services.workspace_leases.heartbeat(
+                    current = await self.services.locks.heartbeat(
                         current,
                         ttl_seconds=self._settings.workspace_lease_ttl_seconds,
                     )
@@ -167,7 +188,7 @@ class WorkflowApplication:
                     await heartbeat_task
             finally:
                 with suppress(LeaseLost):
-                    await self.services.workspace_leases.release(current)
+                    await self.services.locks.release(current)
 
     async def register_mock_agent(self) -> None:
         await self.services.agents.register_mock()
@@ -180,8 +201,8 @@ class WorkflowApplication:
         session_id: str | None = None,
     ) -> SessionRecord:
         resolved_repo = repo.expanduser().resolve(strict=True)
-        state = _git_state(resolved_repo)
-        if state.dirty:
+        source = self.services.git.inspect_source_repository(resolved_repo)
+        if source.dirty:
             raise ValueError("source repository must be clean before session creation")
         if not goal or len(goal) > 20_000:
             raise ValueError("goal must contain 1..20000 characters")
@@ -189,24 +210,31 @@ class WorkflowApplication:
         directory_id = sha256(resolved_id.encode("utf-8")).hexdigest()[:32]
         shared_parent = self.services.paths.shared_workspaces / f"session-{directory_id}"
         shared = shared_parent / "repo"
-        shared.mkdir(parents=True, exist_ok=False)
         try:
+            state = self.services.git.create_session_repository(
+                source=source,
+                destination=shared,
+                session_id=resolved_id,
+            )
             return await self.services.sessions.create(
                 NewSession(
                     session_id=resolved_id,
                     goal=goal,
                     source_repo_path=resolved_repo,
                     shared_repo_path=shared,
-                    base_commit=state.commit,
+                    base_commit=source.commit,
                     integration_branch=state.branch,
                     integration_head_commit=state.commit,
                 )
             )
-        except BaseException:
-            with suppress(OSError):
-                shared.rmdir()
-            with suppress(OSError):
-                shared_parent.rmdir()
+        except BaseException as operation_error:
+            try:
+                self.services.git.remove_session_repository(
+                    shared,
+                    allowed_root=self.services.paths.shared_workspaces,
+                )
+            except Exception as cleanup_error:
+                operation_error.add_note(f"session clone cleanup failed: {cleanup_error!r}")
             raise
 
     async def plan(
@@ -282,7 +310,7 @@ class WorkflowApplication:
         session = await self.services.sessions.get(workflow.session_id)
         async with self.temporary_workspace(
             session.session_id,
-            owner_kind="validate",
+            owner_kind=WorkspaceOwnerKind.VALIDATE,
         ) as workspace_lease:
             return await self._validate_loaded(
                 workflow,
@@ -297,7 +325,7 @@ class WorkflowApplication:
         *,
         workspace_lease: WorkspaceLease,
     ) -> ValidateResponse:
-        state = _git_state(session.source_repo_path)
+        state = self.services.git.state(session.shared_repo_path)
         preflight_errors: list[ValidationIssue] = []
         if session.status != SessionStatus.ACTIVE:
             preflight_errors.append(
@@ -309,19 +337,23 @@ class WorkflowApplication:
         if state.dirty:
             preflight_errors.append(
                 ValidationIssue(
-                    code="source_repo_dirty",
-                    message="source repository changed after session creation",
+                    code="shared_repo_dirty",
+                    message="session integration repository is not clean",
                 )
             )
         if state.commit != session.integration_head_commit:
             preflight_errors.append(
                 ValidationIssue(
                     code="integration_head_changed",
-                    message="source repository HEAD differs from the session snapshot",
+                    message="session integration HEAD differs from the durable session head",
                 )
             )
         catalog = await self.services.agents.catalog()
-        compilation = WorkflowCompiler(catalog).compile(
+        compilation = WorkflowCompiler(
+            catalog,
+            path_policy=PathPolicy(session.shared_repo_path),
+            command_guard=CommandGuard(),
+        ).compile(
             workflow.author_graph,
             integration_base_commit=session.integration_head_commit,
         )
@@ -330,16 +362,16 @@ class WorkflowApplication:
         if compilation.graph is not None:
             executable = ExecutableValidator(
                 self.services.registry,
-                write_runtime_enabled=False,
+                write_runtime_enabled=True,
             ).validate(compilation.graph)
             errors.extend(executable.errors)
             warnings.extend(executable.warnings)
-        final_state = _git_state(session.source_repo_path)
+        final_state = self.services.git.state(session.shared_repo_path)
         if final_state != state:
             errors.append(
                 ValidationIssue(
-                    code="source_repo_changed_during_validation",
-                    message="source repository changed while the workflow was compiling",
+                    code="shared_repo_changed_during_validation",
+                    message="session integration repository changed while compiling",
                 )
             )
         ok = compilation.graph is not None and not errors
@@ -378,7 +410,7 @@ class WorkflowApplication:
         initial_session = await self.services.sessions.get(initial_workflow.session_id)
         async with self.temporary_workspace(
             initial_session.session_id,
-            owner_kind="run",
+            owner_kind=WorkspaceOwnerKind.RUN,
         ) as workspace_lease:
             workflow = await self.services.workflows.get(workflow_id)
             session = await self.services.sessions.get(workflow.session_id)
@@ -399,9 +431,11 @@ class WorkflowApplication:
                 and confirmed_compiled_hash != validation.compiled_hash
             ):
                 raise ValueError("confirmed compiled hash does not match current compilation")
-            final_state = _git_state(session.source_repo_path)
+            final_state = self.services.git.state(session.shared_repo_path)
             if final_state.dirty or final_state.commit != validation.integration_base_commit:
-                raise ValueError("source repository changed before run snapshot creation")
+                raise ValueError(
+                    "session integration repository changed before run snapshot creation"
+                )
             if workflow.semantic_version != validation.source_semantic_version:
                 raise ValueError("workflow changed before run snapshot creation")
             catalog = await self.services.agents.catalog()
@@ -454,32 +488,6 @@ class WorkflowApplication:
         return await self.services.events.list_all_by_session(session_id, page_size=limit)
 
 
-@dataclass(frozen=True, slots=True)
-class _GitState:
-    commit: str
-    branch: str
-    dirty: bool
-
-
-def _git_state(repo: Path) -> _GitState:
-    def run(*args: str) -> str:
-        completed = subprocess.run(
-            ["git", *args],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return completed.stdout.strip()
-
-    return _GitState(
-        commit=run("rev-parse", "HEAD"),
-        branch=run("rev-parse", "--abbrev-ref", "HEAD"),
-        dirty=bool(run("status", "--porcelain", "--untracked-files=normal")),
-    )
-
-
 def _readonly_demo_graph(graph: AuthorGraph) -> AuthorGraph:
     input_node = next(node for node in graph.nodes if node.node_type.value == "input")
     output_node = next(node for node in graph.nodes if node.node_type.value == "output")
@@ -517,10 +525,16 @@ def _readonly_demo_graph(graph: AuthorGraph) -> AuthorGraph:
 def _build_services(settings: Settings) -> RuntimeServices:
     paths = DataPaths.from_settings(settings)
     database = Database(paths.database)
+    git = GitManager(
+        paths.profiles / "git",
+        max_tracked_paths=settings.max_source_tracked_paths,
+        max_git_bytes=settings.max_source_git_bytes,
+    )
     agents = AgentRepository(database)
     sessions = SessionRepository(database)
     leases = MasterLeaseRepository(database)
     workspace_leases = WorkspaceLeaseRepository(database)
+    locks = LockManager(workspace_leases)
     workflows = WorkflowRepository(database)
     events = EventRepository(database, build_runtime_event_registry())
     planner_runs = PlannerRunRepository(database, events, leases)
@@ -530,6 +544,13 @@ def _build_services(settings: Settings) -> RuntimeServices:
         ArtifactStore(paths.artifacts),
         max_artifact_bytes=settings.max_artifact_bytes,
         max_session_artifact_bytes=settings.max_session_artifact_bytes,
+    )
+    command_guard = CommandGuard()
+    change_sets = ChangeSetRepository(database, artifacts, events, leases, locks)
+    test_runner = TestRunner(
+        command_guard,
+        timeout_seconds=settings.agent_default_timeout_seconds,
+        max_output_bytes=settings.max_console_bytes_per_run,
     )
     bundles = TaskContextBundle(
         artifacts,
@@ -541,9 +562,44 @@ def _build_services(settings: Settings) -> RuntimeServices:
         runs,
         artifacts,
         bundles,
-        {"mock": MockAgentAdapter()},
+        {"mock": MockAgentAdapter(demo_write_enabled=True)},
+        change_sets=change_sets,
+        git=git,
+        locks=locks,
+        agent_runs_dir=paths.agent_runs,
+        workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
+        workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
+        max_changed_paths=settings.max_changed_paths,
+        max_patch_bytes=settings.max_patch_bytes,
+        max_created_bytes=settings.max_task_created_bytes,
     )
-    registry = build_node_registry(agent_handler)
+    registry = build_node_registry(
+        agent_handler,
+        patch_guard_handler=PatchGuardNodeHandler(change_sets, artifacts),
+        command_guard_handler=CommandGuardNodeHandler(
+            change_sets,
+            artifacts,
+            command_guard,
+        ),
+        test_handler=TestNodeHandler(
+            change_sets,
+            artifacts,
+            git,
+            locks,
+            test_runner,
+            runtime_root=paths.agent_runs,
+            workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
+            workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
+            max_changed_paths=settings.max_changed_paths,
+            max_patch_bytes=settings.max_patch_bytes,
+            max_created_bytes=settings.max_task_created_bytes,
+        ),
+        risk_handler=RiskClassifierNodeHandler(
+            change_sets,
+            artifacts,
+            RiskClassifier(),
+        ),
+    )
     executor = GraphExecutor(runs, sessions, artifacts, registry)
     scheduler = DurableScheduler(
         runs,
@@ -553,6 +609,7 @@ def _build_services(settings: Settings) -> RuntimeServices:
     return RuntimeServices(
         paths=paths,
         database=database,
+        git=git,
         agents=agents,
         sessions=sessions,
         workflows=workflows,
@@ -560,6 +617,9 @@ def _build_services(settings: Settings) -> RuntimeServices:
         events=events,
         leases=leases,
         workspace_leases=workspace_leases,
+        locks=locks,
+        artifacts=artifacts,
+        change_sets=change_sets,
         runs=runs,
         registry=registry,
         scheduler=scheduler,

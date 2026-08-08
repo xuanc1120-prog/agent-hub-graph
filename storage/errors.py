@@ -65,3 +65,11 @@ class BundleError(StorageError):
 
 class SnapshotIntegrityError(StorageError):
     """An immutable workflow snapshot failed hash or metadata validation."""
+
+
+class ChangeSetIntegrityError(StorageError):
+    """A persisted ChangeSet or one of its artifact references is inconsistent."""
+
+
+class ChangeSetReconciliationRequired(ChangeSetIntegrityError):
+    """Capture commit outcome is inconsistent and requires recovery cleanup."""

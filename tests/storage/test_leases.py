@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -177,3 +179,110 @@ async def test_expired_workspace_takeover_rejects_stale_heartbeat(database: Data
     with pytest.raises(LeaseLost):
         await repository.heartbeat(old, ttl_seconds=5, now=BASE + timedelta(seconds=7))
     await repository.assert_valid(current, now=BASE + timedelta(seconds=7))
+
+
+async def test_workspace_fenced_operation_excludes_expired_takeover(
+    database: Database,
+) -> None:
+    owner = WorkspaceLeaseRepository(database)
+    contender = WorkspaceLeaseRepository(database)
+    lease = await owner.acquire(
+        resource_key="session:fenced",
+        owner_kind="agent_task",
+        owner_operation_id="task-fenced",
+        owner_process_id=101,
+        ttl_seconds=5,
+        now=BASE,
+    )
+    takeover_started = threading.Event()
+    takeover_finished = threading.Event()
+    outcomes: list[object] = []
+
+    def takeover_thread() -> None:
+        async def acquire() -> object:
+            takeover_started.set()
+            return await contender.acquire(
+                resource_key="session:fenced",
+                owner_kind="recovery",
+                owner_operation_id="recovery-fenced",
+                owner_process_id=202,
+                ttl_seconds=30,
+                now=BASE + timedelta(seconds=6),
+            )
+
+        try:
+            outcomes.append(asyncio.run(acquire()))
+        except BaseException as error:
+            outcomes.append(error)
+        finally:
+            takeover_finished.set()
+
+    thread = threading.Thread(target=takeover_thread, daemon=True)
+
+    def fenced_operation() -> str:
+        thread.start()
+        assert takeover_started.wait(timeout=1)
+        time.sleep(0.2)
+        assert not takeover_finished.is_set()
+        return "captured"
+
+    result, renewed = await owner.run_fenced(
+        lease,
+        fenced_operation,
+        ttl_seconds=10,
+        now=BASE + timedelta(seconds=1),
+    )
+    await asyncio.to_thread(thread.join, 5)
+
+    assert result == "captured"
+    assert renewed.fencing_token == lease.fencing_token
+    assert renewed.expires_at > lease.expires_at
+    assert not thread.is_alive()
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], LeaseUnavailable)
+    replacement = await contender.acquire(
+        resource_key="session:fenced",
+        owner_kind="recovery",
+        owner_operation_id="recovery-fenced",
+        owner_process_id=202,
+        ttl_seconds=30,
+        now=BASE + timedelta(seconds=12),
+    )
+    assert replacement.fencing_token == lease.fencing_token + 1
+
+
+async def test_stale_workspace_lease_cannot_enter_fenced_operation(
+    database: Database,
+) -> None:
+    repository = WorkspaceLeaseRepository(database)
+    old = await repository.acquire(
+        resource_key="session:stale-fenced",
+        owner_kind="agent_task",
+        owner_operation_id="task-stale-fenced",
+        owner_process_id=101,
+        ttl_seconds=5,
+        now=BASE,
+    )
+    await repository.acquire(
+        resource_key="session:stale-fenced",
+        owner_kind="recovery",
+        owner_operation_id="recovery-stale-fenced",
+        owner_process_id=202,
+        ttl_seconds=30,
+        now=BASE + timedelta(seconds=6),
+    )
+    operation_called = False
+
+    def stale_operation() -> None:
+        nonlocal operation_called
+        operation_called = True
+
+    with pytest.raises(LeaseLost):
+        await repository.run_fenced(
+            old,
+            stale_operation,
+            ttl_seconds=5,
+            now=BASE + timedelta(seconds=7),
+        )
+
+    assert operation_called is False

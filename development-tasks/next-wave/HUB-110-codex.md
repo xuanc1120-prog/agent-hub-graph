@@ -47,8 +47,8 @@
 
 ## 交付状态
 
-- 实现状态：完成，等待 Claude Code 交叉复审。
-- Python：`363 passed, 5 skipped`；Ruff check/format 通过。
+- 实现状态：已通过 Claude Code 最终交叉复审、集成到 `main`，阶段 1 CLI/Mock gate 已通过。
+- 最终复审基线：Python `389 passed, 5 skipped`；Ruff check/format 通过。
 - 前端：Oxlint 通过，Vitest `7 passed`，生产构建通过，Playwright smoke `1 passed`。
 - 写入型图只生成确定性安全链预览，执行仍以 `write_runtime_unavailable` fail closed。
-- GitManager、ProjectedFileState、真实 Guard/Approval/Merge、取消和 RecoveryManager 仍分别属于 `HUB-200/210`，本任务未提前实现或弱化这些边界。
+- HUB-110 未提前实现或弱化写入安全边界；GitManager、WorkspaceTransaction 和真实 Guard 当前由 `HUB-200` 实现，Approval、Merge、取消和 RecoveryManager 仍属于 `HUB-210`。

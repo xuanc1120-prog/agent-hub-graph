@@ -24,6 +24,9 @@ from protocol import (
     WorkflowNode,
     canonical_json,
 )
+from security.command_guard import CommandGuard, CommandGuardViolation
+from security.path_policy import PathPolicy, PathPolicyViolation
+from security.risk_classifier import RiskClassifier
 from workflow.graph_model import normalize_author_graph, normalize_command_templates
 from workflow.validation import DraftValidator
 
@@ -262,6 +265,9 @@ class WorkflowCompiler:
         policy_version: str = "demo-v1",
         validator: DraftValidator | None = None,
         injector: PolicyInjector | None = None,
+        path_policy: PathPolicy | None = None,
+        command_guard: CommandGuard | None = None,
+        risk_classifier: RiskClassifier | None = None,
     ) -> None:
         if not policy_version or len(policy_version) > 64:
             raise ValueError("policy_version must contain 1..64 characters")
@@ -270,6 +276,9 @@ class WorkflowCompiler:
         self._validator = validator or DraftValidator()
         self._injector = injector or PolicyInjector()
         self._router = AgentRouter(catalog)
+        self._path_policy = path_policy
+        self._command_guard = command_guard
+        self._risk_classifier = risk_classifier or RiskClassifier()
 
     def compile(
         self,
@@ -306,9 +315,20 @@ class WorkflowCompiler:
                     )
                 )
                 continue
-            existing = sorted(set(node.allowed_files_candidate))
-            new = sorted(set(node.new_files_candidate))
-            commands = normalize_command_templates(node.allowed_commands_candidate)
+            try:
+                if self._path_policy is None:
+                    existing = sorted(set(node.allowed_files_candidate))
+                    new = sorted(set(node.new_files_candidate))
+                else:
+                    scope = self._path_policy.validate_scope(
+                        node.allowed_files_candidate,
+                        node.new_files_candidate,
+                    )
+                    existing = list(scope.existing_files)
+                    new = list(scope.new_files)
+            except PathPolicyViolation as error:
+                errors.append(_issue("path_policy_rejected", str(error), node.id))
+                continue
             if len(existing) + len(new) > 100:
                 errors.append(
                     _issue(
@@ -318,7 +338,16 @@ class WorkflowCompiler:
                     )
                 )
                 continue
-            if len(commands) > 20:
+
+            commands = normalize_command_templates(node.allowed_commands_candidate)
+            if self._command_guard is not None:
+                try:
+                    approved_commands = self._command_guard.validate_many(commands)
+                except CommandGuardViolation as error:
+                    errors.append(_issue("command_guard_rejected", str(error), node.id))
+                    continue
+                commands = [list(command.argv) for command in approved_commands]
+            elif len(commands) > 20:
                 errors.append(
                     _issue(
                         "effective_command_scope_limit",
@@ -335,8 +364,13 @@ class WorkflowCompiler:
                         node.id,
                     )
                 )
+            candidate_risk = (
+                self._risk_classifier.classify_paths([*existing, *new]).effective_risk
+                if node.requires_write
+                else RiskLevel.L0
+            )
             risk_floor = _max_risk(
-                node.risk_level_hint,
+                _max_risk(node.risk_level_hint, candidate_risk),
                 RiskLevel.L1 if node.requires_write else RiskLevel.L0,
             )
             if risk_floor == RiskLevel.L4:

@@ -16,7 +16,7 @@ Agent Hub 是一个面向 Coding Agent 的本地可视化编排平台。它把�
 - **智能规划与确定性执行分离**：模型可以提出方案，但权限、依赖、状态转换、重试和审批由代码控制。
 - **统一 CLI Agent 接入层**：第一版真实 Agent 目标为 OpenCode，Codex、Claude Code 和 Aider 先提供禁用状态与能力探测骨架。
 - **本地优先并完整审计**：SQLite 保存状态和索引，大型 console、diff、patch 与报告保存为 Artifact，关键动作写入事件流。
-- **Demo 共享写入区受控**：执行写任务时使用单写租约，记录 dirty diff 归属；失败时只反向应用当前任务 patch，禁止粗暴执行全局 `git reset`。
+- **Demo 共享写入区受控**：Session 使用独立集成 clone 和单写租约；执行前严格要求 clean，任务变更统一捕获为 ChangeSet，并按精确路径恢复，禁止全局 `git reset` 或 `git clean`。
 
 ## 目标执行链
 
@@ -31,7 +31,7 @@ flowchart LR
     X --> W["共享工作区"]
     W --> Q["Diff / Guard / Test"]
     Q --> R["风险与审批"]
-    R --> M["合并或任务级回滚"]
+    R --> M["本地合并或拒绝保留 ChangeSet"]
     E --> O["Event / Artifact / Console"]
 ```
 
@@ -59,14 +59,15 @@ flowchart LR
 | `HUB-120` | 已完成 | RuleBasedPlanner、AgentRouter、fallback 与 lineage |
 | `HUB-130` | 已完成 | ContextPack、ArtifactStore、TaskContextBundle 与 EventRegistry |
 | `HUB-110` | 已完成 | Compiler、Scheduler、GraphExecutor 与只读 MockAgent 闭环 |
+| `HUB-200` | 进行中 | Session 独立 clone、Path/Command/Patch Guard、RiskClassifier 与 canonical WorkspaceTransaction；持久化和 NodeHandler 接线待完成 |
 
-当前开发分支已经具备协议、存储、规划、路由、确定性编译和只读 Mock 调度闭环，但以下部分尚未完成：
+当前 HUB-200 分支已完成第一批共享工作区安全基础设施，但以下部分尚未完成：
 
-- 共享工作区 Guard、审批和恢复链；
+- ChangeSet/artifact 持久化、Guard/Test NodeHandler、审批和恢复链；
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步启动 `HUB-200`，实现共享工作区、ChangeSet 和 Guard 安全链。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步继续 `HUB-200` 第二批，实现 ChangeSet/artifact 持久化和 Guard/Test NodeHandler 接线。
 
 ## 技术栈
 

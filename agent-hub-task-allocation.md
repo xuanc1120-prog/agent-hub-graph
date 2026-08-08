@@ -24,17 +24,17 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 ## 3. 阶段任务
 
-### 当前执行看板（2026-07-26）
+### 当前执行看板（2026-07-28）
 
 | 状态 | 任务 |
 |---|---|
 | completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130` |
-| next | `HUB-200`：Workspace、ChangeSet、LockManager、PatchGuard、CommandGuard 和 RiskClassifier |
-| later | `HUB-210` 及后续任务 |
+| ready_for_review | `HUB-200`：Workspace、ChangeSet、LockManager、PatchGuard、CommandGuard 和 RiskClassifier |
+| next | Claude Code 阻断式复审；通过后并行启动 `HUB-210`、`HUB-220` |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，总任务已集成为 `8/25`。`HUB-110` 最终复审无阻塞问题；Python `389 passed, 5 skipped`、前端 Vitest `7 passed`，Ruff、Oxlint、生产构建和 Playwright smoke 均通过。合并后阶段 1 CLI/Mock gate 再次通过。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，总任务已集成为 `8/25`。`HUB-200` 在 `codex/hub-200-workspace-security` 已完成实现并进入阻断式复审：Session 独立 clone、Path/Command/Patch Guard、RiskClassifier、canonical WorkspaceTransaction、ChangeSet 持久化、写型 AgentTask 和 Guard/Test NodeHandler 均已接线。当前任务分支 Python `491 passed, 7 skipped`，Ruff、前端 lint、Vitest、生产构建和 Playwright smoke 均通过；在复审和合并完成前，总集成数仍保持 `8/25`。
 
-协议冻结点为 `contracts-frozen-v1`。阶段 1 已完成并集成到 `main`；当前执行顺序为 `HUB-200 -> HUB-210 -> 阶段 2 gate`。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。阶段 1 已完成并集成到 `main`；当前执行顺序为 `HUB-200 -> (HUB-210 与 HUB-220) -> 阶段 2 gate`，其中 HUB-210 与 HUB-220 均在 HUB-200 接口冻结后启动，可并行推进。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 

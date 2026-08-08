@@ -39,6 +39,7 @@ def _compile_write(
     commands: tuple[tuple[str, ...], ...],
     task_kind: TaskKind = TaskKind.IMPLEMENT,
     risk: RiskLevel = RiskLevel.L3,
+    new_file: str = "src/new.py",
 ) -> CompiledGraph:
     graph = author.model_copy(deep=True)
     task = next(node for node in graph.nodes if node.node_type == NodeType.AGENT_TASK)
@@ -46,7 +47,7 @@ def _compile_write(
     task.requires_write = True
     task.risk_level_hint = risk
     task.allowed_files_candidate = ["docs/guide.md"] if task_kind == TaskKind.DOCS else []
-    task.new_files_candidate = [] if task_kind == TaskKind.DOCS else ["src/new.py"]
+    task.new_files_candidate = [] if task_kind == TaskKind.DOCS else [new_file]
     task.allowed_commands_candidate = [list(command) for command in commands]
     agent = catalog.agents[0].model_copy(
         update={
@@ -181,3 +182,28 @@ def test_docs_with_approved_commands_uses_command_tests(
     tests = [node for node in compiled.nodes if node.node_type == NodeType.TEST]
 
     assert [node.test_kind for node in tests] == [WorkflowTestKind.COMMAND]
+
+
+def test_static_path_risk_roundtrips_executable_validation(
+    readonly_graph: AuthorGraph,
+    mock_catalog: AgentCatalog,
+) -> None:
+    compiled = _compile_write(
+        readonly_graph,
+        mock_catalog,
+        commands=(("pytest", "-q", "tests/test_new.py"),),
+        task_kind=TaskKind.TEST_FIX,
+        risk=RiskLevel.L1,
+        new_file="tests/test_new.py",
+    )
+    source = next(node for node in compiled.nodes if node.node_type == NodeType.AGENT_TASK)
+    assert source.policy_risk_floor == RiskLevel.L2
+
+    tampered = compiled.model_copy(deep=True)
+    tampered_source = next(node for node in tampered.nodes if node.id == source.id)
+    tampered_source.policy_risk_floor = RiskLevel.L1
+    for node in tampered.nodes:
+        if node.source_node_id == source.id:
+            node.policy_risk_floor = RiskLevel.L1
+
+    assert "compiled_risk_floor_mismatch" in _validation_codes(tampered)

@@ -14,8 +14,9 @@
 | HUB-120 | completed | Planner、Router、lineage/fallback 和 fixture contract smoke 已集成 |
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
 | HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
+| HUB-200 | in_progress | 独立 Session clone、Path/Command/Patch Guard、RiskClassifier 与 canonical WorkspaceTransaction 首批已实现 |
 
-阶段 0 和阶段 1 已完成。`HUB-110` 最终复审确认无 P0/P1/P2，已集成到 `main`；只读 Mock workflow 可由 CLI 从 Session 创建运行到 completed，并完整回放 snapshot、node/task 状态和事件。后续顺序为：
+阶段 0 和阶段 1 已完成。`HUB-200` 已从 `main@f356e69` 在 `codex/hub-200-workspace-security` 启动；真实写任务仍保持 fail closed，直到 ChangeSet 持久化、NodeHandler 安全链以及 HUB-210 Approval/Merge/Recovery 全部完成。后续顺序为：
 
 ```text
 HUB-200（Workspace、ChangeSet、Guard）
@@ -23,7 +24,7 @@ HUB-200（Workspace、ChangeSet、Guard）
 HUB-210（Approval、Merge、Cancel、Recovery）
 ```
 
-下一步开始 `HUB-200`。真实写任务在 `HUB-200/210` 完成前继续 fail closed。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+当前执行 `HUB-200`，任务简报见 `development-tasks/next-wave/HUB-200-codex.md`。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 
@@ -2341,18 +2342,11 @@ class BaseAgentAdapter:
     async def is_available(self) -> bool:
         raise NotImplementedError
 
-    def build_prompt(
-        self,
-        task_package: TaskPackage,
-        context_pack: ContextPack
-    ) -> str:
+    def build_prompt(self, task_package: TaskPackage, context_pack: ContextPack) -> str:
         raise NotImplementedError
 
     async def run(
-        self,
-        task_package: TaskPackage,
-        context_pack: ContextPack,
-        console_stream=None
+        self, task_package: TaskPackage, context_pack: ContextPack, console_stream=None
     ) -> AgentResult:
         raise NotImplementedError
 ```

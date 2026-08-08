@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TypeVar
 
 from aiosqlite import Row
 from pydantic import TypeAdapter
@@ -11,6 +13,8 @@ from pydantic import TypeAdapter
 from protocol import EntityId
 from storage.db import Database, Transaction, normalize_utc, utc_now_text
 from storage.errors import LeaseLost, LeaseUnavailable
+
+_T = TypeVar("_T")
 
 _ENTITY_ID = TypeAdapter(EntityId)
 
@@ -449,6 +453,51 @@ class WorkspaceLeaseRepository:
         )
         if row is None:
             raise LeaseLost("workspace lease is no longer valid")
+
+    async def run_fenced(
+        self,
+        lease: WorkspaceLease,
+        operation: Callable[[], _T],
+        *,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> tuple[_T, WorkspaceLease]:
+        """Run synchronous workspace I/O and renew before releasing the fence."""
+
+        async with self._database.immediate_transaction() as transaction:
+            await self.assert_valid_in(transaction, lease, now=now)
+            result = operation()
+            renewed_at = now if now is not None else normalize_utc()
+            heartbeat_at = utc_now_text(renewed_at)
+            expires_at = utc_now_text(renewed_at + timedelta(seconds=_ttl(ttl_seconds)))
+            changed = await transaction.execute(
+                """
+                UPDATE file_locks
+                SET heartbeat_at = ?, lease_expires_at = ?
+                WHERE resource_key = ? AND owner_kind = ? AND owner_operation_id = ?
+                  AND owner_process_id = ? AND fencing_token = ?
+                  AND released_at IS NULL
+                """,
+                (
+                    heartbeat_at,
+                    expires_at,
+                    lease.resource_key,
+                    lease.owner_kind,
+                    lease.owner_operation_id,
+                    lease.owner_process_id,
+                    lease.fencing_token,
+                ),
+            )
+            if changed != 1:
+                raise LeaseLost("workspace lease fenced renewal was rejected")
+            row = await _one(
+                transaction,
+                "SELECT * FROM file_locks WHERE resource_key = ?",
+                (lease.resource_key,),
+            )
+            if row is None:
+                raise LeaseLost("workspace lease disappeared during fenced renewal")
+            return result, self._workspace(row)
 
     @staticmethod
     def _workspace(row: Row) -> WorkspaceLease:
