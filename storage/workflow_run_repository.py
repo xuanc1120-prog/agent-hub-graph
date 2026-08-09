@@ -108,6 +108,8 @@ class WorkflowRunRecord:
     created_at: str
     started_at: str | None
     finished_at: str | None
+    cancel_requested_at: str | None
+    merge_finalizing_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1106,6 +1108,560 @@ class WorkflowRunRepository:
         assert row is not None
         return _task_record(row)
 
+    async def enter_waiting_approval(
+        self,
+        node_run_id_value: str,
+        *,
+        approval_id: str,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> NodeRunRecord:
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            current = await transaction.fetch_one(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                       wr.cancel_requested_at, wr.merge_finalizing_at
+                FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+                WHERE nr.id = ?
+                """,
+                (node_run_id_value,),
+            )
+            if current is None:
+                raise RecordNotFound(f"node run not found: {node_run_id_value}")
+            if (
+                NodeRunStatus(str(current["status"])) != NodeRunStatus.RUNNING
+                or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.RUNNING
+            ):
+                raise ConcurrencyConflict("approval wait requires a running node and workflow")
+            if current["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("cancellation prevents approval wait")
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'waiting_approval',
+                    error_code = ?, finished_at = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (f"approval_pending:{approval_id}", node_run_id_value),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval wait lost node CAS")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET status = 'waiting_approval'
+                WHERE id = ? AND status = 'running' AND cancel_requested_at IS NULL
+                """,
+                (str(current["workflow_run_id"]),),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval wait lost workflow CAS")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.RUNNING,
+                target=NodeRunStatus.WAITING_APPROVAL,
+                summary="Waiting for durable approval.",
+                error_code=f"approval_pending:{approval_id}",
+                now=now,
+            )
+            await self._append_run_state(
+                transaction,
+                current,
+                lease,
+                previous=WorkflowRunStatus.RUNNING,
+                target=WorkflowRunStatus.WAITING_APPROVAL,
+                now=now,
+            )
+            row = await transaction.fetch_one(
+                "SELECT * FROM node_runs WHERE id = ?", (node_run_id_value,)
+            )
+        assert row is not None
+        return _node_record(row)
+
+    async def resume_after_approval(
+        self,
+        workflow_run_id: str,
+        node_run_id_value: str,
+        *,
+        approved: bool,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> NodeRunRecord:
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            current = await transaction.fetch_one(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                       wr.cancel_requested_at
+                FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+                WHERE nr.id = ? AND nr.workflow_run_id = ?
+                """,
+                (node_run_id_value, workflow_run_id),
+            )
+            if current is None:
+                raise RecordNotFound(f"node run not found: {node_run_id_value}")
+            if (
+                NodeRunStatus(str(current["status"])) != NodeRunStatus.WAITING_APPROVAL
+                or WorkflowRunStatus(str(current["run_status"]))
+                != WorkflowRunStatus.WAITING_APPROVAL
+            ):
+                raise ConcurrencyConflict("approval resume requires a waiting workflow")
+            if current["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("cancellation prevents approval resume")
+            target = NodeRunStatus.READY if approved else NodeRunStatus.COMPLETED
+            outcome = None if approved else NodeOutcome.REJECTED
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = ?, outcome = ?, error_code = ?,
+                    finished_at = ?
+                WHERE id = ? AND status = 'waiting_approval'
+                """,
+                (
+                    target.value,
+                    outcome.value if outcome is not None else None,
+                    None if approved else "approval_rejected",
+                    None if approved else timestamp,
+                    node_run_id_value,
+                ),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval resume lost node CAS")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET status = 'running'
+                WHERE id = ? AND status = 'waiting_approval'
+                  AND cancel_requested_at IS NULL
+                """,
+                (workflow_run_id,),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval resume lost workflow CAS")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.WAITING_APPROVAL,
+                target=target,
+                outcome=outcome,
+                summary="Approval granted." if approved else "Approval rejected.",
+                error_code=None if approved else "approval_rejected",
+                now=now,
+            )
+            await self._append_run_state(
+                transaction,
+                current,
+                lease,
+                previous=WorkflowRunStatus.WAITING_APPROVAL,
+                target=WorkflowRunStatus.RUNNING,
+                now=now,
+            )
+            if not approved:
+                fresh_run = await _run_row(transaction, workflow_run_id)
+                await self._reconcile_in(transaction, fresh_run, lease, now=now)
+            row = await transaction.fetch_one(
+                "SELECT * FROM node_runs WHERE id = ?", (node_run_id_value,)
+            )
+        assert row is not None
+        return _node_record(row)
+
+    async def begin_merge_finalizing(
+        self,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            row = await _run_row(transaction, workflow_run_id)
+            if WorkflowRunStatus(str(row["status"])) != WorkflowRunStatus.RUNNING:
+                raise ConcurrencyConflict("merge finalization requires a running workflow")
+            if row["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("cancel requested before merge finalization")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET merge_finalizing_at = ?
+                WHERE id = ? AND status = 'running'
+                  AND cancel_requested_at IS NULL AND merge_finalizing_at IS NULL
+                """,
+                (timestamp, workflow_run_id),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("merge finalization CAS lost")
+            row = await _run_row(transaction, workflow_run_id)
+        return _run_record(row)
+
+    async def clear_merge_finalizing(
+        self,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            row = await _run_row(transaction, workflow_run_id)
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET merge_finalizing_at = NULL
+                WHERE id = ? AND merge_finalizing_at IS NOT NULL
+                """,
+                (workflow_run_id,),
+            )
+            if changed not in {0, 1}:
+                raise ConcurrencyConflict("merge finalization clear failed")
+            row = await _run_row(transaction, workflow_run_id)
+        return _run_record(row)
+
+    async def finalize_merge(
+        self,
+        node_run_id_value: str,
+        *,
+        change_set_id: str,
+        new_commit: str,
+        workspace_lease: WorkspaceLease,
+        lease: MasterLease,
+        summary: str = "Master committed the approved ChangeSet.",
+        now: datetime | None = None,
+    ) -> NodeRunRecord:
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            await self._workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
+            current = await transaction.fetch_one(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                       wr.current_commit, wr.cancel_requested_at,
+                       wr.merge_finalizing_at
+                FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+                WHERE nr.id = ?
+                """,
+                (node_run_id_value,),
+            )
+            if current is None:
+                raise RecordNotFound(f"node run not found: {node_run_id_value}")
+            if (
+                NodeRunStatus(str(current["status"])) != NodeRunStatus.RUNNING
+                or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.RUNNING
+                or current["merge_finalizing_at"] is None
+                or current["cancel_requested_at"] is not None
+            ):
+                raise ConcurrencyConflict("merge finalization state is no longer writable")
+            expected_resource = f"session:{current['session_id']}:integration"
+            if workspace_lease.resource_key != expected_resource:
+                raise ValueError("merge workspace lease has the wrong resource")
+            session = await transaction.fetch_one(
+                "SELECT integration_head_commit FROM sessions WHERE id = ?",
+                (str(current["session_id"]),),
+            )
+            if session is None or str(session["integration_head_commit"]) != str(
+                current["current_commit"]
+            ):
+                raise ConcurrencyConflict("session integration HEAD changed before commit")
+            changed = await transaction.execute(
+                """
+                UPDATE sessions SET integration_head_commit = ?, updated_at = ?
+                WHERE id = ? AND integration_head_commit = ?
+                """,
+                (
+                    new_commit,
+                    timestamp,
+                    str(current["session_id"]),
+                    str(current["current_commit"]),
+                ),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("session integration HEAD CAS failed")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET current_commit = ?, merge_finalizing_at = NULL
+                WHERE id = ? AND status = 'running' AND merge_finalizing_at IS NOT NULL
+                """,
+                (new_commit, str(current["workflow_run_id"])),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("workflow merge finalization CAS failed")
+            changed = await transaction.execute(
+                """
+                UPDATE change_sets SET status = 'merged', updated_at = ?
+                WHERE id = ? AND status = 'approved'
+                """,
+                (timestamp, change_set_id),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("ChangeSet is not approved for merge")
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'completed', outcome = 'success',
+                    error_code = NULL, finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (timestamp, node_run_id_value),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("merge node completion CAS failed")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.RUNNING,
+                target=NodeRunStatus.COMPLETED,
+                outcome=NodeOutcome.SUCCESS,
+                summary=summary,
+                now=now,
+            )
+            fresh_run = await _run_row(transaction, str(current["workflow_run_id"]))
+            await self._reconcile_in(transaction, fresh_run, lease, now=now)
+            row = await transaction.fetch_one(
+                "SELECT * FROM node_runs WHERE id = ?", (node_run_id_value,)
+            )
+        assert row is not None
+        return _node_record(row)
+
+    async def attach_completed_node_artifact(
+        self,
+        node_run_id_value: str,
+        *,
+        artifact_id: str,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> NodeRunRecord:
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            row = await transaction.fetch_one(
+                "SELECT * FROM node_runs WHERE id = ?",
+                (node_run_id_value,),
+            )
+            if row is None:
+                raise RecordNotFound(f"node run not found: {node_run_id_value}")
+            if NodeRunStatus(str(row["status"])) != NodeRunStatus.COMPLETED:
+                raise ConcurrencyConflict("only a completed node can receive a result artifact")
+            existing = row["output_artifact_id"]
+            if existing is not None and str(existing) != artifact_id:
+                raise ConcurrencyConflict("completed node already has another result artifact")
+            if existing is None:
+                changed = await transaction.execute(
+                    "UPDATE node_runs SET output_artifact_id = ? "
+                    "WHERE id = ? AND status = 'completed' AND output_artifact_id IS NULL",
+                    (artifact_id, node_run_id_value),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("completed node artifact CAS lost")
+                row = await transaction.fetch_one(
+                    "SELECT * FROM node_runs WHERE id = ?",
+                    (node_run_id_value,),
+                )
+        assert row is not None
+        return _node_record(row)
+
+    async def request_cancel(
+        self,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            row = await _run_row(transaction, workflow_run_id)
+            status = WorkflowRunStatus(str(row["status"]))
+            if status in _RUN_TERMINAL:
+                return _run_record(row)
+            if row["merge_finalizing_at"] is not None:
+                raise ConcurrencyConflict(
+                    "merge finalization is the cancellation linearization point"
+                )
+            if row["cancel_requested_at"] is not None:
+                return _run_record(row)
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET cancel_requested_at = ?
+                WHERE id = ? AND cancel_requested_at IS NULL
+                  AND merge_finalizing_at IS NULL
+                """,
+                (timestamp, workflow_run_id),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("cancel request CAS lost")
+        return await self.get(workflow_run_id)
+
+    async def list_recoverable(self) -> list[WorkflowRunRecord]:
+        async with self._database.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM workflow_runs
+                WHERE status IN ('running', 'waiting_approval', 'orphaned')
+                   OR merge_finalizing_at IS NOT NULL
+                ORDER BY created_at, id
+                """
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_run_record(row) for row in rows]
+
+    async def complete_cancel(
+        self,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            run = await _run_row(transaction, workflow_run_id)
+            previous_run = WorkflowRunStatus(str(run["status"]))
+            if previous_run in _RUN_TERMINAL:
+                return _run_record(run)
+            if run["merge_finalizing_at"] is not None:
+                raise ConcurrencyConflict("cannot complete cancellation during merge finalization")
+            rows = await transaction.fetch_all(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status
+                FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+                WHERE nr.workflow_run_id = ?
+                  AND nr.status IN ('pending', 'ready', 'running', 'waiting_approval')
+                """,
+                (workflow_run_id,),
+            )
+            for current in rows:
+                previous = NodeRunStatus(str(current["status"]))
+                changed = await transaction.execute(
+                    """
+                    UPDATE node_runs SET status = 'cancelled', outcome = 'cancelled',
+                        error_code = 'workflow_cancelled', finished_at = ?
+                    WHERE id = ? AND status IN ('pending', 'ready', 'running', 'waiting_approval')
+                    """,
+                    (timestamp, str(current["id"])),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("node cancellation CAS lost")
+                await transaction.execute(
+                    """
+                    UPDATE tasks SET status = 'cancelled', finished_at = ?
+                    WHERE node_run_id = ? AND status IN (
+                        'pending', 'running', 'privilege_requested'
+                    )
+                    """,
+                    (timestamp, str(current["id"])),
+                )
+                await self._append_node_state(
+                    transaction,
+                    current,
+                    lease,
+                    node_run_id=str(current["id"]),
+                    node_id=str(current["node_id"]),
+                    previous=previous,
+                    target=NodeRunStatus.CANCELLED,
+                    outcome=NodeOutcome.CANCELLED,
+                    summary="Workflow cancellation completed.",
+                    error_code="workflow_cancelled",
+                    now=now,
+                )
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET status = 'cancelled', finished_at = ?
+                WHERE id = ? AND status NOT IN (
+                    'blocked', 'failed', 'completed', 'cancelled', 'orphaned'
+                )
+                  AND merge_finalizing_at IS NULL
+                """,
+                (timestamp, workflow_run_id),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("workflow cancellation CAS lost")
+            await self._append_run_state(
+                transaction,
+                run,
+                lease,
+                previous=previous_run,
+                target=WorkflowRunStatus.CANCELLED,
+                now=now,
+            )
+            run = await _run_row(transaction, workflow_run_id)
+        return _run_record(run)
+
+    async def mark_orphaned(
+        self,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        reason: str,
+        node_run_id_value: str | None = None,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            run = await _run_row(transaction, workflow_run_id)
+            previous_run = WorkflowRunStatus(str(run["status"]))
+            if previous_run in _RUN_TERMINAL and previous_run != WorkflowRunStatus.ORPHANED:
+                return _run_record(run)
+            rows = await transaction.fetch_all(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status
+                FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+                WHERE nr.workflow_run_id = ? AND nr.status IN ('running', 'waiting_approval')
+                """,
+                (workflow_run_id,),
+            )
+            for current in rows:
+                if node_run_id_value is not None and str(current["id"]) != node_run_id_value:
+                    continue
+                previous = NodeRunStatus(str(current["status"]))
+                await transaction.execute(
+                    """
+                    UPDATE node_runs SET status = 'orphaned',
+                        error_code = ?, finished_at = COALESCE(finished_at, ?)
+                    WHERE id = ? AND status IN ('running', 'waiting_approval')
+                    """,
+                    (reason[:200], utc_now_text(now), str(current["id"])),
+                )
+                await self._append_node_state(
+                    transaction,
+                    current,
+                    lease,
+                    node_run_id=str(current["id"]),
+                    node_id=str(current["node_id"]),
+                    previous=previous,
+                    target=NodeRunStatus.ORPHANED,
+                    summary="Recovery quarantined an uncertain node.",
+                    error_code=reason[:200],
+                    now=now,
+                )
+            if previous_run != WorkflowRunStatus.ORPHANED:
+                await transaction.execute(
+                    """
+                    UPDATE workflow_runs SET status = 'orphaned',
+                        finished_at = COALESCE(finished_at, ?)
+                    WHERE id = ? AND status IN ('pending', 'running', 'waiting_approval', 'paused')
+                    """,
+                    (utc_now_text(now), workflow_run_id),
+                )
+                await transaction.execute(
+                    "UPDATE sessions SET status = 'blocked', updated_at = ? WHERE id = ?",
+                    (utc_now_text(now), str(run["session_id"])),
+                )
+                await self._append_run_state(
+                    transaction,
+                    run,
+                    lease,
+                    previous=previous_run,
+                    target=WorkflowRunStatus.ORPHANED,
+                    now=now,
+                )
+            run = await _run_row(transaction, workflow_run_id)
+        return _run_record(run)
+
     async def _reconcile_in(
         self,
         transaction: Transaction,
@@ -1242,17 +1798,20 @@ class WorkflowRunRepository:
         target: WorkflowRunStatus,
         now: datetime | None,
     ) -> None:
+        workflow_run_id = str(
+            run["workflow_run_id"] if "workflow_run_id" in tuple(run.keys()) else run["id"]
+        )
         await self._events.append_in(
             transaction,
             session_id=str(run["session_id"]),
             workflow_id=str(run["workflow_id"]),
-            workflow_run_id=str(run["id"]),
+            workflow_run_id=workflow_run_id,
             event_type=RUN_STATE_CHANGED,
             actor_type=ActorType.MASTER,
             actor_id=lease.instance_id,
             payload=WorkflowRunEventPayload(
                 master_fencing_token=lease.fencing_token,
-                workflow_run_id=str(run["id"]),
+                workflow_run_id=workflow_run_id,
                 previous_status=previous,
                 status=target,
             ),
@@ -1461,6 +2020,12 @@ def _run_record(row: aiosqlite.Row) -> WorkflowRunRecord:
         created_at=str(row["created_at"]),
         started_at=str(row["started_at"]) if row["started_at"] is not None else None,
         finished_at=str(row["finished_at"]) if row["finished_at"] is not None else None,
+        cancel_requested_at=(
+            str(row["cancel_requested_at"]) if row["cancel_requested_at"] is not None else None
+        ),
+        merge_finalizing_at=(
+            str(row["merge_finalizing_at"]) if row["merge_finalizing_at"] is not None else None
+        ),
     )
 
 

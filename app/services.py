@@ -35,6 +35,7 @@ from security.path_policy import PathPolicy
 from security.risk_classifier import RiskClassifier
 from security.test_runner import TestRunner
 from storage.agent_repository import AgentRepository
+from storage.approval_repository import ApprovalRepository
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import ArtifactStore
 from storage.change_set_repository import ChangeSetRepository
@@ -61,11 +62,14 @@ from storage.workflow_run_repository import (
     WorkflowRunRecord,
     WorkflowRunRepository,
 )
+from workflow.approval_manager import ApprovalManager
+from workflow.capability_broker import CapabilityBroker
 from workflow.compiler import WorkflowCompiler
 from workflow.events import build_runtime_event_registry
 from workflow.executable_validator import ExecutableValidator
 from workflow.executor import GraphExecutor
 from workflow.handlers.agent_task import AgentTaskNodeHandler
+from workflow.handlers.approval import ApprovalNodeHandler
 from workflow.handlers.factory import build_node_registry
 from workflow.handlers.guards import (
     CommandGuardNodeHandler,
@@ -73,6 +77,8 @@ from workflow.handlers.guards import (
     RiskClassifierNodeHandler,
     TestNodeHandler,
 )
+from workflow.handlers.merge_patch import MergePatchNodeHandler
+from workflow.recovery import CancellationManager, RecoveryManager
 from workflow.registry import NodeRegistry
 from workflow.scheduler import DurableScheduler
 from workspace.git_manager import GitManager
@@ -104,6 +110,11 @@ class RuntimeServices:
     locks: LockManager
     artifacts: ArtifactRepository
     change_sets: ChangeSetRepository
+    approvals: ApprovalRepository
+    approval_manager: ApprovalManager
+    capabilities: CapabilityBroker
+    cancellation: CancellationManager
+    recovery: RecoveryManager
     runs: WorkflowRunRepository
     registry: NodeRegistry
     scheduler: DurableScheduler
@@ -126,6 +137,7 @@ class WorkflowApplication:
             ttl_seconds=self._settings.master_lease_ttl_seconds,
         )
         current = lease
+        await self.services.recovery.recover(lease=current)
         stop = asyncio.Event()
 
         async def heartbeat() -> None:
@@ -547,6 +559,18 @@ def _build_services(settings: Settings) -> RuntimeServices:
     )
     command_guard = CommandGuard()
     change_sets = ChangeSetRepository(database, artifacts, events, leases, locks)
+    approvals = ApprovalRepository(database, events, leases)
+    approval_manager = ApprovalManager(
+        approvals,
+        change_sets,
+        runs,
+        ttl_seconds=settings.changeset_approval_ttl_seconds,
+    )
+    capabilities = CapabilityBroker(
+        approvals,
+        ttl_seconds=settings.privilege_approval_ttl_seconds,
+        grant_ttl_seconds=settings.capability_grant_ttl_seconds,
+    )
     test_runner = TestRunner(
         command_guard,
         timeout_seconds=settings.agent_default_timeout_seconds,
@@ -594,12 +618,24 @@ def _build_services(settings: Settings) -> RuntimeServices:
             max_patch_bytes=settings.max_patch_bytes,
             max_created_bytes=settings.max_task_created_bytes,
         ),
+        approval_handler=ApprovalNodeHandler(approval_manager),
+        merge_patch_handler=MergePatchNodeHandler(
+            runs,
+            change_sets,
+            approvals,
+            git,
+            locks,
+            workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
+            workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
+        ),
         risk_handler=RiskClassifierNodeHandler(
             change_sets,
             artifacts,
             RiskClassifier(),
         ),
     )
+    cancellation = CancellationManager(runs, approvals, capabilities, events)
+    recovery = RecoveryManager(runs, sessions, approvals, change_sets, events, git, locks)
     executor = GraphExecutor(runs, sessions, artifacts, registry)
     scheduler = DurableScheduler(
         runs,
@@ -620,6 +656,11 @@ def _build_services(settings: Settings) -> RuntimeServices:
         locks=locks,
         artifacts=artifacts,
         change_sets=change_sets,
+        approvals=approvals,
+        approval_manager=approval_manager,
+        capabilities=capabilities,
+        cancellation=cancellation,
+        recovery=recovery,
         runs=runs,
         registry=registry,
         scheduler=scheduler,
