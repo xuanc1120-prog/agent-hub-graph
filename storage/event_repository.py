@@ -310,6 +310,64 @@ class EventRepository:
                 ),
             )
 
+    async def append_security_event_in(
+        self,
+        transaction: Transaction,
+        *,
+        session_id: str,
+        workflow_run_id: str | None,
+        task_id: str | None,
+        event_type: str,
+        severity: Literal["info", "warning", "high", "critical"],
+        payload: StrictModel,
+        now: datetime | None = None,
+    ) -> None:
+        """Append a security event to an existing durable mutation transaction."""
+
+        payload_json = canonical_json(payload).decode("utf-8")
+        if len(event_type) < 1 or len(event_type) > 128:
+            raise ValueError("security event type must contain 1..128 characters")
+        if len(payload_json) > 65_536:
+            raise ValueError("security event payload is too large")
+        session = await transaction.fetch_one("SELECT id FROM sessions WHERE id = ?", (session_id,))
+        if session is None:
+            raise RecordNotFound(f"session not found: {session_id}")
+        if workflow_run_id is not None:
+            run = await transaction.fetch_one(
+                "SELECT session_id FROM workflow_runs WHERE id = ?", (workflow_run_id,)
+            )
+            if run is None or str(run["session_id"]) != session_id:
+                raise RecordNotFound(f"workflow run not found: {workflow_run_id}")
+        if task_id is not None:
+            task = await transaction.fetch_one(
+                """
+                SELECT wr.session_id FROM tasks t
+                JOIN node_runs nr ON nr.id = t.node_run_id
+                JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+                WHERE t.id = ?
+                """,
+                (task_id,),
+            )
+            if task is None or str(task["session_id"]) != session_id:
+                raise RecordNotFound(f"task not found: {task_id}")
+        await transaction.execute(
+            """
+            INSERT INTO security_events(
+                session_id, workflow_run_id, task_id,
+                event_type, severity, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                workflow_run_id,
+                task_id,
+                event_type,
+                severity,
+                payload_json,
+                utc_now_text(now),
+            ),
+        )
+
     # ------------------------------------------------------------------
     # Read path (all reads validate through registry)
     # ------------------------------------------------------------------

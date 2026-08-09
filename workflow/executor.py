@@ -21,7 +21,7 @@ from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
 )
-from workflow.approval_manager import ApprovalPending
+from workflow.approval_manager import ApprovalPending, PrivilegePending
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workflow.registry import NodeRegistry
 
@@ -92,6 +92,15 @@ class GraphExecutor:
             if not isinstance(raw_result, NodeHandlerResult):
                 raise TypeError("NodeHandler returned an untyped result")
             result = raw_result
+        except PrivilegePending as pending:
+            current = next(
+                item
+                for item in await self._runs.list_nodes(pending.workflow_run_id)
+                if item.node_run_id == pending.node_run_id
+            )
+            if current.status != NodeRunStatus.WAITING_APPROVAL:
+                raise ConcurrencyConflict("privilege retry did not persist waiting state") from None
+            return current
         except ApprovalPending as pending:
             return await self._runs.enter_waiting_approval(
                 claimed.node_run_id,

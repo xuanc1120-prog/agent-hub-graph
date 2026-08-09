@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from typing import Literal
 
 import aiosqlite
@@ -51,6 +52,26 @@ class CapabilityGrantRecord:
     workflow_run_id: str
     node_run_id: str
     request_status: PrivilegeRequestStatus
+
+
+@dataclass(frozen=True, slots=True)
+class PrivilegeRequestBinding:
+    request_id: str
+    workflow_run_id: str
+    session_id: str
+    node_run_id: str
+    task_id: str
+    agent_id: str
+    capability: str
+    action: str
+    resource: str
+    effective_risk: RiskLevel
+    status: PrivilegeRequestStatus
+
+
+def _task_id_for_node(node_run_id: str) -> str:
+    digest = sha256(f"task\x00{node_run_id}".encode()).hexdigest()[:24]
+    return f"task-{digest}"
 
 
 async def _conn_one(
@@ -152,10 +173,16 @@ class ApprovalRepository:
         database: Database,
         events: EventRepository,
         master_leases: MasterLeaseRepository,
+        runs: object | None = None,
     ) -> None:
         self._database = database
         self._events = events
         self._master_leases = master_leases
+        self._runs = runs
+
+    @property
+    def atomic_resume_available(self) -> bool:
+        return self._runs is not None
 
     async def get(self, approval_id: str) -> ApprovalRecord:
         async with self._database.connection() as connection:
@@ -194,6 +221,61 @@ class ApprovalRepository:
                 (request_id,),
             )
         return _approval_record(row) if row is not None else None
+
+    async def get_grant_for_task(self, task_id: str) -> CapabilityGrantRecord | None:
+        async with self._database.connection() as connection:
+            row = await _conn_one(
+                connection,
+                """
+                SELECT cg.*, pr.status AS request_status, pr.node_run_id,
+                       nr.workflow_run_id
+                FROM capability_grants cg
+                JOIN privilege_requests pr ON pr.id = cg.request_id
+                JOIN node_runs nr ON nr.id = pr.node_run_id
+                WHERE cg.target_task_id = ?
+                """,
+                (task_id,),
+            )
+        if row is None:
+            return None
+        return _grant_record(
+            row,
+            workflow_run_id=str(row["workflow_run_id"]),
+            node_run_id=str(row["node_run_id"]),
+        )
+
+    async def get_privilege_request_binding(
+        self, request_id: str
+    ) -> PrivilegeRequestBinding | None:
+        async with self._database.connection() as connection:
+            row = await _conn_one(
+                connection,
+                """
+                SELECT pr.*, nr.workflow_run_id, wr.session_id,
+                       t.agent_id
+                FROM privilege_requests pr
+                JOIN node_runs nr ON nr.id = pr.node_run_id
+                JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+                JOIN tasks t ON t.id = pr.task_id
+                WHERE pr.id = ?
+                """,
+                (request_id,),
+            )
+        if row is None:
+            return None
+        return PrivilegeRequestBinding(
+            request_id=str(row["id"]),
+            workflow_run_id=str(row["workflow_run_id"]),
+            session_id=str(row["session_id"]),
+            node_run_id=str(row["node_run_id"]),
+            task_id=str(row["task_id"]),
+            agent_id=str(row["agent_id"]),
+            capability=str(row["capability"]),
+            action=str(row["action"]),
+            resource=str(row["resource"]),
+            effective_risk=RiskLevel(str(row["effective_risk"])),
+            status=PrivilegeRequestStatus(str(row["status"])),
+        )
 
     async def create(
         self,
@@ -457,6 +539,18 @@ class ApprovalRepository:
                 )
             if changed != 1:
                 raise ConcurrencyConflict("approval subject transition lost CAS")
+            if isinstance(current.approval, ChangeSetApproval) and self._runs is not None:
+                resume = getattr(self._runs, "resume_after_approval_in", None)
+                if resume is None:
+                    raise RuntimeError("workflow run repository lacks atomic approval resume")
+                await resume(
+                    tx,
+                    current.approval.workflow_run_id,
+                    current.approval.node_run_id,
+                    approved=target == ApprovalStatus.APPROVED,
+                    lease=master_lease,
+                    now=now,
+                )
             if isinstance(current.approval, PrivilegeApproval):
                 request_row = await tx.fetch_one(
                     "SELECT pr.status, pr.task_id, pr.node_run_id, nr.workflow_run_id "
@@ -477,6 +571,20 @@ class ApprovalRepository:
                     now=now,
                     reason=f"approval_decision:{target.value}",
                 )
+                if self._runs is not None:
+                    resume = getattr(self._runs, "resume_privilege_after_approval_in", None)
+                    if resume is None:
+                        raise RuntimeError(
+                            "workflow run repository lacks atomic privilege approval resume"
+                        )
+                    await resume(
+                        tx,
+                        current.approval.workflow_run_id,
+                        current.approval.node_run_id,
+                        approved=target == ApprovalStatus.APPROVED,
+                        lease=master_lease,
+                        now=now,
+                    )
             fresh = await tx.fetch_one("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             assert fresh is not None
             result = _approval_record(fresh)
@@ -562,6 +670,7 @@ class ApprovalRepository:
                 raise ValueError("renewal changed the ChangeSet")
             if (
                 new_approval.workflow_run_id != old.approval.workflow_run_id
+                or new_approval.node_run_id != old.approval.node_run_id
                 or new_approval.base_commit != old.approval.base_commit
                 or new_approval.patch_sha256 != old.approval.patch_sha256
                 or new_approval.evidence_sha256 != old.approval.evidence_sha256
@@ -710,7 +819,7 @@ class ApprovalRepository:
             request = await tx.fetch_one(
                 """
                 SELECT pr.*, source_nr.node_id, source_nr.attempt AS source_attempt,
-                       source_nr.workflow_run_id
+                       source_nr.workflow_run_id, source_task.agent_id AS source_agent_id
                 FROM privilege_requests pr
                 JOIN tasks source_task ON source_task.id = pr.task_id
                 JOIN node_runs source_nr ON source_nr.id = pr.node_run_id
@@ -732,16 +841,24 @@ class ApprovalRepository:
             if str(request["status"]) != PrivilegeRequestStatus.APPROVED.value:
                 raise ConcurrencyConflict("privilege request is not approved")
             approval = await tx.fetch_one(
-                "SELECT status FROM approvals WHERE privilege_request_id = ? "
+                "SELECT status, expires_at FROM approvals WHERE privilege_request_id = ? "
                 "ORDER BY created_at DESC LIMIT 1",
                 (grant.request_id,),
             )
-            if approval is None or str(approval["status"]) != ApprovalStatus.APPROVED.value:
+            if (
+                approval is None
+                or str(approval["status"]) != ApprovalStatus.APPROVED.value
+                or str(approval["expires_at"]) <= utc_now_text(now)
+            ):
                 raise ConcurrencyConflict("grant requires an approved PrivilegeApproval")
             target = await tx.fetch_one(
                 """
-                SELECT t.id, nr.node_id, nr.attempt, nr.workflow_run_id, nr.id AS node_run_id
+                SELECT t.id, t.active_capability_grant_id, t.status AS task_status,
+                       t.agent_id, nr.node_id, nr.attempt, nr.workflow_run_id, nr.id AS node_run_id,
+                       nr.status AS node_status,
+                       wr.session_id, wr.status AS workflow_status, wr.cancel_requested_at
                 FROM tasks t JOIN node_runs nr ON nr.id = t.node_run_id
+                JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
                 WHERE t.id = ?
                 """,
                 (grant.target_task_id,),
@@ -752,17 +869,48 @@ class ApprovalRepository:
                 str(target["workflow_run_id"]) != workflow_run_id
                 or str(target["node_id"]) != str(request["node_id"])
                 or int(target["attempt"]) != int(request["source_attempt"]) + 1
+                or str(target["id"]) != _task_id_for_node(str(target["node_run_id"]))
+                or str(target["agent_id"]) != str(request["source_agent_id"])
+                or target["cancel_requested_at"] is not None
+                or str(target["workflow_status"])
+                in {"cancelled", "completed", "failed", "orphaned"}
+                or (
+                    target["active_capability_grant_id"] is not None
+                    and str(target["active_capability_grant_id"]) != grant.grant_id
+                )
             ):
                 raise ValueError("grant target must be same node attempt+1")
             existing = await tx.fetch_one(
                 "SELECT * FROM capability_grants WHERE request_id = ?", (grant.request_id,)
             )
             if existing is not None:
+                if (
+                    str(existing["id"]) != grant.grant_id
+                    or str(existing["target_task_id"]) != grant.target_task_id
+                    or str(existing["action"]) != grant.action.value
+                    or str(existing["resource"]) != grant.resource
+                ):
+                    raise ConcurrencyConflict("capability grant subject drifted")
+                await tx.execute(
+                    "UPDATE tasks SET active_capability_grant_id = ? "
+                    "WHERE id = ? AND active_capability_grant_id IS NULL",
+                    (grant.grant_id, grant.target_task_id),
+                )
+                activate = getattr(self._runs, "activate_capability_target_in", None)
+                if activate is not None and str(target["node_status"]) == "pending":
+                    await activate(
+                        tx,
+                        target_task_id=grant.target_task_id,
+                        lease=master_lease,
+                        now=now,
+                    )
                 return _grant_record(
                     existing,
                     workflow_run_id=workflow_run_id,
                     node_run_id=str(request["node_run_id"]),
                 )
+            if str(target["task_status"]) != "pending" or str(target["node_status"]) != "pending":
+                raise ConcurrencyConflict("grant target must be a pending retry task")
             await tx.execute(
                 """
                 INSERT INTO capability_grants(
@@ -778,6 +926,15 @@ class ApprovalRepository:
                     utc_now_text(grant.expires_at),
                 ),
             )
+            changed = await tx.execute(
+                """
+                UPDATE tasks SET active_capability_grant_id = ?
+                WHERE id = ? AND active_capability_grant_id IS NULL
+                """,
+                (grant.grant_id, grant.target_task_id),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("grant target capability binding lost CAS")
             row = await tx.fetch_one(
                 "SELECT * FROM capability_grants WHERE id = ?", (grant.grant_id,)
             )
@@ -791,6 +948,14 @@ class ApprovalRepository:
                 now=now,
                 reason="created",
             )
+            activate = getattr(self._runs, "activate_capability_target_in", None)
+            if activate is not None:
+                await activate(
+                    tx,
+                    target_task_id=grant.target_task_id,
+                    lease=master_lease,
+                    now=now,
+                )
         return _grant_record(
             row, workflow_run_id=workflow_run_id, node_run_id=str(request["node_run_id"])
         )
@@ -812,10 +977,22 @@ class ApprovalRepository:
             row = await tx.fetch_one(
                 """
                 SELECT cg.*, pr.status AS request_status, pr.node_run_id, pr.task_id,
-                       nr.workflow_run_id
+                       nr.workflow_run_id, source_wr.session_id AS source_session_id,
+                       ap.status AS approval_status, ap.expires_at AS approval_expires_at,
+                       target_task.active_capability_grant_id,
+                       target_nr.workflow_run_id AS target_workflow_run_id,
+                       target_nr.status AS target_node_status,
+                       target_wr.session_id AS target_session_id,
+                       target_wr.status AS target_workflow_status,
+                       target_wr.cancel_requested_at AS target_cancel_requested_at
                 FROM capability_grants cg
                 JOIN privilege_requests pr ON pr.id = cg.request_id
                 JOIN node_runs nr ON nr.id = pr.node_run_id
+                JOIN workflow_runs source_wr ON source_wr.id = nr.workflow_run_id
+                JOIN approvals ap ON ap.privilege_request_id = pr.id
+                JOIN tasks target_task ON target_task.id = cg.target_task_id
+                JOIN node_runs target_nr ON target_nr.id = target_task.node_run_id
+                JOIN workflow_runs target_wr ON target_wr.id = target_nr.workflow_run_id
                 WHERE cg.id = ?
                 """,
                 (grant_id,),
@@ -826,20 +1003,49 @@ class ApprovalRepository:
                 str(row["target_task_id"]) != target_task_id
                 or str(row["action"]) != action.value
                 or str(row["resource"]) != resource
+                or str(row["active_capability_grant_id"]) != grant_id
             ):
                 raise ValueError("grant target/action/resource mismatch")
-            if str(row["request_status"]) != PrivilegeRequestStatus.APPROVED.value:
+            if (
+                str(row["target_workflow_run_id"]) != str(row["workflow_run_id"])
+                or str(row["target_session_id"]) != str(row["source_session_id"])
+                or row["target_cancel_requested_at"] is not None
+                or str(row["target_workflow_status"]) != "running"
+                or str(row["target_node_status"]) != "running"
+            ):
+                raise ConcurrencyConflict("grant target workflow is cancelled or not running")
+            if (
+                str(row["request_status"]) != PrivilegeRequestStatus.APPROVED.value
+                or str(row["approval_status"]) != ApprovalStatus.APPROVED.value
+                or str(row["approval_expires_at"]) <= timestamp
+            ):
                 raise ConcurrencyConflict("privilege request is no longer approved")
             if workspace_lease is None:
                 raise ValueError("workspace lease is required to consume a grant")
+            if (
+                workspace_lease.owner_kind != "agent_task"
+                or workspace_lease.owner_operation_id != target_task_id
+            ):
+                raise ValueError("grant workspace lease is not bound to the target AgentTask")
+            expected_resource = f"session:{row['target_session_id']}:integration"
+            if workspace_lease.resource_key != expected_resource:
+                raise ValueError("grant workspace lease belongs to another session")
             lock = await tx.fetch_one(
                 """
                 SELECT resource_key, fencing_token
                 FROM file_locks
-                WHERE resource_key = ? AND fencing_token = ?
+                WHERE resource_key = ? AND owner_kind = 'agent_task'
+                  AND owner_operation_id = ? AND owner_process_id = ?
+                  AND fencing_token = ? AND released_at IS NULL
                   AND lease_expires_at > ?
                 """,
-                (workspace_lease.resource_key, workspace_lease.fencing_token, timestamp),
+                (
+                    f"session:{row['target_session_id']}:integration",
+                    target_task_id,
+                    workspace_lease.owner_process_id,
+                    workspace_lease.fencing_token,
+                    timestamp,
+                ),
             )
             if lock is None:
                 raise ConcurrencyConflict("grant consumption lacks the bound workspace fence")
@@ -871,6 +1077,11 @@ class ApprovalRepository:
             )
             if changed_request != 1:
                 raise ConcurrencyConflict("privilege request consumption lost CAS")
+            await tx.execute(
+                "UPDATE tasks SET active_capability_grant_id = NULL "
+                "WHERE id = ? AND active_capability_grant_id = ?",
+                (target_task_id, grant_id),
+            )
             fresh = await tx.fetch_one(
                 """
                 SELECT cg.*, pr.status AS request_status, pr.node_run_id,
@@ -937,6 +1148,11 @@ class ApprovalRepository:
                         "UPDATE privilege_requests SET status = 'denied' "
                         "WHERE id = ? AND status = 'approved'",
                         (str(row["request_id"]),),
+                    )
+                    await tx.execute(
+                        "UPDATE tasks SET active_capability_grant_id = NULL "
+                        "WHERE id = ? AND active_capability_grant_id = ?",
+                        (str(row["target_task_id"]), str(row["id"])),
                     )
                     fresh = await tx.fetch_one(
                         """
@@ -1066,6 +1282,186 @@ class ApprovalRepository:
             )
         return count
 
+    async def invalidate_for_run_in(
+        self,
+        tx: Transaction,
+        *,
+        workflow_run_id: str,
+        master_lease: MasterLease,
+        reason: str = "workflow_cancelled",
+        now: datetime | None = None,
+    ) -> int:
+        """Invalidate approvals as part of a caller-owned cancellation transaction."""
+
+        await self._master_leases.assert_valid_in(tx, master_lease, now=now)
+        timestamp = utc_now_text(now)
+        rows = await tx.fetch_all(
+            "SELECT * FROM approvals WHERE workflow_run_id = ? AND status = 'pending'",
+            (workflow_run_id,),
+        )
+        count = 0
+        for row in rows:
+            current = _approval_record(row)
+            changed = await tx.execute(
+                """
+                UPDATE approvals
+                SET status = 'invalidated', version = version + 1, decided_at = ?
+                WHERE id = ? AND status = 'pending' AND version = ?
+                """,
+                (timestamp, current.approval.approval_id, current.approval.version),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval invalidation lost CAS")
+            if isinstance(current.approval, ChangeSetApproval):
+                await tx.execute(
+                    """
+                    UPDATE change_sets SET status = 'cancelled', updated_at = ?
+                    WHERE id = ? AND status IN ('pending_approval', 'approved')
+                    """,
+                    (timestamp, current.approval.change_set_id),
+                )
+            else:
+                changed_request = await tx.execute(
+                    """
+                    UPDATE privilege_requests SET status = 'denied'
+                    WHERE id = ? AND status IN ('pending', 'waiting_approval')
+                    """,
+                    (current.approval.privilege_request_id,),
+                )
+                if changed_request == 1:
+                    request_row = await tx.fetch_one(
+                        """
+                        SELECT pr.task_id, pr.node_run_id, nr.workflow_run_id
+                        FROM privilege_requests pr
+                        JOIN node_runs nr ON nr.id = pr.node_run_id
+                        WHERE pr.id = ?
+                        """,
+                        (current.approval.privilege_request_id,),
+                    )
+                    assert request_row is not None
+                    await self._append_privilege_request_event(
+                        tx,
+                        workflow_run_id=str(request_row["workflow_run_id"]),
+                        node_run_id=str(request_row["node_run_id"]),
+                        task_id=str(request_row["task_id"]),
+                        request_id=current.approval.privilege_request_id,
+                        previous=PrivilegeRequestStatus.WAITING_APPROVAL.value,
+                        status=PrivilegeRequestStatus.DENIED.value,
+                        master_lease=master_lease,
+                        now=now,
+                        reason=reason,
+                    )
+            fresh = await tx.fetch_one(
+                "SELECT * FROM approvals WHERE id = ?", (current.approval.approval_id,)
+            )
+            assert fresh is not None
+            await self._append_approval_event(
+                tx,
+                approval=_approval_record(fresh).approval,
+                previous=current.approval.status,
+                master_lease=master_lease,
+                now=now,
+                reason=reason,
+            )
+            count += 1
+        await tx.execute(
+            """
+            UPDATE change_sets SET status = 'cancelled', updated_at = ?
+            WHERE status IN ('pending_approval', 'approved')
+              AND task_id IN (
+                  SELECT t.id FROM tasks t
+                  JOIN node_runs nr ON nr.id = t.node_run_id
+                  WHERE nr.workflow_run_id = ?
+              )
+            """,
+            (timestamp, workflow_run_id),
+        )
+        return count
+
+    async def revoke_unconsumed_for_run_in(
+        self,
+        tx: Transaction,
+        *,
+        workflow_run_id: str,
+        master_lease: MasterLease,
+        reason: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Revoke grants as part of a caller-owned cancellation transaction."""
+
+        await self._master_leases.assert_valid_in(tx, master_lease, now=now)
+        timestamp = utc_now_text(now)
+        rows = await tx.fetch_all(
+            """
+            SELECT cg.*, pr.status AS request_status, pr.node_run_id,
+                   pr.task_id, nr.workflow_run_id
+            FROM capability_grants cg
+            JOIN privilege_requests pr ON pr.id = cg.request_id
+            JOIN node_runs nr ON nr.id = pr.node_run_id
+            WHERE nr.workflow_run_id = ?
+              AND cg.consumed_at IS NULL AND cg.revoked_at IS NULL
+            """,
+            (workflow_run_id,),
+        )
+        count = 0
+        for row in rows:
+            changed = await tx.execute(
+                """
+                UPDATE capability_grants
+                SET revoked_at = ?, revocation_reason = ?
+                WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL
+                """,
+                (timestamp, reason, str(row["id"])),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("grant revocation lost CAS")
+            count += 1
+            changed_request = await tx.execute(
+                "UPDATE privilege_requests SET status = 'denied' "
+                "WHERE id = ? AND status = 'approved'",
+                (str(row["request_id"]),),
+            )
+            await tx.execute(
+                "UPDATE tasks SET active_capability_grant_id = NULL "
+                "WHERE id = ? AND active_capability_grant_id = ?",
+                (str(row["target_task_id"]), str(row["id"])),
+            )
+            fresh = await tx.fetch_one(
+                """
+                SELECT cg.*, pr.status AS request_status, pr.node_run_id, pr.task_id,
+                       nr.workflow_run_id
+                FROM capability_grants cg
+                JOIN privilege_requests pr ON pr.id = cg.request_id
+                JOIN node_runs nr ON nr.id = pr.node_run_id
+                WHERE cg.id = ?
+                """,
+                (str(row["id"]),),
+            )
+            assert fresh is not None
+            if changed_request == 1:
+                await self._append_privilege_request_event(
+                    tx,
+                    workflow_run_id=str(fresh["workflow_run_id"]),
+                    node_run_id=str(fresh["node_run_id"]),
+                    task_id=str(fresh["task_id"]),
+                    request_id=str(fresh["request_id"]),
+                    previous=PrivilegeRequestStatus.APPROVED.value,
+                    status=PrivilegeRequestStatus.DENIED.value,
+                    master_lease=master_lease,
+                    now=now,
+                    reason=f"revoked:{reason}",
+                )
+            await self._append_grant_event(
+                tx,
+                row=fresh,
+                workflow_run_id=str(fresh["workflow_run_id"]),
+                node_run_id=str(fresh["node_run_id"]),
+                master_lease=master_lease,
+                now=now,
+                reason=f"revoked:{reason}",
+            )
+        return count
+
     async def _append_privilege_request_event(
         self,
         tx: Transaction,
@@ -1121,6 +1517,24 @@ class ApprovalRepository:
         if changed != 1:
             raise ConcurrencyConflict("approval expiry lost CAS")
         if isinstance(current.approval, PrivilegeApproval):
+            request_row = await tx.fetch_one(
+                """
+                SELECT pr.status, pr.task_id, pr.node_run_id, nr.workflow_run_id,
+                       nr.status AS node_status, wr.status AS workflow_status,
+                       wr.cancel_requested_at,
+                       EXISTS(
+                           SELECT 1 FROM node_runs retry
+                           WHERE retry.workflow_run_id = nr.workflow_run_id
+                             AND retry.node_id = nr.node_id
+                             AND retry.attempt > nr.attempt
+                       ) AS has_retry
+                FROM privilege_requests pr
+                JOIN node_runs nr ON nr.id = pr.node_run_id
+                JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+                WHERE pr.id = ?
+                """,
+                (current.approval.privilege_request_id,),
+            )
             changed_request = await tx.execute(
                 """
                 UPDATE privilege_requests SET status = 'expired'
@@ -1128,26 +1542,39 @@ class ApprovalRepository:
                 """,
                 (current.approval.privilege_request_id,),
             )
-            if changed_request == 1:
-                request_row = await tx.fetch_one(
-                    "SELECT pr.task_id, pr.node_run_id, nr.workflow_run_id "
-                    "FROM privilege_requests pr JOIN node_runs nr ON nr.id = pr.node_run_id "
-                    "WHERE pr.id = ?",
-                    (current.approval.privilege_request_id,),
-                )
-                assert request_row is not None
+            if changed_request == 1 and request_row is not None:
                 await self._append_privilege_request_event(
                     tx,
                     workflow_run_id=str(request_row["workflow_run_id"]),
                     node_run_id=str(request_row["node_run_id"]),
                     task_id=str(request_row["task_id"]),
                     request_id=current.approval.privilege_request_id,
-                    previous=PrivilegeRequestStatus.WAITING_APPROVAL.value,
+                    previous=str(request_row["status"]),
                     status=PrivilegeRequestStatus.EXPIRED.value,
                     master_lease=master_lease,
                     now=now,
                     reason="expired",
                 )
+                if (
+                    self._runs is not None
+                    and str(request_row["node_status"]) == "waiting_approval"
+                    and str(request_row["workflow_status"]) == "waiting_approval"
+                    and request_row["cancel_requested_at"] is None
+                    and bool(request_row["has_retry"])
+                ):
+                    resume = getattr(self._runs, "resume_privilege_after_approval_in", None)
+                    if resume is None:
+                        raise RuntimeError(
+                            "workflow run repository lacks atomic privilege expiry resume"
+                        )
+                    await resume(
+                        tx,
+                        str(request_row["workflow_run_id"]),
+                        str(request_row["node_run_id"]),
+                        approved=False,
+                        lease=master_lease,
+                        now=now,
+                    )
         fresh = await tx.fetch_one(
             "SELECT * FROM approvals WHERE id = ?", (current.approval.approval_id,)
         )

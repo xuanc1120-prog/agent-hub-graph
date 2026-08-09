@@ -137,8 +137,8 @@ class WorkflowApplication:
             ttl_seconds=self._settings.master_lease_ttl_seconds,
         )
         current = lease
-        await self.services.recovery.recover(lease=current)
         stop = asyncio.Event()
+        heartbeat_task: asyncio.Task[None] | None = None
 
         async def heartbeat() -> None:
             nonlocal current
@@ -152,14 +152,21 @@ class WorkflowApplication:
                         ttl_seconds=self._settings.master_lease_ttl_seconds,
                     )
 
-        heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            yield lease
+            # Recovery must be covered by the same release finally as normal
+            # Master operation.  Keep the lease alive while startup verifies
+            # Git, artifacts, and durable state; heartbeat preserves the same
+            # fencing token even though it refreshes the expiry snapshot.
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await self.services.recovery.recover(lease=current)
+            yield current
         finally:
             stop.set()
-            with suppress(asyncio.CancelledError):
-                await heartbeat_task
-            await self.services.leases.release(current)
+            if heartbeat_task is not None:
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            with suppress(LeaseLost):
+                await self.services.leases.release(current)
 
     @asynccontextmanager
     async def temporary_workspace(
@@ -559,12 +566,13 @@ def _build_services(settings: Settings) -> RuntimeServices:
     )
     command_guard = CommandGuard()
     change_sets = ChangeSetRepository(database, artifacts, events, leases, locks)
-    approvals = ApprovalRepository(database, events, leases)
+    approvals = ApprovalRepository(database, events, leases, runs)
     approval_manager = ApprovalManager(
         approvals,
         change_sets,
         runs,
         ttl_seconds=settings.changeset_approval_ttl_seconds,
+        artifacts=artifacts,
     )
     capabilities = CapabilityBroker(
         approvals,
@@ -590,6 +598,7 @@ def _build_services(settings: Settings) -> RuntimeServices:
         change_sets=change_sets,
         git=git,
         locks=locks,
+        capabilities=capabilities,
         agent_runs_dir=paths.agent_runs,
         workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
         workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
@@ -625,6 +634,7 @@ def _build_services(settings: Settings) -> RuntimeServices:
             approvals,
             git,
             locks,
+            artifacts=artifacts,
             workspace_lease_ttl_seconds=settings.workspace_lease_ttl_seconds,
             workspace_heartbeat_seconds=settings.lease_heartbeat_seconds,
         ),
@@ -635,7 +645,17 @@ def _build_services(settings: Settings) -> RuntimeServices:
         ),
     )
     cancellation = CancellationManager(runs, approvals, capabilities, events)
-    recovery = RecoveryManager(runs, sessions, approvals, change_sets, events, git, locks)
+    recovery = RecoveryManager(
+        runs,
+        sessions,
+        approvals,
+        change_sets,
+        events,
+        git,
+        locks,
+        artifacts,
+        capabilities=capabilities,
+    )
     executor = GraphExecutor(runs, sessions, artifacts, registry)
     scheduler = DurableScheduler(
         runs,

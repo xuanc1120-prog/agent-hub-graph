@@ -467,7 +467,7 @@ class WorkspaceLeaseRepository:
         async with self._database.immediate_transaction() as transaction:
             await self.assert_valid_in(transaction, lease, now=now)
             result = operation()
-            renewed_at = now if now is not None else normalize_utc()
+            renewed_at = normalize_utc(now)
             heartbeat_at = utc_now_text(renewed_at)
             expires_at = utc_now_text(renewed_at + timedelta(seconds=_ttl(ttl_seconds)))
             changed = await transaction.execute(
@@ -476,7 +476,7 @@ class WorkspaceLeaseRepository:
                 SET heartbeat_at = ?, lease_expires_at = ?
                 WHERE resource_key = ? AND owner_kind = ? AND owner_operation_id = ?
                   AND owner_process_id = ? AND fencing_token = ?
-                  AND released_at IS NULL
+                  AND released_at IS NULL AND lease_expires_at > ?
                 """,
                 (
                     heartbeat_at,
@@ -486,6 +486,7 @@ class WorkspaceLeaseRepository:
                     lease.owner_operation_id,
                     lease.owner_process_id,
                     lease.fencing_token,
+                    heartbeat_at,
                 ),
             )
             if changed != 1:

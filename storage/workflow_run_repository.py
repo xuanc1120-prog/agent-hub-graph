@@ -41,10 +41,12 @@ from storage.repositories import WorkflowRecord
 from workflow.compiler import WorkflowCompiler
 from workflow.events import (
     NODE_STATE_CHANGED,
+    RECOVERY_ACTION,
     RUN_CREATED,
     RUN_STATE_CHANGED,
     TASK_STATE_CHANGED,
     NodeRunEventPayload,
+    RecoveryEventPayload,
     TaskEventPayload,
     WorkflowRunEventPayload,
 )
@@ -136,6 +138,7 @@ class TaskRecord:
     agent_id: str
     base_commit: str
     runtime_policy_artifact_id: str | None
+    active_capability_grant_id: str | None
     status: TaskStatus
     created_at: str
     finished_at: str | None
@@ -899,59 +902,263 @@ class WorkflowRunRepository:
                 )
             if (
                 str(policy["session_id"]) != str(node["session_id"])
-                or policy["task_id"] is not None
+                or (policy["task_id"] is not None and str(policy["task_id"]) != task_id)
                 or policy["planner_run_id"] is not None
                 or str(policy["artifact_type"]) != "runtime_policy"
                 or not bool(policy["redacted"])
             ):
                 raise ValueError("runtime policy artifact is not an unowned task policy")
 
+            existing_task = await transaction.fetch_one(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            )
+            if existing_task is None:
+                await transaction.execute(
+                    """
+                    INSERT INTO tasks(
+                        id, node_run_id, agent_id, base_commit,
+                        runtime_policy_artifact_id, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?)
+                    """,
+                    (
+                        task_id,
+                        node_run_id_value,
+                        agent_id,
+                        base_commit,
+                        runtime_policy_artifact_id,
+                        timestamp,
+                    ),
+                )
+                claimed = await transaction.execute(
+                    """
+                    UPDATE artifacts SET task_id = ?
+                    WHERE id = ? AND task_id IS NULL AND planner_run_id IS NULL
+                    """,
+                    (task_id, runtime_policy_artifact_id),
+                )
+                if claimed != 1:
+                    raise ConcurrencyConflict("runtime policy artifact ownership changed")
+                await self._append_task_state(
+                    transaction,
+                    node,
+                    lease,
+                    task_id=task_id,
+                    previous=None,
+                    target=TaskStatus.PENDING,
+                    now=now,
+                )
+            else:
+                if (
+                    str(existing_task["node_run_id"]) != node_run_id_value
+                    or str(existing_task["agent_id"]) != agent_id
+                    or str(existing_task["base_commit"]) != base_commit
+                    or (
+                        existing_task["runtime_policy_artifact_id"] is not None
+                        and str(existing_task["runtime_policy_artifact_id"])
+                        != runtime_policy_artifact_id
+                    )
+                    or TaskStatus(str(existing_task["status"])) != TaskStatus.PENDING
+                ):
+                    raise ConcurrencyConflict("precreated privilege retry task is not pending")
+                if existing_task["runtime_policy_artifact_id"] is None:
+                    claimed = await transaction.execute(
+                        """
+                        UPDATE artifacts SET task_id = ?
+                        WHERE id = ? AND task_id IS NULL AND planner_run_id IS NULL
+                        """,
+                        (task_id, runtime_policy_artifact_id),
+                    )
+                    if claimed != 1:
+                        raise ConcurrencyConflict("runtime policy artifact ownership changed")
+                    bound = await transaction.execute(
+                        """
+                        UPDATE tasks SET runtime_policy_artifact_id = ?
+                        WHERE id = ? AND runtime_policy_artifact_id IS NULL
+                        """,
+                        (runtime_policy_artifact_id, task_id),
+                    )
+                    if bound != 1:
+                        raise ConcurrencyConflict("retry policy binding lost CAS")
+                changed = await transaction.execute(
+                    "UPDATE tasks SET status = 'running', finished_at = NULL "
+                    "WHERE id = ? AND status = 'pending'",
+                    (task_id,),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("precreated task start lost CAS")
+                await self._append_task_state(
+                    transaction,
+                    node,
+                    lease,
+                    task_id=task_id,
+                    previous=TaskStatus.PENDING,
+                    target=TaskStatus.RUNNING,
+                    now=now,
+                )
+            if existing_task is None:
+                await self._append_task_state(
+                    transaction,
+                    node,
+                    lease,
+                    task_id=task_id,
+                    previous=TaskStatus.PENDING,
+                    target=TaskStatus.RUNNING,
+                    now=now,
+                )
+            row = await transaction.fetch_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        assert row is not None
+        return _task_record(row)
+
+    async def prepare_privilege_retry(
+        self,
+        workflow_run_id: str,
+        node_run_id_value: str,
+        *,
+        approval_id: str,
+        lease: MasterLease,
+        workspace_lease: WorkspaceLease,
+        now: datetime | None = None,
+    ) -> str:
+        """Persist an attempt+1 target before a privilege approval is decided."""
+
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            current = await transaction.fetch_one(
+                """
+                SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                       wr.cancel_requested_at, wr.current_commit,
+                       t.id AS task_id, t.agent_id, t.base_commit,
+                       t.runtime_policy_artifact_id, t.status AS task_status
+                FROM node_runs nr
+                JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+                JOIN tasks t ON t.node_run_id = nr.id
+                WHERE nr.id = ? AND nr.workflow_run_id = ?
+                """,
+                (node_run_id_value, workflow_run_id),
+            )
+            if current is None:
+                raise RecordNotFound(f"privilege source node not found: {node_run_id_value}")
+            expected_resource = f"session:{current['session_id']}:integration"
+            if (
+                workspace_lease.resource_key != expected_resource
+                or workspace_lease.owner_kind != "agent_task"
+                or workspace_lease.owner_operation_id != str(current["task_id"])
+            ):
+                raise ValueError("privilege retry requires the source task workspace lease")
+            await self._workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
+            if current["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("workflow cancellation prevents privilege retry")
+            if (
+                NodeRunStatus(str(current["status"])) != NodeRunStatus.RUNNING
+                or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.RUNNING
+                or TaskStatus(str(current["task_status"])) != TaskStatus.RUNNING
+            ):
+                raise ConcurrencyConflict("privilege retry requires a running source task")
+            target_node_id = node_run_id(
+                workflow_run_id,
+                str(current["node_id"]),
+                int(current["attempt"]) + 1,
+            )
+            target_task_id = task_id_for_node(target_node_id)
+            existing = await transaction.fetch_one(
+                "SELECT id FROM node_runs WHERE id = ?", (target_node_id,)
+            )
+            if existing is not None:
+                return target_task_id
+            await transaction.execute(
+                """
+                INSERT INTO node_runs(
+                    id, workflow_run_id, node_id, node_type, attempt, status,
+                    assigned_agent_id, created_at, error_code
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    target_node_id,
+                    workflow_run_id,
+                    str(current["node_id"]),
+                    str(current["node_type"]),
+                    int(current["attempt"]) + 1,
+                    str(current["assigned_agent_id"]),
+                    timestamp,
+                    f"privilege_retry_for:{approval_id}",
+                ),
+            )
             await transaction.execute(
                 """
                 INSERT INTO tasks(
                     id, node_run_id, agent_id, base_commit,
                     runtime_policy_artifact_id, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'running', ?)
+                ) VALUES (?, ?, ?, ?, NULL, 'pending', ?)
                 """,
                 (
-                    task_id,
-                    node_run_id_value,
-                    agent_id,
-                    base_commit,
-                    runtime_policy_artifact_id,
+                    target_task_id,
+                    target_node_id,
+                    str(current["agent_id"]),
+                    str(current["base_commit"]),
                     timestamp,
                 ),
             )
-            claimed = await transaction.execute(
+            changed = await transaction.execute(
                 """
-                UPDATE artifacts SET task_id = ?
-                WHERE id = ? AND task_id IS NULL AND planner_run_id IS NULL
+                UPDATE tasks SET status = 'privilege_requested', finished_at = ?
+                WHERE id = ? AND status = 'running'
                 """,
-                (task_id, runtime_policy_artifact_id),
+                (timestamp, str(current["task_id"])),
             )
-            if claimed != 1:
-                raise ConcurrencyConflict("runtime policy artifact ownership changed")
+            if changed != 1:
+                raise ConcurrencyConflict("privilege request lost source task CAS")
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'waiting_approval',
+                    error_code = ?, finished_at = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (f"privilege_pending:{approval_id}", node_run_id_value),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("privilege wait lost source node CAS")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET status = 'waiting_approval'
+                WHERE id = ? AND status = 'running' AND cancel_requested_at IS NULL
+                """,
+                (workflow_run_id,),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("privilege wait lost workflow CAS")
             await self._append_task_state(
                 transaction,
-                node,
+                current,
                 lease,
-                task_id=task_id,
-                previous=None,
-                target=TaskStatus.PENDING,
+                task_id=str(current["task_id"]),
+                previous=TaskStatus.RUNNING,
+                target=TaskStatus.PRIVILEGE_REQUESTED,
+                error_code=f"privilege_pending:{approval_id}",
+                workspace_fencing_token=workspace_lease.fencing_token,
                 now=now,
             )
-            await self._append_task_state(
+            await self._append_node_state(
                 transaction,
-                node,
+                current,
                 lease,
-                task_id=task_id,
-                previous=TaskStatus.PENDING,
-                target=TaskStatus.RUNNING,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.RUNNING,
+                target=NodeRunStatus.WAITING_APPROVAL,
+                summary="Waiting for privilege approval.",
+                error_code=f"privilege_pending:{approval_id}",
                 now=now,
             )
-            row = await transaction.fetch_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        assert row is not None
-        return _task_record(row)
+            await self._append_run_state(
+                transaction,
+                current,
+                lease,
+                previous=WorkflowRunStatus.RUNNING,
+                target=WorkflowRunStatus.WAITING_APPROVAL,
+                now=now,
+            )
+        return target_task_id
 
     async def finish_task(
         self,
@@ -1136,6 +1343,19 @@ class WorkflowRunRepository:
                 raise ConcurrencyConflict("approval wait requires a running node and workflow")
             if current["cancel_requested_at"] is not None:
                 raise ConcurrencyConflict("cancellation prevents approval wait")
+            approval = await transaction.fetch_one(
+                "SELECT status FROM approvals WHERE id = ?",
+                (approval_id,),
+            )
+            if approval is not None and str(approval["status"]) in {"approved", "rejected"}:
+                return await self.resume_after_approval_in(
+                    transaction,
+                    str(current["workflow_run_id"]),
+                    node_run_id_value,
+                    approved=str(approval["status"]) == "approved",
+                    lease=lease,
+                    now=now,
+                )
             changed = await transaction.execute(
                 """
                 UPDATE node_runs SET status = 'waiting_approval',
@@ -1270,10 +1490,137 @@ class WorkflowRunRepository:
         assert row is not None
         return _node_record(row)
 
+    async def resume_after_approval_in(
+        self,
+        transaction: Transaction,
+        workflow_run_id: str,
+        node_run_id_value: str,
+        *,
+        approved: bool,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> NodeRunRecord:
+        """Advance an approval gate inside the caller's durable transaction."""
+
+        timestamp = utc_now_text(now)
+        current = await transaction.fetch_one(
+            """
+            SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                   wr.cancel_requested_at
+            FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+            WHERE nr.id = ? AND nr.workflow_run_id = ?
+            """,
+            (node_run_id_value, workflow_run_id),
+        )
+        if current is None:
+            raise RecordNotFound(f"node run not found: {node_run_id_value}")
+        node_status = NodeRunStatus(str(current["status"]))
+        run_status = WorkflowRunStatus(str(current["run_status"]))
+        if (
+            node_status == NodeRunStatus.WAITING_APPROVAL
+            and run_status == WorkflowRunStatus.WAITING_APPROVAL
+        ):
+            if current["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("cancellation prevents approval resume")
+            target = NodeRunStatus.READY if approved else NodeRunStatus.COMPLETED
+            outcome = None if approved else NodeOutcome.REJECTED
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = ?, outcome = ?, error_code = ?,
+                    finished_at = ?
+                WHERE id = ? AND status = 'waiting_approval'
+                """,
+                (
+                    target.value,
+                    outcome.value if outcome is not None else None,
+                    None if approved else "approval_rejected",
+                    None if approved else timestamp,
+                    node_run_id_value,
+                ),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval resume lost node CAS")
+            changed = await transaction.execute(
+                """
+                UPDATE workflow_runs SET status = 'running'
+                WHERE id = ? AND status = 'waiting_approval'
+                  AND cancel_requested_at IS NULL
+                """,
+                (workflow_run_id,),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval resume lost workflow CAS")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.WAITING_APPROVAL,
+                target=target,
+                outcome=outcome,
+                summary="Approval granted." if approved else "Approval rejected.",
+                error_code=None if approved else "approval_rejected",
+                now=now,
+            )
+            await self._append_run_state(
+                transaction,
+                current,
+                lease,
+                previous=WorkflowRunStatus.WAITING_APPROVAL,
+                target=WorkflowRunStatus.RUNNING,
+                now=now,
+            )
+            if not approved:
+                fresh_run = await _run_row(transaction, workflow_run_id)
+                await self._reconcile_in(transaction, fresh_run, lease, now=now)
+        elif node_status == NodeRunStatus.RUNNING and run_status == WorkflowRunStatus.RUNNING:
+            if approved:
+                row = await transaction.fetch_one(
+                    "SELECT * FROM node_runs WHERE id = ?", (node_run_id_value,)
+                )
+                assert row is not None
+                return _node_record(row)
+            if current["cancel_requested_at"] is not None:
+                raise ConcurrencyConflict("cancellation prevents approval rejection")
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'completed', outcome = 'rejected',
+                    error_code = 'approval_rejected', finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (timestamp, node_run_id_value),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("approval rejection lost node CAS")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.RUNNING,
+                target=NodeRunStatus.COMPLETED,
+                outcome=NodeOutcome.REJECTED,
+                summary="Approval rejected.",
+                error_code="approval_rejected",
+                now=now,
+            )
+            fresh_run = await _run_row(transaction, workflow_run_id)
+            await self._reconcile_in(transaction, fresh_run, lease, now=now)
+        else:
+            raise ConcurrencyConflict("approval resume requires a waiting workflow")
+        row = await transaction.fetch_one(
+            "SELECT * FROM node_runs WHERE id = ?", (node_run_id_value,)
+        )
+        assert row is not None
+        return _node_record(row)
+
     async def begin_merge_finalizing(
         self,
         workflow_run_id: str,
         *,
+        workspace_lease: WorkspaceLease,
         lease: MasterLease,
         now: datetime | None = None,
     ) -> WorkflowRunRecord:
@@ -1281,6 +1628,24 @@ class WorkflowRunRepository:
         async with self._database.immediate_transaction() as transaction:
             await self._leases.assert_valid_in(transaction, lease, now=now)
             row = await _run_row(transaction, workflow_run_id)
+            expected_resource = f"session:{row['session_id']}:integration"
+            if (
+                workspace_lease.resource_key != expected_resource
+                or workspace_lease.owner_kind != "merge"
+            ):
+                raise ValueError("merge finalization requires the session merge workspace lease")
+            merge_node = await transaction.fetch_one(
+                """
+                SELECT id FROM node_runs
+                WHERE workflow_run_id = ? AND node_type = 'merge_patch'
+                  AND status = 'running'
+                ORDER BY attempt DESC LIMIT 1
+                """,
+                (workflow_run_id,),
+            )
+            if merge_node is None or workspace_lease.owner_operation_id != str(merge_node["id"]):
+                raise ValueError("merge finalization lease is not bound to the running merge node")
+            await self._workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
             if WorkflowRunStatus(str(row["status"])) != WorkflowRunStatus.RUNNING:
                 raise ConcurrencyConflict("merge finalization requires a running workflow")
             if row["cancel_requested_at"] is not None:
@@ -1298,16 +1663,259 @@ class WorkflowRunRepository:
             row = await _run_row(transaction, workflow_run_id)
         return _run_record(row)
 
+    async def resume_privilege_after_approval_in(
+        self,
+        transaction: Transaction,
+        workflow_run_id: str,
+        node_run_id_value: str,
+        *,
+        approved: bool,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> None:
+        current = await transaction.fetch_one(
+            """
+            SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                   wr.cancel_requested_at, t.id AS source_task_id,
+                   t.status AS source_task_status
+            FROM node_runs nr JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+            JOIN tasks t ON t.node_run_id = nr.id
+            WHERE nr.id = ? AND nr.workflow_run_id = ?
+            """,
+            (node_run_id_value, workflow_run_id),
+        )
+        if current is None:
+            raise RecordNotFound(f"privilege node not found: {node_run_id_value}")
+        if (
+            NodeRunStatus(str(current["status"])) != NodeRunStatus.WAITING_APPROVAL
+            or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.WAITING_APPROVAL
+            or current["cancel_requested_at"] is not None
+        ):
+            raise ConcurrencyConflict("privilege approval resume requires a waiting workflow")
+        target = await transaction.fetch_one(
+            """
+            SELECT nr.*, t.id AS task_id
+            FROM node_runs nr JOIN tasks t ON t.node_run_id = nr.id
+            WHERE nr.workflow_run_id = ? AND nr.node_id = ? AND nr.attempt > ?
+            ORDER BY nr.attempt ASC LIMIT 1
+            """,
+            (workflow_run_id, str(current["node_id"]), int(current["attempt"])),
+        )
+        if target is None:
+            raise ConcurrencyConflict("privilege retry target is missing")
+        timestamp = utc_now_text(now)
+        if approved:
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'superseded', outcome = 'cancelled',
+                    error_code = 'privilege_retry_approved', finished_at = ?
+                WHERE id = ? AND status = 'waiting_approval'
+                """,
+                (timestamp, node_run_id_value),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("privilege approval supersede lost CAS")
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=node_run_id_value,
+                node_id=str(current["node_id"]),
+                previous=NodeRunStatus.WAITING_APPROVAL,
+                target=NodeRunStatus.SUPERSEDED,
+                outcome=NodeOutcome.CANCELLED,
+                summary="Privilege approval created a new task attempt.",
+                error_code="privilege_retry_approved",
+                now=now,
+            )
+            return
+        changed = await transaction.execute(
+            """
+            UPDATE tasks SET status = 'failed', error_code = 'privilege_rejected',
+                finished_at = ?
+            WHERE id = ? AND status = 'privilege_requested'
+            """,
+            (timestamp, str(current["source_task_id"])),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege rejection lost source task CAS")
+        await self._append_task_state(
+            transaction,
+            current,
+            lease,
+            task_id=str(current["source_task_id"]),
+            previous=TaskStatus.PRIVILEGE_REQUESTED,
+            target=TaskStatus.FAILED,
+            error_code="privilege_rejected",
+            now=now,
+        )
+        changed = await transaction.execute(
+            """
+            UPDATE node_runs SET status = 'completed', outcome = 'rejected',
+                error_code = 'privilege_rejected', finished_at = ?
+            WHERE id = ? AND status = 'waiting_approval'
+            """,
+            (timestamp, node_run_id_value),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege rejection lost source node CAS")
+        await transaction.execute(
+            "UPDATE tasks SET status = 'cancelled', finished_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (timestamp, str(target["task_id"])),
+        )
+        changed = await transaction.execute(
+            """
+            UPDATE node_runs SET status = 'skipped', outcome = NULL,
+                error_code = 'privilege_rejected', finished_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (timestamp, str(target["id"])),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege rejection lost retry target CAS")
+        await self._append_node_state(
+            transaction,
+            current,
+            lease,
+            node_run_id=node_run_id_value,
+            node_id=str(current["node_id"]),
+            previous=NodeRunStatus.WAITING_APPROVAL,
+            target=NodeRunStatus.COMPLETED,
+            outcome=NodeOutcome.REJECTED,
+            summary="Privilege request was rejected.",
+            error_code="privilege_rejected",
+            now=now,
+        )
+        await self._append_node_state(
+            transaction,
+            current,
+            lease,
+            node_run_id=str(target["id"]),
+            node_id=str(target["node_id"]),
+            previous=NodeRunStatus.PENDING,
+            target=NodeRunStatus.SKIPPED,
+            summary="Privilege retry was rejected.",
+            error_code="privilege_rejected",
+            now=now,
+        )
+        changed = await transaction.execute(
+            "UPDATE workflow_runs SET status = 'running' "
+            "WHERE id = ? AND status = 'waiting_approval' AND cancel_requested_at IS NULL",
+            (workflow_run_id,),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege rejection lost workflow CAS")
+        await self._append_run_state(
+            transaction,
+            current,
+            lease,
+            previous=WorkflowRunStatus.WAITING_APPROVAL,
+            target=WorkflowRunStatus.RUNNING,
+            now=now,
+        )
+        await self._reconcile_in(
+            transaction,
+            await _run_row(transaction, workflow_run_id),
+            lease,
+            now=now,
+        )
+
+    async def activate_capability_target_in(
+        self,
+        transaction: Transaction,
+        *,
+        target_task_id: str,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> None:
+        current = await transaction.fetch_one(
+            """
+            SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                   wr.cancel_requested_at, t.status AS task_status
+            FROM tasks t
+            JOIN node_runs nr ON nr.id = t.node_run_id
+            JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+            WHERE t.id = ?
+            """,
+            (target_task_id,),
+        )
+        if current is None:
+            raise RecordNotFound(f"capability target task not found: {target_task_id}")
+        if NodeRunStatus(str(current["status"])) == NodeRunStatus.READY:
+            return
+        if (
+            NodeRunStatus(str(current["status"])) != NodeRunStatus.PENDING
+            or TaskStatus(str(current["task_status"])) != TaskStatus.PENDING
+            or current["cancel_requested_at"] is not None
+        ):
+            raise ConcurrencyConflict("capability target is not a pending retry")
+        changed = await transaction.execute(
+            "UPDATE node_runs SET status = 'ready', error_code = NULL "
+            "WHERE id = ? AND status = 'pending'",
+            (str(current["id"]),),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("capability target ready CAS lost")
+        await self._append_node_state(
+            transaction,
+            current,
+            lease,
+            node_run_id=str(current["id"]),
+            node_id=str(current["node_id"]),
+            previous=NodeRunStatus.PENDING,
+            target=NodeRunStatus.READY,
+            summary="Capability grant activated the retry task.",
+            now=now,
+        )
+        changed = await transaction.execute(
+            """
+            UPDATE workflow_runs SET status = 'running'
+            WHERE id = ? AND status = 'waiting_approval' AND cancel_requested_at IS NULL
+            """,
+            (str(current["workflow_run_id"]),),
+        )
+        if changed == 1:
+            await self._append_run_state(
+                transaction,
+                current,
+                lease,
+                previous=WorkflowRunStatus.WAITING_APPROVAL,
+                target=WorkflowRunStatus.RUNNING,
+                now=now,
+            )
+
     async def clear_merge_finalizing(
         self,
         workflow_run_id: str,
         *,
+        workspace_lease: WorkspaceLease,
         lease: MasterLease,
         now: datetime | None = None,
     ) -> WorkflowRunRecord:
         async with self._database.immediate_transaction() as transaction:
             await self._leases.assert_valid_in(transaction, lease, now=now)
             row = await _run_row(transaction, workflow_run_id)
+            expected_resource = f"session:{row['session_id']}:integration"
+            if workspace_lease.resource_key != expected_resource:
+                raise ValueError("merge finalization clear requires the session workspace lease")
+            merge_node = await transaction.fetch_one(
+                """
+                SELECT id FROM node_runs
+                WHERE workflow_run_id = ? AND node_type = 'merge_patch'
+                  AND status = 'running'
+                ORDER BY attempt DESC LIMIT 1
+                """,
+                (workflow_run_id,),
+            )
+            expected_operations = {f"recovery-{workflow_run_id}"}
+            if merge_node is not None:
+                expected_operations.add(str(merge_node["id"]))
+            if workspace_lease.owner_kind not in {"merge", "recovery"} or (
+                workspace_lease.owner_operation_id not in expected_operations
+            ):
+                raise ValueError("merge finalization clear lease is not bound to this workflow")
+            await self._workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
             changed = await transaction.execute(
                 """
                 UPDATE workflow_runs SET merge_finalizing_at = NULL
@@ -1357,6 +1965,15 @@ class WorkflowRunRepository:
             expected_resource = f"session:{current['session_id']}:integration"
             if workspace_lease.resource_key != expected_resource:
                 raise ValueError("merge workspace lease has the wrong resource")
+            expected_operation = (
+                str(current["id"])
+                if workspace_lease.owner_kind == "merge"
+                else f"recovery-{current['workflow_run_id']}"
+            )
+            if workspace_lease.owner_kind not in {"merge", "recovery"} or (
+                workspace_lease.owner_operation_id != expected_operation
+            ):
+                raise ValueError("merge workspace lease is not bound to this finalization")
             session = await transaction.fetch_one(
                 "SELECT integration_head_commit FROM sessions WHERE id = ?",
                 (str(current["session_id"]),),
@@ -1590,6 +2207,174 @@ class WorkflowRunRepository:
             )
             run = await _run_row(transaction, workflow_run_id)
         return _run_record(run)
+
+    async def cancel_with_cleanup(
+        self,
+        workflow_run_id: str,
+        *,
+        approvals: object,
+        capabilities: object,
+        lease: MasterLease,
+        reason: str = "workflow_cancelled",
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        """Linearize cancellation, revocations, node state, and audit in one tx."""
+
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease, now=now)
+            run = await _run_row(transaction, workflow_run_id)
+            previous = WorkflowRunStatus(str(run["status"]))
+            if previous in _RUN_TERMINAL and run["cancel_requested_at"] is None:
+                return _run_record(run)
+            if run["merge_finalizing_at"] is not None:
+                raise ConcurrencyConflict(
+                    "merge finalization is the cancellation linearization point"
+                )
+            if run["cancel_requested_at"] is None:
+                changed = await transaction.execute(
+                    """
+                    UPDATE workflow_runs SET cancel_requested_at = ?
+                    WHERE id = ? AND cancel_requested_at IS NULL
+                      AND merge_finalizing_at IS NULL
+                    """,
+                    (timestamp, workflow_run_id),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("cancel request CAS lost")
+                run = await _run_row(transaction, workflow_run_id)
+            invalidate = getattr(approvals, "invalidate_for_run_in", None)
+            revoke = getattr(capabilities, "revoke_for_run_in", None)
+            if invalidate is None or revoke is None:
+                raise RuntimeError("cancellation dependencies lack atomic transaction hooks")
+            await invalidate(
+                transaction,
+                workflow_run_id=workflow_run_id,
+                master_lease=lease,
+                reason=reason,
+                now=now,
+            )
+            await revoke(
+                transaction,
+                workflow_run_id,
+                master_lease=lease,
+                reason=reason,
+                now=now,
+            )
+            result = await self._complete_cancel_in(
+                transaction,
+                workflow_run_id,
+                lease=lease,
+                now=now,
+            )
+            payload = RecoveryEventPayload(
+                master_fencing_token=lease.fencing_token,
+                workflow_run_id=workflow_run_id,
+                session_id=str(run["session_id"]),
+                action="cancel",
+                outcome="cancelled",
+                reason="cancellation and all dependent authorization state committed atomically",
+            )
+            await self._events.append_in(
+                transaction,
+                session_id=str(run["session_id"]),
+                workflow_id=str(run["workflow_id"]),
+                workflow_run_id=workflow_run_id,
+                event_type=RECOVERY_ACTION,
+                actor_type=ActorType.MASTER,
+                actor_id=lease.instance_id,
+                payload=payload,
+                now=now,
+            )
+            await self._events.append_security_event_in(
+                transaction,
+                session_id=str(run["session_id"]),
+                workflow_run_id=workflow_run_id,
+                task_id=None,
+                event_type="workflow.cancellation_completed",
+                severity="info",
+                payload=payload,
+                now=now,
+            )
+            return result
+
+    async def _complete_cancel_in(
+        self,
+        transaction: Transaction,
+        workflow_run_id: str,
+        *,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        timestamp = utc_now_text(now)
+        run = await _run_row(transaction, workflow_run_id)
+        previous_run = WorkflowRunStatus(str(run["status"]))
+        if previous_run in _RUN_TERMINAL:
+            return _run_record(run)
+        if run["merge_finalizing_at"] is not None:
+            raise ConcurrencyConflict("cannot complete cancellation during merge finalization")
+        rows = await transaction.fetch_all(
+            """
+            SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status
+            FROM node_runs nr JOIN workflow_runs wr ON nr.workflow_run_id = wr.id
+            WHERE nr.workflow_run_id = ?
+              AND nr.status IN ('pending', 'ready', 'running', 'waiting_approval')
+            """,
+            (workflow_run_id,),
+        )
+        for current in rows:
+            previous = NodeRunStatus(str(current["status"]))
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'cancelled', outcome = 'cancelled',
+                    error_code = 'workflow_cancelled', finished_at = ?
+                WHERE id = ? AND status IN ('pending', 'ready', 'running', 'waiting_approval')
+                """,
+                (timestamp, str(current["id"])),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("node cancellation CAS lost")
+            await transaction.execute(
+                """
+                UPDATE tasks SET status = 'cancelled', finished_at = ?
+                WHERE node_run_id = ? AND status IN ('pending', 'running', 'privilege_requested')
+                """,
+                (timestamp, str(current["id"])),
+            )
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=str(current["id"]),
+                node_id=str(current["node_id"]),
+                previous=previous,
+                target=NodeRunStatus.CANCELLED,
+                outcome=NodeOutcome.CANCELLED,
+                summary="Workflow cancellation completed.",
+                error_code="workflow_cancelled",
+                now=now,
+            )
+        changed = await transaction.execute(
+            """
+            UPDATE workflow_runs SET status = 'cancelled', finished_at = ?
+            WHERE id = ? AND status NOT IN (
+                'blocked', 'failed', 'completed', 'cancelled', 'orphaned'
+            )
+              AND merge_finalizing_at IS NULL
+            """,
+            (timestamp, workflow_run_id),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("workflow cancellation CAS lost")
+        await self._append_run_state(
+            transaction,
+            run,
+            lease,
+            previous=previous_run,
+            target=WorkflowRunStatus.CANCELLED,
+            now=now,
+        )
+        return _run_record(await _run_row(transaction, workflow_run_id))
 
     async def mark_orphaned(
         self,
@@ -2060,6 +2845,11 @@ def _task_record(row: aiosqlite.Row) -> TaskRecord:
         runtime_policy_artifact_id=(
             str(row["runtime_policy_artifact_id"])
             if row["runtime_policy_artifact_id"] is not None
+            else None
+        ),
+        active_capability_grant_id=(
+            str(row["active_capability_grant_id"])
+            if row["active_capability_grant_id"] is not None
             else None
         ),
         status=TaskStatus(str(row["status"])),

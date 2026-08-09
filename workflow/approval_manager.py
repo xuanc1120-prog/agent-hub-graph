@@ -13,10 +13,12 @@ from protocol import (
     RiskLevel,
 )
 from storage.approval_repository import ApprovalRecord, ApprovalRepository
+from storage.artifact_repository import ArtifactRepository
 from storage.change_set_repository import ChangeSetRepository
 from storage.errors import ConcurrencyConflict
 from storage.leases import MasterLease
 from storage.workflow_run_repository import WorkflowRunRepository
+from workflow.approval_evidence import build_manifest, manifest_hash
 from workflow.handlers.base import NodeExecutionContext
 
 
@@ -26,6 +28,10 @@ class ApprovalPending(RuntimeError):
         self.approval_id = approval_id
         self.workflow_run_id = workflow_run_id
         self.node_run_id = node_run_id
+
+
+class PrivilegePending(ApprovalPending):
+    """An AgentTask must pause until its side-gate approval is granted."""
 
 
 def _subject_hash(value: dict[str, Any]) -> str:
@@ -45,12 +51,14 @@ class ApprovalManager:
         runs: WorkflowRunRepository,
         *,
         ttl_seconds: int = 3600,
+        artifacts: ArtifactRepository | None = None,
     ) -> None:
         if ttl_seconds < 1:
             raise ValueError("approval ttl must be positive")
         self._approvals = approvals
         self._change_sets = change_sets
         self._runs = runs
+        self._artifacts = artifacts
         self._ttl_seconds = ttl_seconds
 
     @staticmethod
@@ -76,21 +84,39 @@ class ApprovalManager:
         )
         if source is None:
             raise ValueError("approval source node is absent from snapshot")
-        evidence_sha256 = sha256(
-            json.dumps(
-                sorted(
-                    (ref.artifact_id, ref.sha256, ref.artifact_type.value)
-                    for ref in record.change_set.evidence_refs
-                ),
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        if self._artifacts is None:
+            evidence_sha256 = sha256(
+                json.dumps(
+                    sorted(
+                        (ref.artifact_id, ref.sha256, ref.artifact_type.value)
+                        for ref in record.change_set.evidence_refs
+                    ),
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_effective_risk = None
+        else:
+            try:
+                nodes = await self._runs.list_nodes(context.run.workflow_run_id)
+                task = await self._runs.get_task(record.change_set.task_id)
+                manifest = await build_manifest(
+                    run=context.run,
+                    change_set=record,
+                    nodes=nodes,
+                    artifacts=self._artifacts,
+                    runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+                )
+            except Exception as error:
+                raise ConcurrencyConflict("approval evidence cannot be reconstructed") from error
+            evidence_sha256 = manifest_hash(manifest)
+            manifest_effective_risk = RiskLevel(manifest["effective_risk"])
         scope = sorted(
             set((source.effective_allowed_files or []) + (source.effective_new_files or []))
         )
         effective_risk = _max_risk(
             source.policy_risk_floor or RiskLevel.L1,
             source.risk_level_hint,
+            manifest_effective_risk or RiskLevel.L0,
         )
         expiry = (now or datetime.now(UTC)) + timedelta(seconds=self._ttl_seconds)
         subject = {
@@ -102,6 +128,10 @@ class ApprovalManager:
             "evidence_sha256": evidence_sha256,
             "scope": scope,
             "effective_risk": effective_risk.value,
+            "post_state_hash": record.change_set.post_state_hash,
+            "compiled_snapshot_hash": context.run.compiled_snapshot_hash,
+            "policy_version": context.run.policy_version,
+            "current_commit": context.run.current_commit,
             "expires_at": expiry.isoformat().replace("+00:00", "Z"),
         }
         subject_sha256 = _subject_hash(subject)
@@ -133,6 +163,21 @@ class ApprovalManager:
             ApprovalStatus.APPROVED,
             ApprovalStatus.REJECTED,
         }:
+            if not isinstance(latest.approval, ChangeSetApproval):
+                raise ConcurrencyConflict("ChangeSet approval subject type drifted")
+            if (
+                latest.approval.change_set_id != approval.change_set_id
+                or latest.approval.base_commit != approval.base_commit
+                or latest.approval.patch_sha256 != approval.patch_sha256
+                or latest.approval.evidence_sha256 != approval.evidence_sha256
+                or latest.approval.effective_risk != approval.effective_risk
+                or latest.approval.scope != approval.scope
+            ):
+                raise ConcurrencyConflict("ChangeSet approval subject drifted")
+            if latest.approval.status == ApprovalStatus.APPROVED and latest.approval.expires_at <= (
+                now or datetime.now(UTC)
+            ):
+                raise ConcurrencyConflict("ChangeSet approval has expired")
             return latest
         return await self._approvals.create(
             approval=approval,
@@ -173,6 +218,13 @@ class ApprovalManager:
             master_lease=master_lease,
             now=now,
         )
+        # The repository advances a ChangeSet approval gate in the same SQL
+        # transaction as the decision.  The fallback below is retained only
+        # for older injected repositories used by external callers/tests.
+        if not isinstance(result.approval, ChangeSetApproval):
+            return result
+        if getattr(self._approvals, "atomic_resume_available", False):
+            return result
         try:
             await self._runs.resume_after_approval(
                 result.approval.workflow_run_id,
@@ -223,16 +275,62 @@ class ApprovalManager:
         master_lease: MasterLease,
         now: datetime | None = None,
     ) -> ApprovalRecord:
+        old = await self._approvals.get(old_approval_id)
+        if not isinstance(old.approval, ChangeSetApproval):
+            raise ValueError("only ChangeSetApproval can be renewed")
+        change_set = await self._change_sets.get(old.approval.change_set_id)
+        run = await self._runs.get(old.approval.workflow_run_id)
+        nodes = await self._runs.list_nodes(run.workflow_run_id)
+        source_record = next(
+            (item for item in nodes if item.node_run_id == change_set.change_set.node_run_id),
+            None,
+        )
+        if source_record is None:
+            raise ConcurrencyConflict("renewal source run is absent from the workflow")
+        source = next(
+            (node for node in run.compiled_snapshot.nodes if node.id == source_record.node_id),
+            None,
+        )
+        if source is None:
+            raise ConcurrencyConflict("renewal source is absent from the immutable snapshot")
+        if self._artifacts is None:
+            evidence_sha256 = old.approval.evidence_sha256
+            manifest_effective_risk = None
+        else:
+            try:
+                task = await self._runs.get_task(change_set.change_set.task_id)
+                manifest = await build_manifest(
+                    run=run,
+                    change_set=change_set,
+                    nodes=nodes,
+                    artifacts=self._artifacts,
+                    runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+                )
+            except Exception as error:
+                raise ConcurrencyConflict("renewal evidence cannot be reconstructed") from error
+            evidence_sha256 = manifest_hash(manifest)
+            manifest_effective_risk = RiskLevel(manifest["effective_risk"])
+        effective_risk = _max_risk(
+            source.policy_risk_floor or RiskLevel.L1,
+            source.risk_level_hint,
+            manifest_effective_risk or RiskLevel.L0,
+        )
         expected_subject = _subject_hash(
             {
-                "workflow_run_id": new_approval.workflow_run_id,
+                "workflow_run_id": run.workflow_run_id,
                 "node_run_id": new_approval.node_run_id,
-                "change_set_id": new_approval.change_set_id,
-                "base_commit": new_approval.base_commit,
-                "patch_sha256": new_approval.patch_sha256,
-                "evidence_sha256": new_approval.evidence_sha256,
-                "scope": new_approval.scope,
-                "effective_risk": new_approval.effective_risk.value,
+                "change_set_id": change_set.change_set.change_set_id,
+                "base_commit": change_set.change_set.base_commit,
+                "patch_sha256": change_set.change_set.patch_sha256,
+                "evidence_sha256": evidence_sha256,
+                "scope": sorted(
+                    set((source.effective_allowed_files or []) + (source.effective_new_files or []))
+                ),
+                "effective_risk": effective_risk.value,
+                "post_state_hash": change_set.change_set.post_state_hash,
+                "compiled_snapshot_hash": run.compiled_snapshot_hash,
+                "policy_version": run.policy_version,
+                "current_commit": run.current_commit,
                 "expires_at": new_approval.expires_at.astimezone(UTC)
                 .isoformat()
                 .replace("+00:00", "Z"),
@@ -250,4 +348,4 @@ class ApprovalManager:
         )
 
 
-__all__ = ["ApprovalManager", "ApprovalPending"]
+__all__ = ["ApprovalManager", "ApprovalPending", "PrivilegePending"]
