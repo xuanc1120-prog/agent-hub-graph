@@ -1009,6 +1009,72 @@ class WorkflowRunRepository:
         assert row is not None
         return _task_record(row)
 
+    async def _create_privilege_retry_target_in(
+        self,
+        transaction: Transaction,
+        current: aiosqlite.Row,
+        *,
+        workflow_run_id: str,
+        approval_id: str,
+        timestamp: str,
+    ) -> aiosqlite.Row:
+        """Create the sole retry target while the approval transaction is open."""
+
+        if int(current["attempt"]) >= 2:
+            raise ConcurrencyConflict("privilege retry exceeds the two-attempt limit")
+        later = await transaction.fetch_one(
+            "SELECT id FROM node_runs WHERE workflow_run_id = ? AND node_id = ? AND attempt > ?",
+            (workflow_run_id, str(current["node_id"]), int(current["attempt"])),
+        )
+        if later is not None:
+            raise ConcurrencyConflict("privilege retry target already exists")
+        target_node_id = node_run_id(
+            workflow_run_id,
+            str(current["node_id"]),
+            int(current["attempt"]) + 1,
+        )
+        target_task_id = task_id_for_node(target_node_id)
+        await transaction.execute(
+            """
+            INSERT INTO node_runs(
+                id, workflow_run_id, node_id, node_type, attempt, status,
+                assigned_agent_id, created_at, error_code
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                target_node_id,
+                workflow_run_id,
+                str(current["node_id"]),
+                str(current["node_type"]),
+                int(current["attempt"]) + 1,
+                str(current["assigned_agent_id"]),
+                timestamp,
+                f"privilege_retry_for:{approval_id}",
+            ),
+        )
+        await transaction.execute(
+            """
+            INSERT INTO tasks(
+                id, node_run_id, agent_id, base_commit,
+                runtime_policy_artifact_id, status, created_at
+            ) VALUES (?, ?, ?, ?, NULL, 'pending', ?)
+            """,
+            (
+                target_task_id,
+                target_node_id,
+                str(current["agent_id"]),
+                str(current["base_commit"]),
+                timestamp,
+            ),
+        )
+        target = await transaction.fetch_one(
+            "SELECT nr.*, t.id AS task_id, t.status AS task_status "
+            "FROM node_runs nr JOIN tasks t ON t.node_run_id = nr.id WHERE nr.id = ?",
+            (target_node_id,),
+        )
+        assert target is not None
+        return target
+
     async def prepare_privilege_retry(
         self,
         workflow_run_id: str,
@@ -1019,7 +1085,7 @@ class WorkflowRunRepository:
         workspace_lease: WorkspaceLease,
         now: datetime | None = None,
     ) -> str:
-        """Persist an attempt+1 target before a privilege approval is decided."""
+        """Move the source into a waiting state without pre-authorizing a retry."""
 
         timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as transaction:
@@ -1052,62 +1118,30 @@ class WorkflowRunRepository:
             if (
                 NodeRunStatus(str(current["status"])) != NodeRunStatus.RUNNING
                 or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.RUNNING
-                or TaskStatus(str(current["task_status"])) != TaskStatus.RUNNING
+                or TaskStatus(str(current["task_status"]))
+                not in {TaskStatus.RUNNING, TaskStatus.PRIVILEGE_REQUESTED}
             ):
                 raise ConcurrencyConflict("privilege retry requires a running source task")
-            target_node_id = node_run_id(
-                workflow_run_id,
-                str(current["node_id"]),
-                int(current["attempt"]) + 1,
-            )
-            target_task_id = task_id_for_node(target_node_id)
-            existing = await transaction.fetch_one(
-                "SELECT id FROM node_runs WHERE id = ?", (target_node_id,)
-            )
-            if existing is not None:
-                return target_task_id
-            await transaction.execute(
-                """
-                INSERT INTO node_runs(
-                    id, workflow_run_id, node_id, node_type, attempt, status,
-                    assigned_agent_id, created_at, error_code
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-                """,
-                (
-                    target_node_id,
-                    workflow_run_id,
-                    str(current["node_id"]),
-                    str(current["node_type"]),
-                    int(current["attempt"]) + 1,
-                    str(current["assigned_agent_id"]),
-                    timestamp,
-                    f"privilege_retry_for:{approval_id}",
-                ),
-            )
-            await transaction.execute(
-                """
-                INSERT INTO tasks(
-                    id, node_run_id, agent_id, base_commit,
-                    runtime_policy_artifact_id, status, created_at
-                ) VALUES (?, ?, ?, ?, NULL, 'pending', ?)
-                """,
-                (
-                    target_task_id,
-                    target_node_id,
-                    str(current["agent_id"]),
-                    str(current["base_commit"]),
-                    timestamp,
-                ),
-            )
-            changed = await transaction.execute(
-                """
-                UPDATE tasks SET status = 'privilege_requested', finished_at = ?
-                WHERE id = ? AND status = 'running'
-                """,
-                (timestamp, str(current["task_id"])),
-            )
-            if changed != 1:
-                raise ConcurrencyConflict("privilege request lost source task CAS")
+            if (
+                int(current["attempt"]) >= 2
+                or await transaction.fetch_one(
+                    "SELECT id FROM node_runs WHERE workflow_run_id = ? AND node_id = ? "
+                    "AND attempt > ?",
+                    (workflow_run_id, str(current["node_id"]), int(current["attempt"])),
+                )
+                is not None
+            ):
+                raise ConcurrencyConflict("privilege retry exceeds the two-attempt limit")
+            if TaskStatus(str(current["task_status"])) == TaskStatus.RUNNING:
+                changed = await transaction.execute(
+                    """
+                    UPDATE tasks SET status = 'privilege_requested', finished_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (timestamp, str(current["task_id"])),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("privilege request lost source task CAS")
             changed = await transaction.execute(
                 """
                 UPDATE node_runs SET status = 'waiting_approval',
@@ -1127,17 +1161,18 @@ class WorkflowRunRepository:
             )
             if changed != 1:
                 raise ConcurrencyConflict("privilege wait lost workflow CAS")
-            await self._append_task_state(
-                transaction,
-                current,
-                lease,
-                task_id=str(current["task_id"]),
-                previous=TaskStatus.RUNNING,
-                target=TaskStatus.PRIVILEGE_REQUESTED,
-                error_code=f"privilege_pending:{approval_id}",
-                workspace_fencing_token=workspace_lease.fencing_token,
-                now=now,
-            )
+            if TaskStatus(str(current["task_status"])) == TaskStatus.RUNNING:
+                await self._append_task_state(
+                    transaction,
+                    current,
+                    lease,
+                    task_id=str(current["task_id"]),
+                    previous=TaskStatus.RUNNING,
+                    target=TaskStatus.PRIVILEGE_REQUESTED,
+                    error_code=f"privilege_pending:{approval_id}",
+                    workspace_fencing_token=workspace_lease.fencing_token,
+                    now=now,
+                )
             await self._append_node_state(
                 transaction,
                 current,
@@ -1158,7 +1193,9 @@ class WorkflowRunRepository:
                 target=WorkflowRunStatus.WAITING_APPROVAL,
                 now=now,
             )
-        return target_task_id
+        return task_id_for_node(
+            node_run_id(workflow_run_id, str(current["node_id"]), int(current["attempt"]) + 1)
+        )
 
     async def finish_task(
         self,
@@ -1663,6 +1700,91 @@ class WorkflowRunRepository:
             row = await _run_row(transaction, workflow_run_id)
         return _run_record(row)
 
+    async def approve_privilege_in(
+        self,
+        transaction: Transaction,
+        workflow_run_id: str,
+        node_run_id_value: str,
+        *,
+        approval_id: str,
+        lease: MasterLease,
+        now: datetime | None = None,
+    ) -> str:
+        """Supersede the source and create the retry target in one SQL transaction."""
+
+        current = await transaction.fetch_one(
+            """
+            SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
+                   wr.cancel_requested_at, t.id AS source_task_id,
+                   t.status AS source_task_status, t.agent_id, t.base_commit
+            FROM node_runs nr JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+            JOIN tasks t ON t.node_run_id = nr.id
+            WHERE nr.id = ? AND nr.workflow_run_id = ?
+            """,
+            (node_run_id_value, workflow_run_id),
+        )
+        if current is None:
+            raise RecordNotFound(f"privilege node not found: {node_run_id_value}")
+        if (
+            NodeRunStatus(str(current["status"])) != NodeRunStatus.WAITING_APPROVAL
+            or WorkflowRunStatus(str(current["run_status"])) != WorkflowRunStatus.WAITING_APPROVAL
+            or current["cancel_requested_at"] is not None
+            or TaskStatus(str(current["source_task_status"])) != TaskStatus.PRIVILEGE_REQUESTED
+        ):
+            raise ConcurrencyConflict("privilege approval requires a waiting source attempt")
+        timestamp = utc_now_text(now)
+        target = await self._create_privilege_retry_target_in(
+            transaction,
+            current,
+            workflow_run_id=workflow_run_id,
+            approval_id=approval_id,
+            timestamp=timestamp,
+        )
+        changed = await transaction.execute(
+            """
+            UPDATE tasks SET status = 'cancelled', error_code = 'privilege_retry_approved',
+                finished_at = ?
+            WHERE id = ? AND status = 'privilege_requested'
+            """,
+            (timestamp, str(current["source_task_id"])),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege approval source task CAS lost")
+        await self._append_task_state(
+            transaction,
+            current,
+            lease,
+            task_id=str(current["source_task_id"]),
+            previous=TaskStatus.PRIVILEGE_REQUESTED,
+            target=TaskStatus.CANCELLED,
+            error_code="privilege_retry_approved",
+            now=now,
+        )
+        changed = await transaction.execute(
+            """
+            UPDATE node_runs SET status = 'superseded', outcome = 'cancelled',
+                error_code = 'privilege_retry_approved', finished_at = ?
+            WHERE id = ? AND status = 'waiting_approval'
+            """,
+            (timestamp, node_run_id_value),
+        )
+        if changed != 1:
+            raise ConcurrencyConflict("privilege approval supersede lost CAS")
+        await self._append_node_state(
+            transaction,
+            current,
+            lease,
+            node_run_id=node_run_id_value,
+            node_id=str(current["node_id"]),
+            previous=NodeRunStatus.WAITING_APPROVAL,
+            target=NodeRunStatus.SUPERSEDED,
+            outcome=NodeOutcome.CANCELLED,
+            summary="Privilege approval created a new task attempt.",
+            error_code="privilege_retry_approved",
+            now=now,
+        )
+        return str(target["task_id"])
+
     async def resume_privilege_after_approval_in(
         self,
         transaction: Transaction,
@@ -1677,7 +1799,7 @@ class WorkflowRunRepository:
             """
             SELECT nr.*, wr.workflow_id, wr.session_id, wr.status AS run_status,
                    wr.cancel_requested_at, t.id AS source_task_id,
-                   t.status AS source_task_status
+                   t.status AS source_task_status, t.agent_id, t.base_commit
             FROM node_runs nr JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
             JOIN tasks t ON t.node_run_id = nr.id
             WHERE nr.id = ? AND nr.workflow_run_id = ?
@@ -1701,10 +1823,24 @@ class WorkflowRunRepository:
             """,
             (workflow_run_id, str(current["node_id"]), int(current["attempt"])),
         )
-        if target is None:
-            raise ConcurrencyConflict("privilege retry target is missing")
         timestamp = utc_now_text(now)
         if approved:
+            if target is None:
+                await self._create_privilege_retry_target_in(
+                    transaction,
+                    current,
+                    workflow_run_id=workflow_run_id,
+                    approval_id="legacy-approval",
+                    timestamp=timestamp,
+                )
+                target = await transaction.fetch_one(
+                    "SELECT nr.*, t.id AS task_id FROM node_runs nr "
+                    "JOIN tasks t ON t.node_run_id = nr.id "
+                    "WHERE nr.workflow_run_id = ? AND nr.node_id = ? AND nr.attempt > ? "
+                    "ORDER BY nr.attempt ASC LIMIT 1",
+                    (workflow_run_id, str(current["node_id"]), int(current["attempt"])),
+                )
+                assert target is not None
             changed = await transaction.execute(
                 """
                 UPDATE node_runs SET status = 'superseded', outcome = 'cancelled',
@@ -1729,6 +1865,7 @@ class WorkflowRunRepository:
                 now=now,
             )
             return
+        target_task_id = None if target is None else str(target["task_id"])
         changed = await transaction.execute(
             """
             UPDATE tasks SET status = 'failed', error_code = 'privilege_rejected',
@@ -1759,21 +1896,22 @@ class WorkflowRunRepository:
         )
         if changed != 1:
             raise ConcurrencyConflict("privilege rejection lost source node CAS")
-        await transaction.execute(
-            "UPDATE tasks SET status = 'cancelled', finished_at = ? "
-            "WHERE id = ? AND status = 'pending'",
-            (timestamp, str(target["task_id"])),
-        )
-        changed = await transaction.execute(
-            """
-            UPDATE node_runs SET status = 'skipped', outcome = NULL,
-                error_code = 'privilege_rejected', finished_at = ?
-            WHERE id = ? AND status = 'pending'
-            """,
-            (timestamp, str(target["id"])),
-        )
-        if changed != 1:
-            raise ConcurrencyConflict("privilege rejection lost retry target CAS")
+        if target is not None:
+            await transaction.execute(
+                "UPDATE tasks SET status = 'cancelled', finished_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (timestamp, target_task_id),
+            )
+            changed = await transaction.execute(
+                """
+                UPDATE node_runs SET status = 'skipped', outcome = NULL,
+                    error_code = 'privilege_rejected', finished_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, str(target["id"])),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("privilege rejection lost retry target CAS")
         await self._append_node_state(
             transaction,
             current,
@@ -1787,18 +1925,19 @@ class WorkflowRunRepository:
             error_code="privilege_rejected",
             now=now,
         )
-        await self._append_node_state(
-            transaction,
-            current,
-            lease,
-            node_run_id=str(target["id"]),
-            node_id=str(target["node_id"]),
-            previous=NodeRunStatus.PENDING,
-            target=NodeRunStatus.SKIPPED,
-            summary="Privilege retry was rejected.",
-            error_code="privilege_rejected",
-            now=now,
-        )
+        if target is not None:
+            await self._append_node_state(
+                transaction,
+                current,
+                lease,
+                node_run_id=str(target["id"]),
+                node_id=str(target["node_id"]),
+                previous=NodeRunStatus.PENDING,
+                target=NodeRunStatus.SKIPPED,
+                summary="Privilege retry was rejected.",
+                error_code="privilege_rejected",
+                now=now,
+            )
         changed = await transaction.execute(
             "UPDATE workflow_runs SET status = 'running' "
             "WHERE id = ? AND status = 'waiting_approval' AND cancel_requested_at IS NULL",

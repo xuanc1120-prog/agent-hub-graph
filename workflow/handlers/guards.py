@@ -27,6 +27,7 @@ from security.command_guard import CommandGuard, CommandGuardViolation
 from security.patch_guard import PatchGuard, PatchGuardDecision
 from security.risk_classifier import RiskClassifier
 from security.test_runner import TestRunner, TestRunResult
+from storage.approval_repository import ApprovalRepository
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRecord, ChangeSetRepository
 from storage.errors import ConcurrencyConflict
@@ -145,15 +146,38 @@ class _ChangeSetHandler:
 
 
 class PatchGuardNodeHandler(_ChangeSetHandler):
+    def __init__(
+        self,
+        change_sets: ChangeSetRepository,
+        artifacts: ArtifactRepository,
+        approvals: ApprovalRepository | None = None,
+    ) -> None:
+        super().__init__(change_sets, artifacts)
+        self._approvals = approvals
+
     async def execute(self, value: object) -> NodeHandlerResult:
         context = _context(value)
         source, record = await self._source(context)
         record, patch = await self._change_sets.load_patch(record.change_set.change_set_id)
+        granted_existing: tuple[str, ...] = ()
+        if self._approvals is not None:
+            grant = await self._approvals.get_grant_for_task(record.change_set.task_id)
+            if (
+                grant is not None
+                and grant.grant.consumed_at is not None
+                and grant.grant.consumed_fencing_token is not None
+                and grant.grant.target_task_id == record.change_set.task_id
+            ):
+                granted_existing = (grant.grant.resource,)
+        allowed_existing = tuple(
+            dict.fromkeys([*(source.effective_allowed_files or []), *granted_existing])
+        )
         report = PatchGuard(context.session.shared_repo_path).check(
             record.document.manifest,
             patch,
-            allowed_existing_files=source.effective_allowed_files or [],
+            allowed_existing_files=allowed_existing,
             allowed_new_files=source.effective_new_files or [],
+            granted_existing_files=granted_existing,
             expected_patch_sha256=record.change_set.patch_sha256,
         )
         artifact = PatchGuardArtifact(

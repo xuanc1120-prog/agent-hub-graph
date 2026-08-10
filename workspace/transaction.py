@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import unicodedata
+from collections.abc import Collection
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -106,6 +107,7 @@ class WorkspaceTransaction:
         max_inventory_bytes: int = 2 * 1024 * 1024 * 1024,
         max_ignored_preimage_bytes: int = 100 * 1024 * 1024,
         seal_git_objects: bool = False,
+        forbidden_paths: Collection[str] = (),
     ) -> None:
         if any(
             limit < 1
@@ -137,6 +139,7 @@ class WorkspaceTransaction:
         )
         self._seal_git_objects = seal_git_objects
         self._path_policy = PathPolicy(self._repo, max_scope_files=max_changed_paths)
+        self._forbidden_paths = {self._path_policy.comparison_key(path) for path in forbidden_paths}
         self._phase = "new"
         self._baseline_state: RepositoryState | None = None
         self._baseline_inventory: _Inventory | None = None
@@ -780,6 +783,10 @@ class WorkspaceTransaction:
     ) -> None:
         for path in paths:
             validated = self._path_policy.validate_cleanup_path(path)
+            if self._path_policy.comparison_key(path) in self._forbidden_paths:
+                raise WorkspaceTransactionError(
+                    f"protected capability resource requires a consumed grant: {path}"
+                )
             if path in after.files and not validated.exists:
                 raise WorkspaceTransactionError(f"captured path disappeared: {path}")
 

@@ -105,6 +105,9 @@ class ApprovalManager:
                     nodes=nodes,
                     artifacts=self._artifacts,
                     runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+                    capability_lineage=await self._approvals.list_privilege_lineage_for_run(
+                        context.run.workflow_run_id
+                    ),
                 )
             except Exception as error:
                 raise ConcurrencyConflict("approval evidence cannot be reconstructed") from error
@@ -305,6 +308,9 @@ class ApprovalManager:
                     nodes=nodes,
                     artifacts=self._artifacts,
                     runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+                    capability_lineage=await self._approvals.list_privilege_lineage_for_run(
+                        run.workflow_run_id
+                    ),
                 )
             except Exception as error:
                 raise ConcurrencyConflict("renewal evidence cannot be reconstructed") from error

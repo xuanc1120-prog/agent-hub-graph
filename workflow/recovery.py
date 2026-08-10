@@ -358,6 +358,9 @@ class RecoveryManager:
             nodes=nodes,
             artifacts=self._artifacts,
             runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+            capability_lineage=await self._approvals.list_privilege_lineage_for_run(
+                run.workflow_run_id
+            ),
         )
         return manifest_hash(manifest)
 

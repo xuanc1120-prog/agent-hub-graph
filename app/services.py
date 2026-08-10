@@ -566,7 +566,13 @@ def _build_services(settings: Settings) -> RuntimeServices:
     )
     command_guard = CommandGuard()
     change_sets = ChangeSetRepository(database, artifacts, events, leases, locks)
-    approvals = ApprovalRepository(database, events, leases, runs)
+    approvals = ApprovalRepository(
+        database,
+        events,
+        leases,
+        runs,
+        grant_ttl_seconds=settings.capability_grant_ttl_seconds,
+    )
     approval_manager = ApprovalManager(
         approvals,
         change_sets,
@@ -608,7 +614,7 @@ def _build_services(settings: Settings) -> RuntimeServices:
     )
     registry = build_node_registry(
         agent_handler,
-        patch_guard_handler=PatchGuardNodeHandler(change_sets, artifacts),
+        patch_guard_handler=PatchGuardNodeHandler(change_sets, artifacts, approvals),
         command_guard_handler=CommandGuardNodeHandler(
             change_sets,
             artifacts,

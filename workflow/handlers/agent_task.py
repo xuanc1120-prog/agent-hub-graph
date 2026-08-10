@@ -15,6 +15,7 @@ from adapters.base import BaseAgentAdapter, ConsoleSink
 from context.context_builder import ContextBuilder
 from context.task_bundle import TaskContextBundle
 from protocol import (
+    AgentOutputEnvelope,
     AgentResult,
     AgentResultStatus,
     ArtifactRef,
@@ -42,6 +43,7 @@ from storage.workflow_run_repository import (
 )
 from workflow.approval_manager import PrivilegePending
 from workflow.capability_broker import CapabilityBroker
+from workflow.capability_policy import eligible_actions
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
@@ -147,6 +149,73 @@ class AgentTaskNodeHandler:
                 self._agent_runs_dir,
             )
         )
+
+    async def _materialize_privilege_requests(
+        self,
+        context: NodeExecutionContext,
+        *,
+        task_id: str,
+        result: AgentResult,
+    ) -> list[str]:
+        """Persist the adapter's structured request before validating the result.
+
+        Adapters return a sealed ``AgentOutputEnvelope`` artifact rather than
+        receiving a database service.  This is the production bridge from the
+        adapter result to the capability side-gate; request IDs alone never
+        authorize an unpersisted request.
+        """
+
+        request_ids = list(result.privilege_request_ids)
+        if result.raw_output_ref is None:
+            return request_ids
+        record, content = await self._artifacts.get_and_verify(
+            result.raw_output_ref.artifact_id,
+            expected_session_id=context.run.session_id,
+            expected_task_id=task_id,
+        )
+        if (
+            record.task_id != task_id
+            or record.artifact_type != ArtifactType.REPORT.value
+            or not record.redacted
+            or record.sha256 != result.raw_output_ref.sha256
+            or record.size_bytes != result.raw_output_ref.size_bytes
+        ):
+            raise _AgentTaskError("privilege_output_artifact_binding_invalid")
+        try:
+            envelope = AgentOutputEnvelope.model_validate_json(content, strict=True)
+        except Exception as error:
+            raise _AgentTaskError("privilege_output_envelope_invalid") from error
+        if not envelope.privilege_requests:
+            return request_ids
+        if request_ids:
+            # A result may repeat a previously persisted ID, but cannot attach
+            # a different proposal to that immutable request.
+            binding = (
+                await self._capabilities.validate_result_requests(
+                    context,
+                    task_id=task_id,
+                    request_ids=request_ids,
+                )
+                if self._capabilities is not None
+                else None
+            )
+            if binding is None:
+                raise _AgentTaskError("capability_runtime_unavailable")
+            proposal = envelope.privilege_requests[0]
+            if (
+                binding.action != proposal.requested_action.value
+                or binding.resource != proposal.requested_resource
+            ):
+                raise _AgentTaskError("privilege_request_subject_mismatch")
+            return request_ids
+        if self._capabilities is None:
+            raise _AgentTaskError("capability_runtime_unavailable")
+        request, _approval = await self._capabilities.request(
+            context,
+            envelope.privilege_requests[0],
+            now=datetime.now(UTC),
+        )
+        return [request.request_id]
 
     @staticmethod
     def _runtime_policy(node: WorkflowNode) -> FrozenStrictModel:
@@ -473,6 +542,19 @@ class AgentTaskNodeHandler:
                     expected_branch=context.session.integration_branch,
                     temp_directory=(self._agent_runs_dir / task.task_id / "workspace-transaction"),
                     seal_git_objects=True,
+                    forbidden_paths=tuple(
+                        path
+                        for path in (
+                            set(context.node.effective_allowed_files or [])
+                            | set(context.node.effective_new_files or [])
+                        )
+                        if eligible_actions(path)
+                        and not (
+                            capability_grant is not None
+                            and path == capability_grant.grant.resource
+                            and path in set(context.node.effective_allowed_files or [])
+                        )
+                    ),
                     **self._transaction_limits,
                 )
                 await self._locks.run_fenced(
@@ -499,10 +581,15 @@ class AgentTaskNodeHandler:
                             execution_error = _AgentTaskError("capability_runtime_unavailable")
                         else:
                             try:
+                                request_ids = await self._materialize_privilege_requests(
+                                    context,
+                                    task_id=task.task_id,
+                                    result=agent_result,
+                                )
                                 binding = await self._capabilities.validate_result_requests(
                                     context,
                                     task_id=task.task_id,
-                                    request_ids=agent_result.privilege_request_ids,
+                                    request_ids=request_ids,
                                 )
                                 approval = await self._capabilities.approval_for_request(
                                     binding.request_id
@@ -544,6 +631,21 @@ class AgentTaskNodeHandler:
                 )
                 held.assert_healthy()
                 if isinstance(execution_error, PrivilegePending):
+                    if has_changes:
+                        assert capture is not None
+                        await self._change_sets.persist_capture(
+                            session_id=context.run.session_id,
+                            workflow_run_id=context.run.workflow_run_id,
+                            node_run_id=context.node_run.node_run_id,
+                            task_id=task.task_id,
+                            capture=capture,
+                            master_lease=context.master_lease,
+                            workspace_lease=held.lease,
+                            task_target=TaskStatus.PRIVILEGE_REQUESTED,
+                            task_error_code="privilege_partial_capture",
+                            status=ChangeSetStatus.ABANDONED_PARTIAL,
+                            reason="Privilege request abandoned the partial workspace capture",
+                        )
                     await self._runs.prepare_privilege_retry(
                         context.run.workflow_run_id,
                         context.node_run.node_run_id,

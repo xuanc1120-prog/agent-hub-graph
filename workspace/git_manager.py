@@ -13,7 +13,7 @@ from collections.abc import Collection, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -563,6 +563,59 @@ class GitManager:
             input_bytes=self._pathspec_bytes(paths),
         )
 
+    def remove_worktree_entries(self, repo: Path, paths: Sequence[str]) -> None:
+        """Remove only explicit plain entries created by the failed ChangeSet."""
+
+        root = repo.expanduser().resolve(strict=True)
+        self._assert_directory_not_reparse(root, label="repository root")
+        unique = sorted(set(paths), key=lambda value: (value.count("/"), value), reverse=True)
+        for relative in unique:
+            if not isinstance(relative, str) or not relative:
+                raise GitManagerError("rollback path must be a non-empty string")
+            pure = PurePosixPath(relative)
+            if (
+                pure.is_absolute()
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in pure.parts)
+            ):
+                raise GitManagerError("rollback path must be a safe repository-relative path")
+            current = root
+            missing = False
+            for component in pure.parts[:-1]:
+                current = current / component
+                try:
+                    self._assert_plain_git_entry(current, expect_directory=True)
+                except FileNotFoundError:
+                    missing = True
+                    break
+            if missing:
+                continue
+            target = root.joinpath(*pure.parts)
+            try:
+                metadata = target.lstat()
+            except FileNotFoundError:
+                continue
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & reparse_flag
+            ):
+                raise GitManagerError("rollback path is a link or reparse point")
+            if stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink > 1:
+                    raise GitManagerError("rollback refuses to unlink a hardlinked file")
+                target.unlink()
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                self._assert_plain_git_entry(target, expect_directory=True)
+                try:
+                    next(target.iterdir())
+                except StopIteration:
+                    target.rmdir()
+                    continue
+                raise GitManagerError("rollback refuses to remove a non-empty directory")
+            raise GitManagerError("rollback path is not a regular file or directory")
+
     def index_sha256(self, repo: Path) -> str:
         root = repo.expanduser().resolve(strict=True)
         entries = self._run(("ls-files", "--stage", "-z", "--"), cwd=root).stdout
@@ -624,6 +677,7 @@ class GitManager:
         workflow_run_id: str,
         change_set_id: str,
         approval_id: str,
+        expected_index_sha256: str | None = None,
     ) -> tuple[str, str]:
         self._require_object_id(parent_commit)
         if sha256(patch_bytes).hexdigest() != patch_sha256:
@@ -634,8 +688,10 @@ class GitManager:
             raise GitManagerError("an approved patch must contain at least one path")
         self._pathspec_bytes(normalized)
         before = self.state(root)
-        if before.commit != parent_commit or before.dirty:
-            raise GitManagerError("approved merge requires the expected clean parent")
+        if before.commit != parent_commit or before.staged:
+            raise GitManagerError("approved merge requires the expected parent and clean index")
+        if expected_index_sha256 is not None and self.index_sha256(root) != expected_index_sha256:
+            raise GitManagerError("approved merge index changed before staging")
         expected_tree = self.canonical_patch_tree(
             root,
             parent_commit=parent_commit,
@@ -649,10 +705,10 @@ class GitManager:
         staged = self._nul_paths(
             self._run(("diff", "--cached", "--name-only", "-z", "--"), cwd=root).stdout
         )
-        if set(staged) != set(normalized):
-            raise GitManagerError("approved merge staged paths do not exactly match the ChangeSet")
+        if not staged:
+            raise GitManagerError("approved merge produced no staged paths")
         after_stage = self.state(root)
-        if after_stage.unstaged or set(after_stage.untracked_files) - set(normalized):
+        if after_stage.unstaged or after_stage.untracked_files:
             raise GitManagerError("approved merge left unexpected working tree changes")
         if (
             self._run(

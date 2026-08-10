@@ -27,6 +27,7 @@ from storage.approval_repository import (
 from storage.db import Transaction
 from storage.leases import MasterLease, WorkspaceLease
 from storage.workflow_run_repository import task_id_for_node
+from workflow.capability_policy import is_eligible_resource
 from workflow.handlers.base import NodeExecutionContext
 
 _ACTIONS = {
@@ -75,15 +76,15 @@ class CapabilityBroker:
         if not resource:
             raise ValueError("privilege requests require one exact existing resource")
         source = context.node
-        allowed = set(source.effective_allowed_files or [])
-        if resource not in allowed or resource in set(source.effective_new_files or []):
-            raise ValueError("privilege resource is outside the compiled existing-file scope")
+        if not is_eligible_resource(proposal.requested_action, resource):
+            raise ValueError("privilege resource is not eligible for the requested action")
         repo_root = Path(context.session.shared_repo_path).expanduser().resolve(strict=True)
         candidate = repo_root / resource
         if (
             candidate.is_symlink()
             or not candidate.is_file()
             or candidate.resolve(strict=True) != candidate.absolute()
+            or candidate.stat().st_nlink > 1
         ):
             raise ValueError("privilege resource must be one existing non-reparse file")
         effective_risk = _risk(
@@ -253,11 +254,8 @@ class CapabilityBroker:
             not in {PrivilegeRequestStatus.PENDING, PrivilegeRequestStatus.WAITING_APPROVAL}
         ):
             raise ValueError("privilege request is not bound to the active AgentTask")
-        allowed = set(context.node.effective_allowed_files or [])
-        if binding.resource not in allowed or binding.resource in set(
-            context.node.effective_new_files or []
-        ):
-            raise ValueError("privilege request resource exceeds compiled existing-file scope")
+        if not is_eligible_resource(PrivilegeAction(binding.action), binding.resource):
+            raise ValueError("privilege request resource is not eligible for the requested action")
         return binding
 
     async def revoke_for_run(

@@ -101,6 +101,7 @@ class MergePatchNodeHandler:
         applied = False
         finalizing = False
         committed: str | None = None
+        expected_index_sha256: str | None = None
         async with self._locks.hold(
             session_id=context.run.session_id,
             owner_kind=WorkspaceOwnerKind.MERGE,
@@ -116,6 +117,9 @@ class MergePatchNodeHandler:
                     raise ConcurrencyConflict("workspace HEAD is stale or dirty before merge")
                 if current_state.commit != record.change_set.base_commit:
                     raise ConcurrencyConflict("ChangeSet base commit is stale")
+                expected_index_sha256 = self._git.index_sha256(
+                    Path(context.session.shared_repo_path)
+                )
                 await self._runs.begin_merge_finalizing(
                     context.run.workflow_run_id,
                     workspace_lease=held.lease,
@@ -167,6 +171,7 @@ class MergePatchNodeHandler:
                     patch_bytes=patch,
                     patch_sha256=record.change_set.patch_sha256,
                     post_state_hash=record.change_set.post_state_hash,
+                    expected_index_sha256=expected_index_sha256,
                 )
                 held.assert_healthy()
                 await self._runs.finalize_merge(
@@ -209,6 +214,9 @@ class MergePatchNodeHandler:
                 nodes=await self._runs.list_nodes(context.run.workflow_run_id),
                 artifacts=self._artifacts,
                 runtime_policy_artifact_id=task.runtime_policy_artifact_id,
+                capability_lineage=await self._approvals.list_privilege_lineage_for_run(
+                    context.run.workflow_run_id
+                ),
             )
         except Exception as error:
             raise ConcurrencyConflict("merge evidence cannot be reconstructed") from error
@@ -244,6 +252,7 @@ class MergePatchNodeHandler:
                     set(record.change_set.created_files)
                     | set(record.change_set.untracked_files)
                     | set(record.change_set.renamed_files)
+                    | set(record.change_set.created_directories)
                 )
                 existing = tuple(path for path in changed_paths if path not in created)
 
@@ -254,6 +263,7 @@ class MergePatchNodeHandler:
                         paths=existing,
                     )
                     self._git.unstage_new_paths(repo, tuple(sorted(created)))
+                    self._git.remove_worktree_entries(repo, tuple(sorted(created)))
 
                 await self._locks.run_fenced(
                     held,
