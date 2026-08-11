@@ -781,7 +781,7 @@ def _open_windows_fd(
     desired_access = 0x80000000  # GENERIC_READ
     if write_attributes:
         desired_access |= 0x00000100  # FILE_WRITE_ATTRIBUTES
-    share_mode = 0 if deny_mutation else 0x1 | 0x2 | 0x4  # READ | WRITE | DELETE
+    share_mode = 0x1 if deny_mutation else 0x1 | 0x2 | 0x4  # READ | WRITE | DELETE
     open_existing = 3
     flags = 0x00200000 | 0x08000000  # OPEN_REPARSE_POINT | SEQUENTIAL_SCAN
     handle = create_file(

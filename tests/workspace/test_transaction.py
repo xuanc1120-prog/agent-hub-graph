@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
-from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
+from protocol import PrivilegeAction
 from workspace.change_set import FileAction
 from workspace.git_manager import GitManager
 from workspace.transaction import (
@@ -76,17 +77,26 @@ def test_capability_seal_must_match_workspace_transaction_preimage(
     changed = b'{"name":"prod"}'
     assert len(original) == len(changed)
     target.write_bytes(original)
-    seal = {
-        "schema": "hub210-capability-resource-seal-v1",
-        "relative_path": "cache/settings.json",
-        "sha256": sha256(original).hexdigest(),
-        "size_bytes": len(original),
-        "mode": target.stat().st_mode & 0o777,
-        "device": target.stat().st_dev,
-        "inode": target.stat().st_ino,
-        "link_count": target.stat().st_nlink,
-        "file_attributes": getattr(target.stat(), "st_file_attributes", 0),
-    }
+    from workflow.capability_broker import inspect_capability_resource
+
+    seal = inspect_capability_resource(
+        repo,
+        PrivilegeAction.EDIT_PROJECT_CONFIG,
+        "cache/settings.json",
+    ).as_dict()
+    assert seal["mode"] == stat.S_IMODE(target.stat().st_mode)
+
+    transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp-positive",
+        sealed_preimages={"cache/settings.json": seal},
+    )
+    transaction.begin()
+    transaction.close()
+
     target.write_bytes(changed)
 
     transaction = WorkspaceTransaction(

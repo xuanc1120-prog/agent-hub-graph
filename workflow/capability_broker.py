@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ class CapabilityResourceSeal:
                 relative_path=str(value["relative_path"]),
                 sha256=str(value["sha256"]),
                 size_bytes=int(value["size_bytes"]),
-                mode=int(value["mode"]),
+                mode=stat.S_IMODE(int(value["mode"])),
                 device=int(value["device"]),
                 inode=int(value["inode"]),
                 link_count=int(value["link_count"]),
@@ -133,7 +134,7 @@ def _read_stable_resource(
         relative_path=resource,
         sha256=second_hash,
         size_bytes=int(metadata.st_size),
-        mode=int(metadata.st_mode),
+        mode=stat.S_IMODE(metadata.st_mode),
         device=int(getattr(metadata, "st_dev", 0)),
         inode=int(getattr(metadata, "st_ino", 0)),
         link_count=int(metadata.st_nlink),
@@ -417,9 +418,17 @@ class CapabilityBroker:
                 workspace_lease=workspace_lease,
                 now=now,
             )
-            if consumed.resource_seal != bound.as_dict():
+            if (
+                consumed.resource_seal is None
+                or CapabilityResourceSeal.from_mapping(consumed.resource_seal) != bound
+            ):
                 raise ValueError("capability grant resource seal changed")
-        if consumed.resource_seal != current.resource_seal:
+        if (
+            consumed.resource_seal is None
+            or current.resource_seal is None
+            or CapabilityResourceSeal.from_mapping(consumed.resource_seal)
+            != CapabilityResourceSeal.from_mapping(current.resource_seal)
+        ):
             raise ValueError("capability grant resource seal changed")
         return consumed
 

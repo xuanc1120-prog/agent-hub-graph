@@ -225,7 +225,7 @@ class WorkspaceTransaction:
                     or str(expected["relative_path"]) != path
                     or str(expected["sha256"]) != snapshot.sha256
                     or int(expected["size_bytes"]) != snapshot.size_bytes
-                    or int(expected["mode"]) != snapshot.mode
+                    or stat.S_IMODE(int(expected["mode"])) != snapshot.mode
                 ):
                     raise ValueError
                 expected_device = int(expected["device"])
