@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -37,6 +38,7 @@ _ACTIONS = {
     CapabilityType.MODIFY_DEPENDENCY: PrivilegeAction.EDIT_DEPENDENCY_MANIFEST,
     CapabilityType.MODIFY_CONFIG: PrivilegeAction.EDIT_PROJECT_CONFIG,
 }
+_RESOURCE_SCAN_LIMIT = 8 * 1024 * 1024
 
 
 def _risk(value: RiskLevel, floor: RiskLevel) -> RiskLevel:
@@ -94,6 +96,51 @@ class CapabilityResourceSeal:
             raise ValueError("capability resource seal is malformed") from error
 
 
+def _metadata_tuple(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(getattr(metadata, "st_dev", 0)),
+        int(getattr(metadata, "st_ino", 0)),
+        int(metadata.st_size),
+        int(metadata.st_mode),
+        int(metadata.st_nlink),
+        int(getattr(metadata, "st_file_attributes", 0)),
+    )
+
+
+def _read_stable_resource(
+    stream: Any,
+    *,
+    resource: str,
+    assert_secret_free_bytes: Any,
+) -> CapabilityResourceSeal:
+    """Read twice through one handle and reject metadata or content drift."""
+
+    first = stream.read(_RESOURCE_SCAN_LIMIT + 1)
+    first_metadata = os.fstat(stream.fileno())
+    stream.seek(0)
+    second = stream.read(_RESOURCE_SCAN_LIMIT + 1)
+    second_metadata = os.fstat(stream.fileno())
+    assert_secret_free_bytes(first, label="capability resource")
+    assert_secret_free_bytes(second, label="capability resource")
+    if _metadata_tuple(first_metadata) != _metadata_tuple(second_metadata):
+        raise ValueError("capability resource metadata changed during read")
+    first_hash = sha256(first).hexdigest()
+    second_hash = sha256(second).hexdigest()
+    if first_hash != second_hash:
+        raise ValueError("capability resource content changed during read")
+    metadata = second_metadata
+    return CapabilityResourceSeal(
+        relative_path=resource,
+        sha256=second_hash,
+        size_bytes=int(metadata.st_size),
+        mode=int(metadata.st_mode),
+        device=int(getattr(metadata, "st_dev", 0)),
+        inode=int(getattr(metadata, "st_ino", 0)),
+        link_count=int(metadata.st_nlink),
+        file_attributes=int(getattr(metadata, "st_file_attributes", 0)),
+    )
+
+
 def inspect_capability_resource(
     repo_root: Path,
     action: PrivilegeAction,
@@ -109,38 +156,19 @@ def inspect_capability_resource(
     try:
         with SecureWorkspaceRoot(repo_root) as secure_root:
             with secure_root.open_binary(resource) as stream:
-                metadata = os.fstat(stream.fileno())
-                content = stream.read(8 * 1024 * 1024 + 1)
-                assert_secret_free_bytes(content, label="capability resource")
-                seal = CapabilityResourceSeal(
-                    relative_path=resource,
-                    sha256=sha256(content).hexdigest(),
-                    size_bytes=int(metadata.st_size),
-                    mode=int(metadata.st_mode),
-                    device=int(getattr(metadata, "st_dev", 0)),
-                    inode=int(getattr(metadata, "st_ino", 0)),
-                    link_count=int(metadata.st_nlink),
-                    file_attributes=int(getattr(metadata, "st_file_attributes", 0)),
+                seal = _read_stable_resource(
+                    stream,
+                    resource=resource,
+                    assert_secret_free_bytes=assert_secret_free_bytes,
                 )
             with secure_root.open_binary(resource) as current_stream:
-                current = os.fstat(current_stream.fileno())
-                current_identity = (
-                    int(getattr(current, "st_dev", 0)),
-                    int(getattr(current, "st_ino", 0)),
-                    int(current.st_size),
-                    int(current.st_mode),
-                    int(current.st_nlink),
-                    int(getattr(current, "st_file_attributes", 0)),
+                current = _read_stable_resource(
+                    current_stream,
+                    resource=resource,
+                    assert_secret_free_bytes=assert_secret_free_bytes,
                 )
-            if current_identity != (
-                seal.device,
-                seal.inode,
-                seal.size_bytes,
-                seal.mode,
-                seal.link_count,
-                seal.file_attributes,
-            ):
-                raise SecureFileError("capability resource identity changed")
+            if current != seal:
+                raise SecureFileError("capability resource changed after stable read")
         return seal
     except (OSError, ValueError) as error:
         if isinstance(error, ValueError) and str(error).startswith(
@@ -148,6 +176,37 @@ def inspect_capability_resource(
         ):
             raise
         raise ValueError("capability resource failed closed validation") from error
+
+
+@contextmanager
+def hold_capability_resource(
+    repo_root: Path,
+    action: PrivilegeAction,
+    resource: str,
+    expected: Mapping[str, object] | None,
+):
+    """Hold a verified resource handle across the fenced grant-consume transaction."""
+
+    if expected is None:
+        raise ValueError("capability resource has no immutable seal")
+    if not is_eligible_resource(action, resource):
+        raise ValueError("privilege resource is not eligible for the requested action")
+    expected_seal = CapabilityResourceSeal.from_mapping(expected)
+    from security.secret_policy import assert_secret_free_bytes
+    from workspace.secure_file import SecureWorkspaceRoot
+
+    with (
+        SecureWorkspaceRoot(repo_root) as secure_root,
+        secure_root.open_binary(resource, deny_mutation=True) as stream,
+    ):
+        actual = _read_stable_resource(
+            stream,
+            resource=resource,
+            assert_secret_free_bytes=assert_secret_free_bytes,
+        )
+        if actual != expected_seal:
+            raise ValueError("capability resource seal changed")
+        yield actual
 
 
 def verify_capability_resource(
@@ -188,6 +247,7 @@ class CapabilityBroker:
         context: NodeExecutionContext,
         proposal: PrivilegeRequestProposal,
         *,
+        workspace_lease: WorkspaceLease,
         now: datetime | None = None,
     ) -> tuple[PrivilegeRequest, ApprovalRecord | None]:
         expected_action = _ACTIONS.get(proposal.requested_capability)
@@ -267,13 +327,14 @@ class CapabilityBroker:
                 else PrivilegeRequestStatus.PENDING
             ),
         )
-        await self._approvals.create_privilege_request(
-            request=request,
-            resource_seal=resource_seal.as_dict(),
-            master_lease=context.master_lease,
-            now=now,
-        )
         if effective_risk == RiskLevel.L4:
+            await self._approvals.create_privilege_request(
+                request=request,
+                resource_seal=resource_seal.as_dict(),
+                master_lease=context.master_lease,
+                workspace_lease=workspace_lease,
+                now=now,
+            )
             return request, None
         approval = PrivilegeApproval(
             approval_id=f"approval-priv-{subject_sha256[:32]}",
@@ -288,9 +349,12 @@ class CapabilityBroker:
                 json.dumps(subject, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
         )
-        return request, await self._approvals.create(
+        return request, await self._approvals.create_privilege_request_and_approval(
+            request=request,
+            resource_seal=resource_seal.as_dict(),
             approval=approval,
             master_lease=context.master_lease,
+            workspace_lease=workspace_lease,
             now=now,
         )
 
@@ -338,21 +402,23 @@ class CapabilityBroker:
         current = await self._approvals.get_grant_for_task(target_task_id)
         if current is None or current.grant.grant_id != grant_id:
             raise ValueError("capability grant is not bound to the target task")
-        verify_capability_resource(
+        with hold_capability_resource(
             repo_root,
             action,
             resource,
             current.resource_seal,
-        )
-        consumed = await self._approvals.consume_grant(
-            grant_id=grant_id,
-            target_task_id=target_task_id,
-            action=action,
-            resource=resource,
-            master_lease=master_lease,
-            workspace_lease=workspace_lease,
-            now=now,
-        )
+        ) as bound:
+            consumed = await self._approvals.consume_grant(
+                grant_id=grant_id,
+                target_task_id=target_task_id,
+                action=action,
+                resource=resource,
+                master_lease=master_lease,
+                workspace_lease=workspace_lease,
+                now=now,
+            )
+            if consumed.resource_seal != bound.as_dict():
+                raise ValueError("capability grant resource seal changed")
         if consumed.resource_seal != current.resource_seal:
             raise ValueError("capability grant resource seal changed")
         return consumed
@@ -432,6 +498,7 @@ class CapabilityBroker:
 __all__ = [
     "CapabilityBroker",
     "CapabilityResourceSeal",
+    "hold_capability_resource",
     "inspect_capability_resource",
     "verify_capability_resource",
 ]

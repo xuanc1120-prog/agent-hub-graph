@@ -285,6 +285,72 @@ async def test_newer_schema_fails_before_applying_v1(tmp_path: Path) -> None:
     assert agents is None
 
 
+async def test_v2_capability_rows_are_invalidated_during_v3_migration(tmp_path: Path) -> None:
+    path = tmp_path / "v2-capability-records.db"
+    migration = (Path(__file__).resolve().parents[2] / "migrations" / "init.sql").read_text(
+        encoding="utf-8"
+    )
+    connection = sqlite3.connect(path)
+    connection.executescript(migration)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        INSERT INTO privilege_requests(
+            id, task_id, node_run_id, capability, action, resource,
+            effective_risk, status, created_at
+        ) VALUES ('priv-v2', 'task-v2', 'node-v2', 'modify_config',
+                  'edit_project_config', 'config/settings.json', 'L1', 'approved', ?)
+        """,
+        (TIMESTAMP,),
+    )
+    connection.execute(
+        """
+        INSERT INTO approvals(
+            id, workflow_run_id, node_run_id, subject_type, change_set_id,
+            privilege_request_id, subject_sha256, base_commit, patch_sha256,
+            evidence_sha256, effective_risk, scope_json, status, version,
+            decision_actor, decision_idempotency_key, expires_at, decided_at, created_at
+        ) VALUES ('approval-v2', 'run-v2', 'node-v2', 'privilege_request', NULL,
+                  'priv-v2', ?, NULL, NULL, ?, 'L1', '["config/settings.json"]',
+                  'pending', 1, NULL, NULL, ?, NULL, ?)
+        """,
+        ("a" * 64, "b" * 64, TIMESTAMP, TIMESTAMP),
+    )
+    connection.execute(
+        """
+        INSERT INTO capability_grants(
+            id, request_id, target_task_id, action, resource, expires_at
+        ) VALUES ('grant-v2', 'priv-v2', 'task-v2-retry',
+                  'edit_project_config', 'config/settings.json', ?)
+        """,
+        (TIMESTAMP,),
+    )
+    connection.commit()
+    connection.close()
+
+    assert await Database(path).initialize() == SCHEMA_VERSION
+
+    connection = sqlite3.connect(path)
+    approval = connection.execute(
+        "SELECT status FROM approvals WHERE id = 'approval-v2'"
+    ).fetchone()
+    request = connection.execute(
+        "SELECT status FROM privilege_requests WHERE id = 'priv-v2'"
+    ).fetchone()
+    grant = connection.execute(
+        "SELECT revoked_at, revocation_reason, resource_seal_json "
+        "FROM capability_grants WHERE id = 'grant-v2'"
+    ).fetchone()
+    connection.close()
+
+    assert approval == ("rejected",)
+    assert request == ("denied",)
+    assert grant is not None
+    assert grant[0] is not None
+    assert grant[1] == "resource seal missing during schema migration"
+    assert grant[2] == "{}"
+
+
 def test_naive_timestamps_are_rejected() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         utc_now_text(datetime(2026, 7, 12))

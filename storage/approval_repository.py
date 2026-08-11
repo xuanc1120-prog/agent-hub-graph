@@ -27,7 +27,12 @@ from protocol import (
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import ConcurrencyConflict, RecordNotFound
 from storage.event_repository import EventRepository
-from storage.leases import MasterLease, MasterLeaseRepository, WorkspaceLease
+from storage.leases import (
+    MasterLease,
+    MasterLeaseRepository,
+    WorkspaceLease,
+    WorkspaceLeaseRepository,
+)
 from workflow.events import (
     APPROVAL_STATE_CHANGED,
     CAPABILITY_GRANT_STATE_CHANGED,
@@ -92,6 +97,20 @@ def _require_resource_seal(row: aiosqlite.Row) -> dict[str, object]:
     if seal is None or seal.get("schema") != "hub210-capability-resource-seal-v1":
         raise ConcurrencyConflict("capability resource has no valid immutable seal")
     return seal
+
+
+def _assert_workspace_binding(
+    workspace_lease: WorkspaceLease,
+    *,
+    session_id: str,
+    task_id: str,
+) -> None:
+    if (
+        workspace_lease.owner_kind != "agent_task"
+        or workspace_lease.owner_operation_id != task_id
+        or workspace_lease.resource_key != f"session:{session_id}:integration"
+    ):
+        raise ValueError("workspace lease is not bound to the privilege request task")
 
 
 async def _conn_one(
@@ -856,6 +875,7 @@ class ApprovalRepository:
         request: PrivilegeRequest,
         resource_seal: dict[str, object],
         master_lease: MasterLease,
+        workspace_lease: WorkspaceLease,
         now: datetime | None = None,
     ) -> PrivilegeRequest:
         if resource_seal.get("schema") != "hub210-capability-resource-seal-v1":
@@ -863,6 +883,16 @@ class ApprovalRepository:
         timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as tx:
             await self._master_leases.assert_valid_in(tx, master_lease, now=now)
+            _assert_workspace_binding(
+                workspace_lease,
+                session_id=request.session_id,
+                task_id=request.task_id,
+            )
+            await WorkspaceLeaseRepository(self._database).assert_valid_in(
+                tx,
+                workspace_lease,
+                now=now,
+            )
             existing = await tx.fetch_one(
                 "SELECT * FROM privilege_requests WHERE id = ?", (request.request_id,)
             )
@@ -920,6 +950,200 @@ class ApprovalRepository:
                 reason="created",
             )
         return request
+
+    async def create_privilege_request_and_approval(
+        self,
+        *,
+        request: PrivilegeRequest,
+        resource_seal: dict[str, object],
+        approval: PrivilegeApproval,
+        master_lease: MasterLease,
+        workspace_lease: WorkspaceLease,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
+    ) -> ApprovalRecord:
+        """Atomically persist a fenced request and its pending approval."""
+
+        if approval.status != ApprovalStatus.PENDING or approval.version != 1:
+            raise ValueError("new approvals must start pending at version 1")
+        if approval.effective_risk == RiskLevel.L4:
+            raise ValueError("L4 cannot create an approval")
+        if approval.privilege_request_id != request.request_id:
+            raise ValueError("privilege approval does not bind the request")
+        if resource_seal.get("schema") != "hub210-capability-resource-seal-v1":
+            raise ValueError("capability resource seal is missing its schema")
+        timestamp = utc_now_text(now)
+        async with self._database.immediate_transaction() as tx:
+            await self._master_leases.assert_valid_in(tx, master_lease, now=now)
+            _assert_workspace_binding(
+                workspace_lease,
+                session_id=request.session_id,
+                task_id=request.task_id,
+            )
+            await WorkspaceLeaseRepository(self._database).assert_valid_in(
+                tx,
+                workspace_lease,
+                now=now,
+            )
+
+            existing_request = await tx.fetch_one(
+                "SELECT * FROM privilege_requests WHERE id = ?", (request.request_id,)
+            )
+            if existing_request is None:
+                await tx.execute(
+                    """
+                    INSERT INTO privilege_requests(
+                        id, task_id, node_run_id, capability, action, resource,
+                        resource_seal_json, effective_risk, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request.request_id,
+                        request.task_id,
+                        request.node_run_id,
+                        request.requested_capability.value,
+                        request.requested_action.value,
+                        request.requested_resource,
+                        json.dumps(resource_seal, sort_keys=True, separators=(",", ":")),
+                        request.effective_risk.value,
+                        request.status.value,
+                        timestamp,
+                    ),
+                )
+                lineage = await tx.fetch_one(
+                    "SELECT workflow_run_id FROM node_runs WHERE id = ?",
+                    (request.node_run_id,),
+                )
+                if lineage is None or str(lineage["workflow_run_id"]) != approval.workflow_run_id:
+                    raise ValueError("privilege request lineage does not match approval")
+                await self._append_privilege_request_event(
+                    tx,
+                    workflow_run_id=str(lineage["workflow_run_id"]),
+                    node_run_id=request.node_run_id,
+                    task_id=request.task_id,
+                    request_id=request.request_id,
+                    previous=None,
+                    status=request.status.value,
+                    master_lease=master_lease,
+                    now=now,
+                    reason="created",
+                )
+            else:
+                immutable = {
+                    "task_id": request.task_id,
+                    "node_run_id": request.node_run_id,
+                    "capability": request.requested_capability.value,
+                    "action": request.requested_action.value,
+                    "resource": request.requested_resource,
+                    "effective_risk": request.effective_risk.value,
+                }
+                if any(
+                    str(existing_request[field]) != expected
+                    for field, expected in immutable.items()
+                ):
+                    raise ConcurrencyConflict("privilege request subject drifted")
+                if _resource_seal(existing_request) != resource_seal:
+                    raise ConcurrencyConflict("privilege request resource seal drifted")
+
+            existing_approval = await tx.fetch_one(
+                """
+                SELECT * FROM approvals
+                WHERE privilege_request_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (request.request_id,),
+            )
+            if existing_approval is not None:
+                current = _approval_record(existing_approval)
+                if current.approval.subject_sha256 != approval.subject_sha256:
+                    raise ConcurrencyConflict("pending approval subject drifted")
+                return current
+
+            owner = await tx.fetch_one(
+                "SELECT workflow_run_id FROM node_runs WHERE id = ?",
+                (approval.node_run_id,),
+            )
+            if owner is None:
+                raise RecordNotFound(f"approval node run not found: {approval.node_run_id}")
+            if str(owner["workflow_run_id"]) != approval.workflow_run_id:
+                raise ValueError("approval node does not belong to the workflow run")
+            row = await tx.fetch_one(
+                "SELECT workflow_run_id, node_run_id, task_id, status, "
+                "wr.status AS workflow_status, wr.cancel_requested_at "
+                "FROM privilege_requests "
+                "JOIN node_runs ON node_runs.id = privilege_requests.node_run_id "
+                "JOIN workflow_runs wr ON wr.id = node_runs.workflow_run_id "
+                "WHERE privilege_requests.id = ?",
+                (request.request_id,),
+            )
+            if row is None:
+                raise RecordNotFound(f"privilege request not found: {request.request_id}")
+            if str(row["node_run_id"]) != approval.node_run_id:
+                raise ValueError("privilege approval node does not own request")
+            if str(row["workflow_run_id"]) != approval.workflow_run_id:
+                raise ValueError("privilege approval workflow does not own request")
+            if row["cancel_requested_at"] is not None or str(row["workflow_status"]) in {
+                "cancelled",
+                "completed",
+                "failed",
+                "orphaned",
+            }:
+                raise ConcurrencyConflict("workflow cancellation prevents approval")
+            changed = await tx.execute(
+                "UPDATE privilege_requests SET status = 'waiting_approval' "
+                "WHERE id = ? AND status IN ('pending', 'waiting_approval')",
+                (request.request_id,),
+            )
+            if changed != 1:
+                raise ConcurrencyConflict("privilege request is not awaiting approval")
+            await self._append_privilege_request_event(
+                tx,
+                workflow_run_id=str(row["workflow_run_id"]),
+                node_run_id=str(row["node_run_id"]),
+                task_id=str(row["task_id"]),
+                request_id=request.request_id,
+                previous=str(row["status"]),
+                status=PrivilegeRequestStatus.WAITING_APPROVAL.value,
+                master_lease=master_lease,
+                now=now,
+                reason="approval_created",
+            )
+            await tx.execute(
+                """
+                INSERT INTO approvals(
+                    id, workflow_run_id, node_run_id, subject_type, change_set_id,
+                    privilege_request_id, subject_sha256, base_commit, patch_sha256,
+                    evidence_sha256, effective_risk, scope_json, status, version,
+                    decision_actor, decision_idempotency_key, expires_at, decided_at, created_at
+                ) VALUES (?, ?, ?, 'privilege_request', NULL, ?, ?, NULL, NULL,
+                          ?, ?, ?, 'pending', 1, NULL, ?, ?, NULL, ?)
+                """,
+                (
+                    approval.approval_id,
+                    approval.workflow_run_id,
+                    approval.node_run_id,
+                    approval.privilege_request_id,
+                    approval.subject_sha256,
+                    approval.evidence_sha256,
+                    approval.effective_risk.value,
+                    json.dumps(approval.scope, separators=(",", ":"), ensure_ascii=False),
+                    idempotency_key,
+                    utc_now_text(approval.expires_at),
+                    timestamp,
+                ),
+            )
+            await self._append_approval_event(
+                tx,
+                approval=approval,
+                previous=None,
+                master_lease=master_lease,
+                now=now,
+            )
+            row = await tx.fetch_one(
+                "SELECT * FROM approvals WHERE id = ?", (approval.approval_id,)
+            )
+        assert row is not None
+        return _approval_record(row)
 
     async def create_grant(
         self,

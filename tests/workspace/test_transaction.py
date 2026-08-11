@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,45 @@ def _transaction(
         temp_directory=tmp_path / "transaction-temp",
         **limits,
     )
+
+
+def test_capability_seal_must_match_workspace_transaction_preimage(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(fixture_source_repo, "commit", "--message", "add ignored cache")
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    target = repo / "cache" / "settings.json"
+    target.parent.mkdir()
+    original = b'{"name":"demo"}'
+    changed = b'{"name":"prod"}'
+    assert len(original) == len(changed)
+    target.write_bytes(original)
+    seal = {
+        "schema": "hub210-capability-resource-seal-v1",
+        "relative_path": "cache/settings.json",
+        "sha256": sha256(original).hexdigest(),
+        "size_bytes": len(original),
+        "mode": target.stat().st_mode & 0o777,
+        "device": target.stat().st_dev,
+        "inode": target.stat().st_ino,
+        "link_count": target.stat().st_nlink,
+        "file_attributes": getattr(target.stat(), "st_file_attributes", 0),
+    }
+    target.write_bytes(changed)
+
+    transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp",
+        sealed_preimages={"cache/settings.json": seal},
+    )
+    with pytest.raises(WorkspaceNotClean, match="sealed capability resource"):
+        transaction.begin()
 
 
 def test_capture_canonical_patch_and_restore_mixed_changes(

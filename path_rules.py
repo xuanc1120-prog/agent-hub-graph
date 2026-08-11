@@ -141,7 +141,9 @@ def relative_parts(candidate: str) -> tuple[str, ...] | None:
 
     if not isinstance(candidate, str) or not candidate or "\\" in candidate:
         return None
-    if any(ord(char) < 32 for char in candidate) or any(char in _GLOB_CHARS for char in candidate):
+    if any(ord(char) < 32 or ord(char) == 127 for char in candidate) or any(
+        char in _GLOB_CHARS for char in candidate
+    ):
         return None
     if unicodedata.normalize("NFC", candidate) != candidate:
         return None

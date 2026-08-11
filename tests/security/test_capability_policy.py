@@ -43,6 +43,14 @@ def test_capability_policy_still_allows_a_non_sensitive_project_config() -> None
     assert is_eligible_resource(PrivilegeAction.EDIT_PROJECT_CONFIG, path)
 
 
+def test_capability_policy_denies_del_control_character() -> None:
+    path = "config/settings\x7f.json"
+
+    assert PathPolicy.is_sensitive_relative_path(path)
+    assert eligible_actions(path) == frozenset()
+    assert not is_eligible_resource(PrivilegeAction.EDIT_PROJECT_CONFIG, path)
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -94,6 +102,32 @@ def test_capability_resource_scan_seals_safe_config_identity_and_content(tmp_pat
         "config/settings.json",
     )
     path.write_text('{"name": "changed"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="seal changed"):
+        verify_capability_resource(
+            tmp_path,
+            PrivilegeAction.EDIT_PROJECT_CONFIG,
+            "config/settings.json",
+            seal.as_dict(),
+        )
+
+
+def test_capability_resource_seal_detects_same_size_in_place_content_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config" / "settings.json"
+    path.parent.mkdir()
+    original = '{"name": "demo"}'
+    changed = '{"name": "prod"}'
+    assert len(original) == len(changed)
+    path.write_text(original, encoding="utf-8")
+
+    seal = inspect_capability_resource(
+        tmp_path,
+        PrivilegeAction.EDIT_PROJECT_CONFIG,
+        "config/settings.json",
+    )
+    path.write_text(changed, encoding="utf-8")
 
     with pytest.raises(ValueError, match="seal changed"):
         verify_capability_resource(

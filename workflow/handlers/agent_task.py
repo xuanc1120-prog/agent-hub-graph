@@ -37,6 +37,7 @@ from storage.approval_repository import CapabilityGrantRecord
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRepository
 from storage.errors import ChangeSetReconciliationRequired, LeaseLost
+from storage.leases import WorkspaceLease
 from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
@@ -156,6 +157,7 @@ class AgentTaskNodeHandler:
         *,
         task_id: str,
         result: AgentResult,
+        workspace_lease: WorkspaceLease,
     ) -> list[str]:
         """Persist the adapter's structured request before validating the result.
 
@@ -213,6 +215,7 @@ class AgentTaskNodeHandler:
         request, _approval = await self._capabilities.request(
             context,
             envelope.privilege_requests[0],
+            workspace_lease=workspace_lease,
             now=datetime.now(UTC),
         )
         return [request.request_id]
@@ -569,6 +572,12 @@ class AgentTaskNodeHandler:
                             and path in set(context.node.effective_allowed_files or [])
                         )
                     ),
+                    sealed_preimages=(
+                        {capability_grant.grant.resource: capability_grant.resource_seal}
+                        if capability_grant is not None
+                        and capability_grant.resource_seal is not None
+                        else {}
+                    ),
                     **self._transaction_limits,
                 )
                 await self._locks.run_fenced(
@@ -595,10 +604,12 @@ class AgentTaskNodeHandler:
                             execution_error = _AgentTaskError("capability_runtime_unavailable")
                         else:
                             try:
+                                held.assert_healthy()
                                 request_ids = await self._materialize_privilege_requests(
                                     context,
                                     task_id=task.task_id,
                                     result=agent_result,
+                                    workspace_lease=held.lease,
                                 )
                                 binding = await self._capabilities.validate_result_requests(
                                     context,

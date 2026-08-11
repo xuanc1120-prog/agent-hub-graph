@@ -39,6 +39,7 @@ def test_validates_separate_existing_and_new_exact_scope(repo: Path) -> None:
         "src\\app.py",
         "src/CON.txt",
         "src/file.py:secret",
+        "src/settings\x7f.json",
         "src/trailing. ",
         ".git/config",
         ".agent-hub/policy.json",
