@@ -53,6 +53,7 @@ class CapabilityGrantRecord:
     workflow_run_id: str
     node_run_id: str
     request_status: PrivilegeRequestStatus
+    resource_seal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,11 +69,29 @@ class PrivilegeRequestBinding:
     resource: str
     effective_risk: RiskLevel
     status: PrivilegeRequestStatus
+    resource_seal: dict[str, object] | None = None
 
 
 def _task_id_for_node(node_run_id: str) -> str:
     digest = sha256(f"task\x00{node_run_id}".encode()).hexdigest()[:24]
     return f"task-{digest}"
+
+
+def _resource_seal(row: aiosqlite.Row) -> dict[str, object] | None:
+    value = row["resource_seal_json"]
+    if value is None:
+        return None
+    parsed = json.loads(str(value))
+    if not isinstance(parsed, dict):
+        raise ValueError("persisted capability resource seal is not an object")
+    return {str(key): item for key, item in parsed.items()}
+
+
+def _require_resource_seal(row: aiosqlite.Row) -> dict[str, object]:
+    seal = _resource_seal(row)
+    if seal is None or seal.get("schema") != "hub210-capability-resource-seal-v1":
+        raise ConcurrencyConflict("capability resource has no valid immutable seal")
+    return seal
 
 
 async def _conn_one(
@@ -165,6 +184,7 @@ def _grant_record(
         request_status=PrivilegeRequestStatus(
             str(row["request_status"]) if "request_status" in row else "approved"
         ),
+        resource_seal=_resource_seal(row),
     )
 
 
@@ -321,6 +341,7 @@ class ApprovalRepository:
             resource=str(row["resource"]),
             effective_risk=RiskLevel(str(row["effective_risk"])),
             status=PrivilegeRequestStatus(str(row["status"])),
+            resource_seal=_resource_seal(row),
         )
 
     async def create(
@@ -833,9 +854,12 @@ class ApprovalRepository:
         self,
         *,
         request: PrivilegeRequest,
+        resource_seal: dict[str, object],
         master_lease: MasterLease,
         now: datetime | None = None,
     ) -> PrivilegeRequest:
+        if resource_seal.get("schema") != "hub210-capability-resource-seal-v1":
+            raise ValueError("capability resource seal is missing its schema")
         timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as tx:
             await self._master_leases.assert_valid_in(tx, master_lease, now=now)
@@ -853,6 +877,8 @@ class ApprovalRepository:
                 }
                 if any(str(existing[field]) != expected for field, expected in immutable.items()):
                     raise ConcurrencyConflict("privilege request subject drifted")
+                if _resource_seal(existing) != resource_seal:
+                    raise ConcurrencyConflict("privilege request resource seal drifted")
                 return request.model_copy(
                     update={"status": PrivilegeRequestStatus(str(existing["status"]))}
                 )
@@ -860,8 +886,8 @@ class ApprovalRepository:
                 """
                 INSERT INTO privilege_requests(
                     id, task_id, node_run_id, capability, action, resource,
-                    effective_risk, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    resource_seal_json, effective_risk, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.request_id,
@@ -870,6 +896,7 @@ class ApprovalRepository:
                     request.requested_capability.value,
                     request.requested_action.value,
                     request.requested_resource,
+                    json.dumps(resource_seal, sort_keys=True, separators=(",", ":")),
                     request.effective_risk.value,
                     request.status.value,
                     timestamp,
@@ -929,6 +956,7 @@ class ApprovalRepository:
                 raise ValueError("grant action/resource mismatch")
             if str(request["status"]) != PrivilegeRequestStatus.APPROVED.value:
                 raise ConcurrencyConflict("privilege request is not approved")
+            _require_resource_seal(request)
             approval = await tx.fetch_one(
                 "SELECT status, expires_at FROM approvals WHERE privilege_request_id = ? "
                 "ORDER BY created_at DESC LIMIT 1",
@@ -978,6 +1006,7 @@ class ApprovalRepository:
                     or str(existing["target_task_id"]) != grant.target_task_id
                     or str(existing["action"]) != grant.action.value
                     or str(existing["resource"]) != grant.resource
+                    or str(existing["resource_seal_json"]) != str(request["resource_seal_json"])
                 ):
                     raise ConcurrencyConflict("capability grant subject drifted")
                 await tx.execute(
@@ -1003,8 +1032,9 @@ class ApprovalRepository:
             await tx.execute(
                 """
                 INSERT INTO capability_grants(
-                    id, request_id, target_task_id, action, resource, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, request_id, target_task_id, action, resource,
+                    resource_seal_json, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     grant.grant_id,
@@ -1012,6 +1042,7 @@ class ApprovalRepository:
                     grant.target_task_id,
                     grant.action.value,
                     grant.resource,
+                    str(request["resource_seal_json"]),
                     utc_now_text(grant.expires_at),
                 ),
             )
@@ -1082,6 +1113,7 @@ class ApprovalRepository:
             or str(request["resource"]) != grant.resource
         ):
             raise ConcurrencyConflict("approved privilege grant subject drifted")
+        _require_resource_seal(request)
         approval = await tx.fetch_one(
             "SELECT status, expires_at FROM approvals WHERE privilege_request_id = ? "
             "ORDER BY created_at DESC LIMIT 1",
@@ -1129,6 +1161,7 @@ class ApprovalRepository:
                 or str(existing["target_task_id"]) != grant.target_task_id
                 or str(existing["action"]) != grant.action.value
                 or str(existing["resource"]) != grant.resource
+                or str(existing["resource_seal_json"]) != str(request["resource_seal_json"])
             ):
                 raise ConcurrencyConflict("capability grant subject drifted")
             return _grant_record(
@@ -1139,8 +1172,9 @@ class ApprovalRepository:
         await tx.execute(
             """
             INSERT INTO capability_grants(
-                id, request_id, target_task_id, action, resource, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, request_id, target_task_id, action, resource,
+                resource_seal_json, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 grant.grant_id,
@@ -1148,6 +1182,7 @@ class ApprovalRepository:
                 grant.target_task_id,
                 grant.action.value,
                 grant.resource,
+                str(request["resource_seal_json"]),
                 utc_now_text(grant.expires_at),
             ),
         )

@@ -78,7 +78,9 @@ async def test_initialize_is_idempotent_and_creates_v1_schema(database: Database
         await cursor.close()
 
     assert tables == EXPECTED_TABLES
-    assert [tuple(row) for row in migrations] == [(1, 27), (2, 27)]
+    assert [tuple(row) for row in migrations] == [
+        (version, 27) for version in range(1, SCHEMA_VERSION + 1)
+    ]
     assert foreign_key_errors == []
     assert integrity is not None and integrity[0] == "ok"
 
@@ -257,7 +259,7 @@ async def test_concurrent_initializers_share_one_migration_lock(
     ).fetchall()
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(agents)").fetchall()}
     connection.close()
-    assert versions == [(1,), (2,)]
+    assert versions == [(version,) for version in range(1, SCHEMA_VERSION + 1)]
     assert {"available", "auto_assignable", "unavailable_reason"} <= columns
 
 

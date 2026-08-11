@@ -42,8 +42,8 @@ from storage.workflow_run_repository import (
     task_id_for_node,
 )
 from workflow.approval_manager import PrivilegePending
-from workflow.capability_broker import CapabilityBroker
-from workflow.capability_policy import eligible_actions
+from workflow.capability_broker import CapabilityBroker, verify_capability_resource
+from workflow.capability_policy import eligible_actions, is_eligible_resource
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
@@ -297,8 +297,21 @@ class AgentTaskNodeHandler:
                     or active_grant.grant.consumed_at is not None
                     or active_grant.grant.revoked_at is not None
                     or active_grant.grant.expires_at <= datetime.now(UTC)
+                    or not is_eligible_resource(
+                        active_grant.grant.action,
+                        active_grant.grant.resource,
+                    )
                 ):
                     raise _AgentTaskError("capability_grant_binding_invalid")
+                try:
+                    verify_capability_resource(
+                        Path(context.session.shared_repo_path),
+                        active_grant.grant.action,
+                        active_grant.grant.resource,
+                        active_grant.resource_seal,
+                    )
+                except ValueError as error:
+                    raise _AgentTaskError("capability_resource_seal_invalid") from error
             predecessor_refs = await self._predecessor_refs(context, task_id)
             selected_refs = list(predecessor_refs.values())
             bundle = await self._bundles.materialize(
@@ -532,6 +545,7 @@ class AgentTaskNodeHandler:
                         target_task_id=task.task_id,
                         action=capability_grant.grant.action,
                         resource=capability_grant.grant.resource,
+                        repo_root=Path(context.session.shared_repo_path),
                         master_lease=context.master_lease,
                         workspace_lease=held.lease,
                     )

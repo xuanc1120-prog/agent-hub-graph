@@ -13,7 +13,7 @@ from collections.abc import Collection, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Protocol
 
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -564,57 +564,41 @@ class GitManager:
         )
 
     def remove_worktree_entries(self, repo: Path, paths: Sequence[str]) -> None:
-        """Remove only explicit plain entries created by the failed ChangeSet."""
+        """Remove explicit failed-ChangeSet entries through a pinned root handle."""
+
+        # Do not perform a check-then-path-delete sequence here.  The secure
+        # root keeps POSIX parent directory fds and Windows deny-delete handles
+        # bound while each unlink/rmdir is executed, so a replaced ancestor
+        # cannot redirect rollback outside the repository.
+        from workspace.secure_file import SecureFileError, SecureWorkspaceRoot
 
         root = repo.expanduser().resolve(strict=True)
-        self._assert_directory_not_reparse(root, label="repository root")
-        unique = sorted(set(paths), key=lambda value: (value.count("/"), value), reverse=True)
-        for relative in unique:
-            if not isinstance(relative, str) or not relative:
-                raise GitManagerError("rollback path must be a non-empty string")
-            pure = PurePosixPath(relative)
-            if (
-                pure.is_absolute()
-                or "\\" in relative
-                or any(part in {"", ".", ".."} for part in pure.parts)
-            ):
-                raise GitManagerError("rollback path must be a safe repository-relative path")
-            current = root
-            missing = False
-            for component in pure.parts[:-1]:
-                current = current / component
-                try:
-                    self._assert_plain_git_entry(current, expect_directory=True)
-                except FileNotFoundError:
-                    missing = True
-                    break
-            if missing:
-                continue
-            target = root.joinpath(*pure.parts)
-            try:
-                metadata = target.lstat()
-            except FileNotFoundError:
-                continue
-            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or getattr(metadata, "st_file_attributes", 0) & reparse_flag
-            ):
-                raise GitManagerError("rollback path is a link or reparse point")
-            if stat.S_ISREG(metadata.st_mode):
-                if metadata.st_nlink > 1:
-                    raise GitManagerError("rollback refuses to unlink a hardlinked file")
-                target.unlink()
-                continue
-            if stat.S_ISDIR(metadata.st_mode):
-                self._assert_plain_git_entry(target, expect_directory=True)
-                try:
-                    next(target.iterdir())
-                except StopIteration:
-                    target.rmdir()
-                    continue
-                raise GitManagerError("rollback refuses to remove a non-empty directory")
-            raise GitManagerError("rollback path is not a regular file or directory")
+        normalized_paths = tuple(paths)
+        if any(not isinstance(relative, str) or not relative for relative in normalized_paths):
+            raise GitManagerError("rollback path must be a non-empty string")
+        unique = sorted(
+            set(normalized_paths),
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        )
+        try:
+            with SecureWorkspaceRoot(root) as secure_root:
+                for relative in unique:
+                    try:
+                        if secure_root.unlink_regular(relative):
+                            continue
+                    except SecureFileError as file_error:
+                        file_failure = file_error
+                    else:
+                        continue
+                    try:
+                        secure_root.remove_directory(relative)
+                    except SecureFileError:
+                        raise GitManagerError(
+                            f"secure rollback removal failed for {relative}"
+                        ) from file_failure
+        except SecureFileError as error:
+            raise GitManagerError("secure rollback root validation failed") from error
 
     def index_sha256(self, repo: Path) -> str:
         root = repo.expanduser().resolve(strict=True)

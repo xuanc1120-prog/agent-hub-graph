@@ -12,11 +12,14 @@ import aiosqlite
 
 from storage.errors import UnsupportedSchemaVersion
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _MIGRATION_PATH = Path(__file__).resolve().parent.parent / "migrations" / "init.sql"
 _MIGRATION_V2_PATH = (
     Path(__file__).resolve().parent.parent / "migrations" / "0002_agent_routing_state.sql"
+)
+_MIGRATION_V3_PATH = (
+    Path(__file__).resolve().parent.parent / "migrations" / "0003_capability_resource_seals.sql"
 )
 _MIGRATION_CONTROL = frozenset({"BEGIN", "COMMIT", "ROLLBACK", "PRAGMA"})
 
@@ -155,6 +158,7 @@ class Database:
     async def initialize(self) -> int:
         migration_v1 = _MIGRATION_PATH.read_text(encoding="utf-8")
         migration_v2 = _MIGRATION_V2_PATH.read_text(encoding="utf-8")
+        migration_v3 = _MIGRATION_V3_PATH.read_text(encoding="utf-8")
         async with self._migration_connection() as connection:
             cursor = await connection.execute("BEGIN IMMEDIATE")
             await cursor.close()
@@ -178,6 +182,13 @@ class Database:
                     if version != 2:
                         raise UnsupportedSchemaVersion(
                             f"v2 migration recorded unexpected schema version {version}"
+                        )
+                if version < 3:
+                    await self._execute_migration(connection, migration_v3)
+                    version = await self._schema_version(connection)
+                    if version != 3:
+                        raise UnsupportedSchemaVersion(
+                            f"v3 migration recorded unexpected schema version {version}"
                         )
                 if version != SCHEMA_VERSION:
                     raise UnsupportedSchemaVersion(

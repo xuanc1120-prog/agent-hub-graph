@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
+from path_rules import is_restricted_relative_path
 from protocol import PrivilegeAction
 
 _DEPENDENCY_NAMES = frozenset(
@@ -44,9 +45,6 @@ _CONFIG_SUFFIXES = frozenset(
         ".yml",
     }
 )
-_SECRET_MARKERS = frozenset(
-    {".env", "credentials", "credential", "secret", "secrets", "private", "token", "tokens"}
-)
 
 
 def _parts(path: str) -> tuple[str, ...] | None:
@@ -61,12 +59,15 @@ def _parts(path: str) -> tuple[str, ...] | None:
 def eligible_actions(path: str) -> frozenset[PrivilegeAction]:
     """Return the exact actions permitted for an existing project resource."""
 
+    if is_restricted_relative_path(path):
+        return frozenset()
     parts = _parts(path)
     if parts is None:
         return frozenset()
+    # Keep capability grants on the same deny-by-default credential corpus as
+    # workspace scope validation.  A generic .json/.xml suffix is never
+    # sufficient evidence that an existing file is safe to expose.
     name = parts[-1]
-    if any(marker in parts or name == marker for marker in _SECRET_MARKERS):
-        return frozenset()
     actions: set[PrivilegeAction] = set()
     if (
         name in _DEPENDENCY_NAMES

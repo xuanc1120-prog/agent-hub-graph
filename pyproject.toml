@@ -50,6 +50,9 @@ include = [
 ]
 exclude = ["tests*", "web.frontend*"]
 
+[tool.setuptools]
+py-modules = ["path_rules"]
+
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers -q"
 testpaths = ["tests"]

@@ -165,6 +165,8 @@ async def test_approved_changeset_is_merged_by_master_scheduler(
             idempotency_key="decision-merge",
             master_lease=lease,
         )
+        approved = await application.services.approvals.get(approval.approval.approval_id)
+        assert approved.approval.evidence_sha256 == approval.approval.evidence_sha256
         completed = await application.services.scheduler.run_until_stable(
             run.workflow_run_id,
             lease=lease,

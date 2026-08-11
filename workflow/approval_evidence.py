@@ -57,9 +57,13 @@ async def build_manifest(
         if not added:
             break
         backward.update(added)
-    evidence_node_ids = forward & backward
-    if source_id not in evidence_node_ids or not (approval_ids & evidence_node_ids):
+    chain_node_ids = forward & backward
+    if source_id not in chain_node_ids or not (approval_ids & chain_node_ids):
         raise ApprovalEvidenceError("compiled graph has no complete source-to-approval chain")
+    # The approval node is a decision over this manifest, not evidence for it.
+    # Its status/artifact necessarily changes from waiting to approved, so
+    # including it would make every valid approval change its own subject.
+    evidence_node_ids = chain_node_ids - approval_ids
     evidence_nodes: list[dict[str, Any]] = []
     effective_risk = RiskLevel.L0
     risk_artifact_seen = False

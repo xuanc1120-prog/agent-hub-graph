@@ -10,6 +10,7 @@ import pytest
 from security.patch_guard import PatchGuard, PatchGuardDecision
 from workspace.change_set import ChangeSetManifest, FileAction, FileChange
 from workspace.git_manager import GitManager, GitManagerError
+from workspace.secure_file import SecureWorkspaceRoot
 
 _ZERO = "0" * 64
 _ONE = "1" * 64
@@ -190,6 +191,57 @@ def test_failed_merge_cleanup_refuses_hardlinks(tmp_path: Path) -> None:
     except OSError as error:
         pytest.skip(f"hardlinks unavailable: {error}")
 
-    with pytest.raises(GitManagerError, match="hardlinked"):
+    with pytest.raises(GitManagerError, match="secure rollback"):
         GitManager(tmp_path / "git-profile").remove_worktree_entries(repo, ["created.txt"])
     assert original.read_text(encoding="utf-8") == "must remain\n"
+
+
+def test_failed_merge_cleanup_refuses_a_replaced_parent_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("must remain\n", encoding="utf-8")
+    replaced_parent = repo / "created"
+    replaced_parent.mkdir()
+    temporary = replaced_parent / "file.txt"
+    temporary.write_text("temporary\n", encoding="utf-8")
+    probe = repo / "symlink-probe"
+    try:
+        probe.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+    else:
+        probe.unlink()
+
+    original_unlink = SecureWorkspaceRoot.unlink_regular
+    swapped = False
+
+    def replace_parent_before_delete(
+        secure_root: SecureWorkspaceRoot,
+        relative: str,
+        *,
+        missing_ok: bool = True,
+    ) -> bool:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            temporary.unlink()
+            replaced_parent.rmdir()
+            replaced_parent.symlink_to(outside, target_is_directory=True)
+        return original_unlink(secure_root, relative, missing_ok=missing_ok)
+
+    monkeypatch.setattr(SecureWorkspaceRoot, "unlink_regular", replace_parent_before_delete)
+
+    with pytest.raises(GitManagerError, match="secure rollback"):
+        GitManager(tmp_path / "git-profile").remove_worktree_entries(
+            repo,
+            ["created/file.txt"],
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "must remain\n"
+    assert replaced_parent.is_symlink()
