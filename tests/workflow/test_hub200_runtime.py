@@ -432,8 +432,8 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         )
     )
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     injected = False
     reconciliation_started = asyncio.Event()
     original_reconcile = application.services.change_sets._reconcile_capture_commit
@@ -487,17 +487,17 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
             injected = True
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 faulting_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 
@@ -615,8 +615,8 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
         )
     )
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     injected = False
     active_task_id: str | None = None
     active_run_id: str | None = None
@@ -749,17 +749,17 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
             active_task_id = str(kwargs["task_id"])
             active_run_id = str(kwargs["workflow_run_id"])
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 partially_committed_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 
@@ -840,8 +840,8 @@ async def test_abandoned_capture_reconciliation_requires_security_event(
 
     monkeypatch.setattr(agent_handler._bundles, "cleanup", fail_cleanup_once)
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     reconciliation_injected = False
     active_task_id: str | None = None
     active_run_id: str | None = None
@@ -880,17 +880,17 @@ async def test_abandoned_capture_reconciliation_requires_security_event(
             active_task_id = str(kwargs["task_id"])
             active_run_id = str(kwargs["workflow_run_id"])
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 missing_security_event_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 

@@ -97,6 +97,19 @@ def test_capability_seal_must_match_workspace_transaction_preimage(
     transaction.begin()
     transaction.close()
 
+    legacy_seal = dict(seal)
+    legacy_seal["mode"] = target.stat().st_mode
+    legacy_transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp-legacy-mode",
+        sealed_preimages={"cache/settings.json": legacy_seal},
+    )
+    legacy_transaction.begin()
+    legacy_transaction.close()
+
     target.write_bytes(changed)
 
     transaction = WorkspaceTransaction(
