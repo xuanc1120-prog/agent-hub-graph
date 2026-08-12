@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import unicodedata
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -106,6 +107,8 @@ class WorkspaceTransaction:
         max_inventory_bytes: int = 2 * 1024 * 1024 * 1024,
         max_ignored_preimage_bytes: int = 100 * 1024 * 1024,
         seal_git_objects: bool = False,
+        forbidden_paths: Collection[str] = (),
+        sealed_preimages: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         if any(
             limit < 1
@@ -137,6 +140,10 @@ class WorkspaceTransaction:
         )
         self._seal_git_objects = seal_git_objects
         self._path_policy = PathPolicy(self._repo, max_scope_files=max_changed_paths)
+        self._forbidden_paths = {self._path_policy.comparison_key(path) for path in forbidden_paths}
+        self._sealed_preimages = {
+            str(path): dict(seal) for path, seal in (sealed_preimages or {}).items()
+        }
         self._phase = "new"
         self._baseline_state: RepositoryState | None = None
         self._baseline_inventory: _Inventory | None = None
@@ -191,6 +198,7 @@ class WorkspaceTransaction:
             raise WorkspaceNotClean("ignored baseline exceeds the replayable workspace path limit")
         self._validate_ignored_baseline(ignored)
         inventory = self._scan_inventory(seal_paths=ignored)
+        self._assert_sealed_preimages(inventory)
         tracked = frozenset(self._git.tracked_paths(self._repo))
         preimages = self._capture_ignored_preimages(ignored, inventory)
         index_sha256 = self._git.index_sha256(self._repo)
@@ -203,6 +211,57 @@ class WorkspaceTransaction:
         self._baseline_index_sha256 = index_sha256
         self._git_metadata_seal = metadata_seal
         self._phase = "active"
+
+    def _assert_sealed_preimages(self, inventory: _Inventory) -> None:
+        """Bind approved capability bytes to the transaction's initial inventory."""
+
+        for path, expected in sorted(self._sealed_preimages.items()):
+            snapshot = inventory.files.get(path)
+            if snapshot is None:
+                raise WorkspaceNotClean(f"sealed capability resource is absent: {path}")
+            try:
+                if (
+                    str(expected["schema"]) != "hub210-capability-resource-seal-v1"
+                    or str(expected["relative_path"]) != path
+                    or str(expected["sha256"]) != snapshot.sha256
+                    or int(expected["size_bytes"]) != snapshot.size_bytes
+                    or stat.S_IMODE(int(expected["mode"])) != snapshot.mode
+                ):
+                    raise ValueError
+                expected_device = int(expected["device"])
+                expected_inode = int(expected["inode"])
+                expected_links = int(expected["link_count"])
+                expected_attributes = int(expected["file_attributes"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise WorkspaceNotClean(
+                    f"sealed capability resource preimage does not match: {path}"
+                ) from error
+            try:
+                current_snapshot, _ = self._snapshot_file(
+                    self._require_secure_root(),
+                    path,
+                    capture_content=False,
+                )
+            except WorkspaceTransactionError as error:
+                raise WorkspaceNotClean(
+                    f"sealed capability resource changed during binding: {path}"
+                ) from error
+            if current_snapshot != snapshot:
+                raise WorkspaceNotClean(f"sealed capability resource content changed: {path}")
+            try:
+                with self._require_secure_root().open_binary(path) as stream:
+                    metadata = os.fstat(stream.fileno())
+            except SecureFileError as error:
+                raise WorkspaceNotClean(
+                    f"sealed capability resource identity is unavailable: {path}"
+                ) from error
+            if (
+                int(getattr(metadata, "st_dev", 0)) != expected_device
+                or int(getattr(metadata, "st_ino", 0)) != expected_inode
+                or int(metadata.st_nlink) != expected_links
+                or int(getattr(metadata, "st_file_attributes", 0)) != expected_attributes
+            ):
+                raise WorkspaceNotClean(f"sealed capability resource identity changed: {path}")
 
     @property
     def baseline_state_hash(self) -> str:
@@ -780,6 +839,10 @@ class WorkspaceTransaction:
     ) -> None:
         for path in paths:
             validated = self._path_policy.validate_cleanup_path(path)
+            if self._path_policy.comparison_key(path) in self._forbidden_paths:
+                raise WorkspaceTransactionError(
+                    f"protected capability resource requires a consumed grant: {path}"
+                )
             if path in after.files and not validated.exists:
                 raise WorkspaceTransactionError(f"captured path disappeared: {path}")
 

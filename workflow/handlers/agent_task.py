@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -14,6 +15,7 @@ from adapters.base import BaseAgentAdapter, ConsoleSink
 from context.context_builder import ContextBuilder
 from context.task_bundle import TaskContextBundle
 from protocol import (
+    AgentOutputEnvelope,
     AgentResult,
     AgentResultStatus,
     ArtifactRef,
@@ -24,19 +26,25 @@ from protocol import (
     NodeOutcome,
     NodeRunStatus,
     NodeSummary,
+    PrivilegeRequestStatus,
     RiskLevel,
     TaskPackage,
     TaskStatus,
     WorkflowNode,
     canonical_json,
 )
+from storage.approval_repository import CapabilityGrantRecord
 from storage.artifact_repository import ArtifactRecord, ArtifactRepository
 from storage.change_set_repository import ChangeSetRepository
 from storage.errors import ChangeSetReconciliationRequired, LeaseLost
+from storage.leases import WorkspaceLease
 from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
 )
+from workflow.approval_manager import PrivilegePending
+from workflow.capability_broker import CapabilityBroker, verify_capability_resource
+from workflow.capability_policy import eligible_actions, is_eligible_resource
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
@@ -95,6 +103,7 @@ class AgentTaskNodeHandler:
         change_sets: ChangeSetRepository | None = None,
         git: GitManager | None = None,
         locks: LockManager | None = None,
+        capabilities: CapabilityBroker | None = None,
         agent_runs_dir: Path | None = None,
         workspace_lease_ttl_seconds: int = 30,
         workspace_heartbeat_seconds: float = 5,
@@ -118,6 +127,7 @@ class AgentTaskNodeHandler:
         self._change_sets = change_sets
         self._git = git
         self._locks = locks
+        self._capabilities = capabilities
         self._agent_runs_dir = (
             agent_runs_dir.expanduser().resolve(strict=False) if agent_runs_dir else None
         )
@@ -140,6 +150,75 @@ class AgentTaskNodeHandler:
                 self._agent_runs_dir,
             )
         )
+
+    async def _materialize_privilege_requests(
+        self,
+        context: NodeExecutionContext,
+        *,
+        task_id: str,
+        result: AgentResult,
+        workspace_lease: WorkspaceLease,
+    ) -> list[str]:
+        """Persist the adapter's structured request before validating the result.
+
+        Adapters return a sealed ``AgentOutputEnvelope`` artifact rather than
+        receiving a database service.  This is the production bridge from the
+        adapter result to the capability side-gate; request IDs alone never
+        authorize an unpersisted request.
+        """
+
+        request_ids = list(result.privilege_request_ids)
+        if result.raw_output_ref is None:
+            return request_ids
+        record, content = await self._artifacts.get_and_verify(
+            result.raw_output_ref.artifact_id,
+            expected_session_id=context.run.session_id,
+            expected_task_id=task_id,
+        )
+        if (
+            record.task_id != task_id
+            or record.artifact_type != ArtifactType.REPORT.value
+            or not record.redacted
+            or record.sha256 != result.raw_output_ref.sha256
+            or record.size_bytes != result.raw_output_ref.size_bytes
+        ):
+            raise _AgentTaskError("privilege_output_artifact_binding_invalid")
+        try:
+            envelope = AgentOutputEnvelope.model_validate_json(content, strict=True)
+        except Exception as error:
+            raise _AgentTaskError("privilege_output_envelope_invalid") from error
+        if not envelope.privilege_requests:
+            return request_ids
+        if request_ids:
+            # A result may repeat a previously persisted ID, but cannot attach
+            # a different proposal to that immutable request.
+            binding = (
+                await self._capabilities.validate_result_requests(
+                    context,
+                    task_id=task_id,
+                    request_ids=request_ids,
+                )
+                if self._capabilities is not None
+                else None
+            )
+            if binding is None:
+                raise _AgentTaskError("capability_runtime_unavailable")
+            proposal = envelope.privilege_requests[0]
+            if (
+                binding.action != proposal.requested_action.value
+                or binding.resource != proposal.requested_resource
+            ):
+                raise _AgentTaskError("privilege_request_subject_mismatch")
+            return request_ids
+        if self._capabilities is None:
+            raise _AgentTaskError("capability_runtime_unavailable")
+        request, _approval = await self._capabilities.request(
+            context,
+            envelope.privilege_requests[0],
+            workspace_lease=workspace_lease,
+            now=datetime.now(UTC),
+        )
+        return [request.request_id]
 
     @staticmethod
     def _runtime_policy(node: WorkflowNode) -> FrozenStrictModel:
@@ -206,6 +285,36 @@ class AgentTaskNodeHandler:
                 await self._delete_unbound_policy(policy_record.artifact_id)
                 raise
             task_started = True
+            task_record = await self._runs.get_task(task_id)
+            active_grant: CapabilityGrantRecord | None = None
+            if task_record.active_capability_grant_id is not None:
+                if self._capabilities is None:
+                    raise _AgentTaskError("capability_runtime_unavailable")
+                active_grant = await self._capabilities.grant_for_task(task_id)
+                if (
+                    active_grant is None
+                    or active_grant.grant.grant_id != task_record.active_capability_grant_id
+                    or active_grant.grant.target_task_id != task_id
+                    or active_grant.workflow_run_id != context.run.workflow_run_id
+                    or active_grant.request_status != PrivilegeRequestStatus.APPROVED
+                    or active_grant.grant.consumed_at is not None
+                    or active_grant.grant.revoked_at is not None
+                    or active_grant.grant.expires_at <= datetime.now(UTC)
+                    or not is_eligible_resource(
+                        active_grant.grant.action,
+                        active_grant.grant.resource,
+                    )
+                ):
+                    raise _AgentTaskError("capability_grant_binding_invalid")
+                try:
+                    verify_capability_resource(
+                        Path(context.session.shared_repo_path),
+                        active_grant.grant.action,
+                        active_grant.grant.resource,
+                        active_grant.resource_seal,
+                    )
+                except ValueError as error:
+                    raise _AgentTaskError("capability_resource_seal_invalid") from error
             predecessor_refs = await self._predecessor_refs(context, task_id)
             selected_refs = list(predecessor_refs.values())
             bundle = await self._bundles.materialize(
@@ -230,6 +339,12 @@ class AgentTaskNodeHandler:
                 ),
                 effective_new_files=(
                     list(node.effective_new_files or []) if node.requires_write else []
+                ),
+                active_capability_grant_id=(
+                    active_grant.grant.grant_id if active_grant is not None else None
+                ),
+                granted_existing_files=(
+                    [active_grant.grant.resource] if active_grant is not None else []
                 ),
                 readonly_files=(
                     [] if node.requires_write else list(node.effective_allowed_files or [])
@@ -296,6 +411,7 @@ class AgentTaskNodeHandler:
                     context_pack=context_result.pack,
                     collect=collect,
                     console=console,
+                    capability_grant=active_grant,
                 )
                 bundle_created = False
                 return result
@@ -307,6 +423,14 @@ class AgentTaskNodeHandler:
                 or agent_result.agent_id != node.resolved_agent_id
             ):
                 raise ValueError("AgentResult identity does not match the sealed task")
+            if agent_result.status == AgentResultStatus.PRIVILEGE_REQUESTED:
+                if self._capabilities is None:
+                    raise _AgentTaskError("capability_runtime_unavailable")
+                await self._capabilities.validate_result_requests(
+                    context,
+                    task_id=task_id,
+                    request_ids=agent_result.privilege_request_ids,
+                )
             cleanup = await self._bundles.cleanup(task_id)
             if cleanup.errors:
                 await self._runs.finish_task(
@@ -364,7 +488,7 @@ class AgentTaskNodeHandler:
                 summary=agent_result.summary or "MockAgent execution failed.",
                 error_code=code,
             )
-        except (ChangeSetReconciliationRequired, LeaseLost):
+        except (ChangeSetReconciliationRequired, LeaseLost, PrivilegePending):
             raise
         except Exception as exc:
             if task_started and not node.requires_write:
@@ -398,6 +522,7 @@ class AgentTaskNodeHandler:
         context_pack: ContextPack,
         collect: ConsoleSink,
         console: list[str],
+        capability_grant: CapabilityGrantRecord | None,
     ) -> NodeHandlerResult:
         assert self._change_sets is not None
         assert self._git is not None
@@ -415,6 +540,18 @@ class AgentTaskNodeHandler:
             heartbeat_seconds=self._workspace_heartbeat_seconds,
         ) as held:
             try:
+                if capability_grant is not None:
+                    if self._capabilities is None:
+                        raise _AgentTaskError("capability_runtime_unavailable")
+                    await self._capabilities.consume(
+                        capability_grant.grant.grant_id,
+                        target_task_id=task.task_id,
+                        action=capability_grant.grant.action,
+                        resource=capability_grant.grant.resource,
+                        repo_root=Path(context.session.shared_repo_path),
+                        master_lease=context.master_lease,
+                        workspace_lease=held.lease,
+                    )
                 transaction = WorkspaceTransaction(
                     self._git,
                     Path(context.session.shared_repo_path),
@@ -422,6 +559,25 @@ class AgentTaskNodeHandler:
                     expected_branch=context.session.integration_branch,
                     temp_directory=(self._agent_runs_dir / task.task_id / "workspace-transaction"),
                     seal_git_objects=True,
+                    forbidden_paths=tuple(
+                        path
+                        for path in (
+                            set(context.node.effective_allowed_files or [])
+                            | set(context.node.effective_new_files or [])
+                        )
+                        if eligible_actions(path)
+                        and not (
+                            capability_grant is not None
+                            and path == capability_grant.grant.resource
+                            and path in set(context.node.effective_allowed_files or [])
+                        )
+                    ),
+                    sealed_preimages=(
+                        {capability_grant.grant.resource: capability_grant.resource_seal}
+                        if capability_grant is not None
+                        and capability_grant.resource_seal is not None
+                        else {}
+                    ),
                     **self._transaction_limits,
                 )
                 await self._locks.run_fenced(
@@ -440,6 +596,41 @@ class AgentTaskNodeHandler:
                         or agent_result.agent_id != task.agent_id
                     ):
                         execution_error = _AgentTaskError("agent_identity_mismatch")
+                    if (
+                        execution_error is None
+                        and agent_result.status == AgentResultStatus.PRIVILEGE_REQUESTED
+                    ):
+                        if self._capabilities is None:
+                            execution_error = _AgentTaskError("capability_runtime_unavailable")
+                        else:
+                            try:
+                                held.assert_healthy()
+                                request_ids = await self._materialize_privilege_requests(
+                                    context,
+                                    task_id=task.task_id,
+                                    result=agent_result,
+                                    workspace_lease=held.lease,
+                                )
+                                binding = await self._capabilities.validate_result_requests(
+                                    context,
+                                    task_id=task.task_id,
+                                    request_ids=request_ids,
+                                )
+                                approval = await self._capabilities.approval_for_request(
+                                    binding.request_id
+                                )
+                                if approval is None or approval.approval.status.value != "pending":
+                                    execution_error = _AgentTaskError(
+                                        "privilege_approval_not_pending"
+                                    )
+                                else:
+                                    execution_error = PrivilegePending(
+                                        approval.approval.approval_id,
+                                        context.run.workflow_run_id,
+                                        context.node_run.node_run_id,
+                                    )
+                            except Exception as error:
+                                execution_error = error
                 except BaseException as error:
                     execution_error = error
 
@@ -464,6 +655,29 @@ class AgentTaskNodeHandler:
                     or capture.manifest.created_directories
                 )
                 held.assert_healthy()
+                if isinstance(execution_error, PrivilegePending):
+                    if has_changes:
+                        assert capture is not None
+                        await self._change_sets.persist_capture(
+                            session_id=context.run.session_id,
+                            workflow_run_id=context.run.workflow_run_id,
+                            node_run_id=context.node_run.node_run_id,
+                            task_id=task.task_id,
+                            capture=capture,
+                            master_lease=context.master_lease,
+                            workspace_lease=held.lease,
+                            task_target=TaskStatus.PRIVILEGE_REQUESTED,
+                            task_error_code="privilege_partial_capture",
+                            status=ChangeSetStatus.ABANDONED_PARTIAL,
+                            reason="Privilege request abandoned the partial workspace capture",
+                        )
+                    await self._runs.prepare_privilege_retry(
+                        context.run.workflow_run_id,
+                        context.node_run.node_run_id,
+                        approval_id=execution_error.approval_id,
+                        lease=context.master_lease,
+                        workspace_lease=held.lease,
+                    )
                 if execution_error is not None:
                     raise execution_error
                 assert agent_result is not None

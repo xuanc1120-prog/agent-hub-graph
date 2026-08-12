@@ -13,7 +13,7 @@ from protocol import (
     canonical_json,
 )
 from storage.artifact_repository import ArtifactRepository
-from storage.errors import ChangeSetReconciliationRequired, LeaseLost
+from storage.errors import ChangeSetReconciliationRequired, ConcurrencyConflict, LeaseLost
 from storage.leases import MasterLease
 from storage.repositories import SessionRepository
 from storage.workflow_run_repository import (
@@ -21,6 +21,7 @@ from storage.workflow_run_repository import (
     WorkflowRunRepository,
     task_id_for_node,
 )
+from workflow.approval_manager import ApprovalPending, PrivilegePending
 from workflow.handlers.base import NodeExecutionContext, NodeHandlerResult
 from workflow.registry import NodeRegistry
 
@@ -91,6 +92,21 @@ class GraphExecutor:
             if not isinstance(raw_result, NodeHandlerResult):
                 raise TypeError("NodeHandler returned an untyped result")
             result = raw_result
+        except PrivilegePending as pending:
+            current = next(
+                item
+                for item in await self._runs.list_nodes(pending.workflow_run_id)
+                if item.node_run_id == pending.node_run_id
+            )
+            if current.status != NodeRunStatus.WAITING_APPROVAL:
+                raise ConcurrencyConflict("privilege retry did not persist waiting state") from None
+            return current
+        except ApprovalPending as pending:
+            return await self._runs.enter_waiting_approval(
+                claimed.node_run_id,
+                approval_id=pending.approval_id,
+                lease=lease,
+            )
         except (ChangeSetReconciliationRequired, LeaseLost):
             raise
         except Exception:
@@ -159,15 +175,35 @@ class GraphExecutor:
                     error_code="result_artifact_failed",
                 )
 
-        return await self._runs.complete_node(
-            claimed.node_run_id,
-            target=result.status,
-            outcome=result.outcome,
-            summary=result.summary,
-            output_artifact_id=output_artifact_id,
-            error_code=result.error_code,
-            lease=lease,
-        )
+        try:
+            return await self._runs.complete_node(
+                claimed.node_run_id,
+                target=result.status,
+                outcome=result.outcome,
+                summary=result.summary,
+                output_artifact_id=output_artifact_id,
+                error_code=result.error_code,
+                lease=lease,
+            )
+        except ConcurrencyConflict:
+            if claimed.node_type != NodeType.MERGE_PATCH:
+                raise
+            current = next(
+                item
+                for item in await self._runs.list_nodes(claimed.workflow_run_id)
+                if item.node_run_id == claimed.node_run_id
+            )
+            if current.status == NodeRunStatus.COMPLETED and current.outcome == NodeOutcome.SUCCESS:
+                return current
+            if current.status != result.status or current.outcome != result.outcome:
+                raise
+            if output_artifact_id is None:
+                return current
+            return await self._runs.attach_completed_node_artifact(
+                claimed.node_run_id,
+                artifact_id=output_artifact_id,
+                lease=lease,
+            )
 
 
 def _edge_satisfied(condition: str, outcome: NodeOutcome | None) -> bool:

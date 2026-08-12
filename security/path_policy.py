@@ -3,83 +3,19 @@
 from __future__ import annotations
 
 import os
-import re
 import stat
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-_GLOB_CHARS = frozenset("*?[]")
-_DOS_RESERVED_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
-)
-_SHORT_NAME_PATTERN = re.compile(r"^.+~[0-9]+(?:\..*)?$", re.IGNORECASE)
-_SECRET_BASENAMES = frozenset(
-    {
-        ".envrc",
-        ".netrc",
-        ".npmrc",
-        ".terraformrc",
-        ".pypirc",
-        ".yarnrc",
-        ".yarnrc.yml",
-        "_netrc",
-        "application_default_credentials.json",
-        "auth.json",
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        "credentials",
-        "credentials.json",
-        "credentials.toml",
-        "credentials.tfrc.json",
-        "gradle.properties",
-        "nuget.config",
-        "pip.conf",
-        "pip.ini",
-        "service-account.json",
-        "settings-security.xml",
-    }
-)
-_SECRET_COMPONENTS = frozenset(
-    {
-        ".aws",
-        ".azure",
-        ".cargo",
-        ".docker",
-        ".gradle",
-        ".kube",
-        ".m2",
-        ".terraform.d",
-        "gcloud",
-    }
-)
-_SECRET_PATH_PREFIXES = frozenset(
-    {
-        (".config", "gh"),
-        (".config", "glab"),
-        (".config", "gcloud"),
-        (".config", "pypoetry"),
-        (".config", "rclone"),
-    }
-)
-_FORBIDDEN_COMPONENTS = frozenset(
-    {".agent-hub", ".aider", ".claude", ".codex", ".git", ".opencode", ".ssh"}
-)
-_FORBIDDEN_BASENAMES = frozenset(
-    {
-        ".aider.conf.yml",
-        ".gitattributes",
-        ".gitmodules",
-        "agents.md",
-        "claude.md",
-        "opencode.json",
-        "opencode.jsonc",
-    }
+from path_rules import (
+    _DOS_RESERVED_NAMES,
+    _FORBIDDEN_BASENAMES,
+    _FORBIDDEN_COMPONENTS,
+    _GLOB_CHARS,
+    _SHORT_NAME_PATTERN,
+    is_restricted_relative_path,
 )
 
 
@@ -215,6 +151,17 @@ class PathPolicy:
         normalized = unicodedata.normalize("NFC", path)
         return normalized.casefold() if os.name == "nt" else normalized
 
+    @staticmethod
+    def is_sensitive_relative_path(candidate: str) -> bool:
+        """Return whether a canonical repo-relative path may contain secrets.
+
+        Capability checks use this filesystem-independent predicate before a
+        resource can enter a TaskPackage. Invalid paths fail closed because a
+        capability policy must never turn an ambiguous name into access.
+        """
+
+        return is_restricted_relative_path(candidate)
+
     def _validate_shape(
         self,
         candidate: str,
@@ -264,25 +211,13 @@ class PathPolicy:
         lowered = tuple(part.casefold() for part in parts)
         if any(part in _FORBIDDEN_COMPONENTS for part in lowered):
             raise PathPolicyViolation("Git/runtime metadata and SSH paths are forbidden")
-        if not allow_sensitive and any(part in _SECRET_COMPONENTS for part in lowered):
-            raise PathPolicyViolation("cloud and package credential paths are forbidden")
-        if not allow_sensitive and any(
-            lowered[index : index + len(prefix)] == prefix
-            for prefix in _SECRET_PATH_PREFIXES
-            for index in range(len(lowered) - len(prefix) + 1)
-        ):
-            raise PathPolicyViolation("credential configuration directories are forbidden")
+        if not allow_sensitive and is_restricted_relative_path(candidate):
+            if lowered[-1] in _FORBIDDEN_BASENAMES:
+                raise PathPolicyViolation("Git/Agent control files are forbidden")
+            raise PathPolicyViolation("sensitive file paths are forbidden")
         basename = lowered[-1]
         if not allow_control and basename in _FORBIDDEN_BASENAMES:
             raise PathPolicyViolation("Git/Agent control files are forbidden")
-        if not allow_sensitive and (
-            basename == ".env"
-            or basename.startswith(".env.")
-            or basename.startswith(".envrc.")
-            or basename in _SECRET_BASENAMES
-            or basename.endswith((".pem", ".key", ".p12", ".pfx"))
-        ):
-            raise PathPolicyViolation("sensitive file paths are forbidden")
         normalized = "/".join(parts)
         return normalized, parts
 

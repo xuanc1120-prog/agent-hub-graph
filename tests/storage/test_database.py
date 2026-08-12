@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -78,7 +79,9 @@ async def test_initialize_is_idempotent_and_creates_v1_schema(database: Database
         await cursor.close()
 
     assert tables == EXPECTED_TABLES
-    assert [tuple(row) for row in migrations] == [(1, 27), (2, 27)]
+    assert [tuple(row) for row in migrations] == [
+        (version, 27) for version in range(1, SCHEMA_VERSION + 1)
+    ]
     assert foreign_key_errors == []
     assert integrity is not None and integrity[0] == "ok"
 
@@ -257,7 +260,7 @@ async def test_concurrent_initializers_share_one_migration_lock(
     ).fetchall()
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(agents)").fetchall()}
     connection.close()
-    assert versions == [(1,), (2,)]
+    assert versions == [(version,) for version in range(1, SCHEMA_VERSION + 1)]
     assert {"available", "auto_assignable", "unavailable_reason"} <= columns
 
 
@@ -281,6 +284,279 @@ async def test_newer_schema_fails_before_applying_v1(tmp_path: Path) -> None:
     ).fetchone()
     connection.close()
     assert agents is None
+
+
+async def test_v2_capability_rows_are_invalidated_during_v3_migration(tmp_path: Path) -> None:
+    path = tmp_path / "v2-capability-records.db"
+    migration = (Path(__file__).resolve().parents[2] / "migrations" / "init.sql").read_text(
+        encoding="utf-8"
+    )
+    connection = sqlite3.connect(path)
+    connection.executescript(migration)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        """
+        INSERT INTO privilege_requests(
+            id, task_id, node_run_id, capability, action, resource,
+            effective_risk, status, created_at
+        ) VALUES ('priv-v2', 'task-v2', 'node-v2', 'modify_config',
+                  'edit_project_config', 'config/settings.json', 'L1', 'approved', ?)
+        """,
+        (TIMESTAMP,),
+    )
+    connection.execute(
+        """
+        INSERT INTO approvals(
+            id, workflow_run_id, node_run_id, subject_type, change_set_id,
+            privilege_request_id, subject_sha256, base_commit, patch_sha256,
+            evidence_sha256, effective_risk, scope_json, status, version,
+            decision_actor, decision_idempotency_key, expires_at, decided_at, created_at
+        ) VALUES ('approval-v2', 'run-v2', 'node-v2', 'privilege_request', NULL,
+                  'priv-v2', ?, NULL, NULL, ?, 'L1', '["config/settings.json"]',
+                  'pending', 1, NULL, NULL, ?, NULL, ?)
+        """,
+        ("a" * 64, "b" * 64, TIMESTAMP, TIMESTAMP),
+    )
+    connection.execute(
+        """
+        INSERT INTO capability_grants(
+            id, request_id, target_task_id, action, resource, expires_at
+        ) VALUES ('grant-v2', 'priv-v2', 'task-v2-retry',
+                  'edit_project_config', 'config/settings.json', ?)
+        """,
+        (TIMESTAMP,),
+    )
+    connection.commit()
+    connection.close()
+
+    assert await Database(path).initialize() == SCHEMA_VERSION
+
+    connection = sqlite3.connect(path)
+    approval = connection.execute(
+        "SELECT status FROM approvals WHERE id = 'approval-v2'"
+    ).fetchone()
+    request = connection.execute(
+        "SELECT status FROM privilege_requests WHERE id = 'priv-v2'"
+    ).fetchone()
+    grant = connection.execute(
+        "SELECT revoked_at, revocation_reason, resource_seal_json "
+        "FROM capability_grants WHERE id = 'grant-v2'"
+    ).fetchone()
+    connection.close()
+
+    assert approval == ("rejected",)
+    assert request == ("denied",)
+    assert grant is not None
+    assert grant[0] is not None
+    assert grant[1] == "resource seal missing during schema migration"
+    assert grant[2] == "{}"
+
+
+async def test_v3_migration_records_typed_events_for_valid_capability_lineage(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v2-capability-lineage.db"
+    migration = (Path(__file__).resolve().parents[2] / "migrations" / "init.sql").read_text(
+        encoding="utf-8"
+    )
+    connection = sqlite3.connect(path)
+    connection.executescript(migration)
+    connection.executescript(
+        f"""
+        INSERT INTO agents(
+            id, display_name, adapter_type, enabled, capabilities_json, created_at
+        ) VALUES ('agent-v2', 'Agent v2', 'test', 1, '{{}}', '{TIMESTAMP}');
+
+        INSERT INTO master_leases(
+            lease_key, instance_id, process_id, fencing_token,
+            heartbeat_at, lease_expires_at
+        ) VALUES (
+            'scheduler', 'historical-master-v2', 1, 7,
+            '{TIMESTAMP}', '2026-07-13T00:00:00.000000Z'
+        );
+
+        INSERT INTO sessions(
+            id, goal, source_repo_path, shared_repo_path, base_commit,
+            integration_branch, integration_head_commit, status, created_at, updated_at
+        ) VALUES (
+            'session-v2', 'migration replay', 'source', 'shared-v2',
+            '{"a" * 40}', 'main', '{"b" * 40}', 'active',
+            '{TIMESTAMP}', '{TIMESTAMP}'
+        );
+
+        INSERT INTO workflows(
+            id, session_id, semantic_version, layout_version,
+            author_graph_json, author_graph_hash, layout_json, layout_hash,
+            created_at, updated_at
+        ) VALUES (
+            'workflow-v2', 'session-v2', 1, 1, '{{}}', '{"c" * 64}',
+            '{{}}', '{"d" * 64}', '{TIMESTAMP}', '{TIMESTAMP}'
+        );
+
+        INSERT INTO workflow_runs(
+            id, workflow_id, session_id, integration_base_commit, current_commit,
+            workflow_semantic_version, workflow_layout_version,
+            author_snapshot_json, author_snapshot_hash,
+            compiled_snapshot_json, compiled_snapshot_hash,
+            layout_snapshot_json, layout_snapshot_hash, policy_version,
+            agent_catalog_snapshot_json, agent_catalog_snapshot_hash,
+            status, next_event_seq, created_at
+        ) VALUES (
+            'run-v2', 'workflow-v2', 'session-v2', '{"a" * 40}', '{"a" * 40}',
+            1, 1, '{{}}', '{"e" * 64}', '{{}}', '{"f" * 64}',
+            '{{}}', '{"0" * 64}', '1', '{{}}', '{"1" * 64}',
+            'waiting_approval', 1, '{TIMESTAMP}'
+        );
+
+        INSERT INTO node_runs(
+            id, workflow_run_id, node_id, node_type, attempt, status,
+            assigned_agent_id, created_at
+        ) VALUES (
+            'node-v2', 'run-v2', 'agent-task', 'agent_task', 1, 'waiting_approval',
+            'agent-v2', '{TIMESTAMP}'
+        );
+
+        INSERT INTO node_runs(
+            id, workflow_run_id, node_id, node_type, attempt, status,
+            assigned_agent_id, created_at
+        ) VALUES (
+            'node-v2-retry', 'run-v2', 'agent-task', 'agent_task', 2, 'ready',
+            'agent-v2', '{TIMESTAMP}'
+        );
+
+        INSERT INTO tasks(
+            id, node_run_id, agent_id, base_commit, status, created_at
+        ) VALUES (
+            'task-v2', 'node-v2', 'agent-v2', '{"a" * 40}',
+            'privilege_requested', '{TIMESTAMP}'
+        );
+
+        INSERT INTO tasks(
+            id, node_run_id, agent_id, base_commit, status, created_at
+        ) VALUES (
+            'task-v2-retry', 'node-v2-retry', 'agent-v2', '{"a" * 40}',
+            'pending', '{TIMESTAMP}'
+        );
+
+        INSERT INTO privilege_requests(
+            id, task_id, node_run_id, capability, action, resource,
+            effective_risk, status, created_at
+        ) VALUES (
+            'priv-v2-valid', 'task-v2', 'node-v2', 'modify_config',
+            'edit_project_config', 'config/settings.json', 'L1', 'pending',
+            '{TIMESTAMP}'
+        );
+
+        INSERT INTO approvals(
+            id, workflow_run_id, node_run_id, subject_type, change_set_id,
+            privilege_request_id, subject_sha256, base_commit, patch_sha256,
+            evidence_sha256, effective_risk, scope_json, status, version,
+            decision_actor, decision_idempotency_key, expires_at, decided_at,
+            created_at
+        ) VALUES (
+            'approval-v2-valid', 'run-v2', 'node-v2', 'privilege_request', NULL,
+            'priv-v2-valid', '{"a" * 64}', NULL, NULL, '{"b" * 64}', 'L1',
+            '["config/settings.json"]', 'pending', 3, NULL, NULL,
+            '2026-07-13T00:00:00.000000Z', NULL, '{TIMESTAMP}'
+        );
+
+        INSERT INTO capability_grants(
+            id, request_id, target_task_id, action, resource, expires_at
+        ) VALUES (
+            'grant-v2-valid', 'priv-v2-valid', 'task-v2-retry',
+            'edit_project_config', 'config/settings.json',
+            '2026-07-13T00:00:00.000000Z'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    assert await Database(path).initialize() == SCHEMA_VERSION
+
+    connection = sqlite3.connect(path)
+    events = connection.execute(
+        """
+        SELECT event_type, actor_type, actor_id, run_seq, payload_json
+        FROM events
+        WHERE workflow_run_id = 'run-v2'
+        ORDER BY run_seq
+        """
+    ).fetchall()
+    next_event_seq = connection.execute(
+        "SELECT next_event_seq FROM workflow_runs WHERE id = 'run-v2'"
+    ).fetchone()
+    states = connection.execute(
+        """
+        SELECT
+            (SELECT status FROM privilege_requests WHERE id = 'priv-v2-valid'),
+            (SELECT status FROM approvals WHERE id = 'approval-v2-valid'),
+            (SELECT version FROM approvals WHERE id = 'approval-v2-valid'),
+            (SELECT revoked_at IS NOT NULL FROM capability_grants WHERE id = 'grant-v2-valid')
+        """
+    ).fetchone()
+    connection.close()
+
+    assert [row[:4] for row in events] == [
+        (
+            "workflow.schema_migration_state_changed",
+            "system",
+            "schema-migration-v3",
+            1,
+        ),
+        (
+            "workflow.schema_migration_state_changed",
+            "system",
+            "schema-migration-v3",
+            2,
+        ),
+        (
+            "workflow.schema_migration_state_changed",
+            "system",
+            "schema-migration-v3",
+            3,
+        ),
+    ]
+    from workflow.events import build_runtime_event_registry
+
+    registry = build_runtime_event_registry()
+    for event_type, *_metadata, payload_json in events:
+        registry.validate_payload_json(event_type, payload_json)
+
+    request_payload, approval_payload, grant_payload = [json.loads(row[4]) for row in events]
+    assert all("master_fencing_token" not in json.loads(row[4]) for row in events)
+    assert [
+        payload["provenance"] for payload in (request_payload, approval_payload, grant_payload)
+    ] == [
+        "schema_migration",
+        "schema_migration",
+        "schema_migration",
+    ]
+    assert [
+        payload["migration_version"]
+        for payload in (request_payload, approval_payload, grant_payload)
+    ] == [
+        3,
+        3,
+        3,
+    ]
+    assert request_payload["subject_type"] == "privilege_request"
+    assert request_payload["subject_id"] == "priv-v2-valid"
+    assert request_payload["previous_status"] == "pending"
+    assert request_payload["status"] == "denied"
+    assert approval_payload["subject_type"] == "approval"
+    assert approval_payload["subject_id"] == "approval-v2-valid"
+    assert approval_payload["previous_status"] == "pending"
+    assert approval_payload["status"] == "rejected"
+    assert approval_payload["version"] == 4
+    assert approval_payload["subject_sha256"] == "a" * 64
+    assert grant_payload["subject_type"] == "capability_grant"
+    assert grant_payload["subject_id"] == "grant-v2-valid"
+    assert grant_payload["previous_status"] == "active"
+    assert grant_payload["status"] == "revoked"
+    assert grant_payload["reason"] == ("schema migration v3: resource seal missing; grant revoked")
+    assert next_event_seq == (4,)
+    assert states == ("denied", "rejected", 4, 1)
 
 
 def test_naive_timestamps_are_rejected() -> None:

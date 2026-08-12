@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from protocol import NodeType
 from workflow.handlers.agent_task import AgentTaskNodeHandler
+from workflow.handlers.approval import ApprovalNodeHandler
 from workflow.handlers.deterministic import (
     ContextBuilderNodeHandler,
     IfNodeHandler,
@@ -27,6 +28,8 @@ def build_node_registry(
     command_guard_handler: CommandGuardNodeHandler | None = None,
     test_handler: TestNodeHandler | None = None,
     risk_handler: RiskClassifierNodeHandler | None = None,
+    approval_handler: ApprovalNodeHandler | None = None,
+    merge_patch_handler: object | None = None,
 ) -> NodeRegistry:
     unavailable = UnavailableWriteNodeHandler()
     handlers = {
@@ -37,8 +40,8 @@ def build_node_registry(
         NodeType.COMMAND_GUARD: command_guard_handler or unavailable,
         NodeType.TEST: test_handler or unavailable,
         NodeType.RISK_CLASSIFIER: risk_handler or unavailable,
-        NodeType.APPROVAL: unavailable,
-        NodeType.MERGE_PATCH: unavailable,
+        NodeType.APPROVAL: approval_handler or unavailable,
+        NodeType.MERGE_PATCH: merge_patch_handler or unavailable,
         NodeType.IF: IfNodeHandler(),
         NodeType.OUTPUT: OutputNodeHandler(),
     }

@@ -1,6 +1,7 @@
 """Tests for OpenCode capability manifest generation."""
 
 import json
+import re
 import signal
 import subprocess
 from pathlib import Path
@@ -33,7 +34,7 @@ class TestManifestGeneration:
         version = get_opencode_version()
         assert isinstance(version, str)
         # 版本应该是有效的版本号格式
-        assert version == "1.2.27" or version == "unknown"
+        assert version == "unknown" or re.fullmatch(r"\d+\.\d+\.\d+", version)
 
     def test_get_opencode_help(self):
         """Test getting OpenCode help."""

@@ -69,7 +69,7 @@ async def test_mock_write_reaches_hub210_gate_and_restores_shared_repo(
             workflow_run_id="run-hub200",
         )
 
-    assert run.status == WorkflowRunStatus.BLOCKED
+    assert run.status == WorkflowRunStatus.WAITING_APPROVAL
     assert application.services.git.state(session.shared_repo_path).dirty is False
     assert not (session.shared_repo_path / "docs" / "agent-hub-demo.md").exists()
 
@@ -78,7 +78,7 @@ async def test_mock_write_reaches_hub210_gate_and_restores_shared_repo(
     assert by_type[NodeType.PATCH_GUARD].status == NodeRunStatus.COMPLETED
     assert by_type[NodeType.TEST].status == NodeRunStatus.COMPLETED
     assert by_type[NodeType.RISK_CLASSIFIER].status == NodeRunStatus.COMPLETED
-    assert by_type[NodeType.APPROVAL].status == NodeRunStatus.BLOCKED_BY_GUARD
+    assert by_type[NodeType.APPROVAL].status == NodeRunStatus.WAITING_APPROVAL
 
     async with application.services.database.connection() as connection:
         cursor = await connection.execute("SELECT id FROM change_sets")
@@ -86,7 +86,7 @@ async def test_mock_write_reaches_hub210_gate_and_restores_shared_repo(
         await cursor.close()
     assert len(rows) == 1
     record = await application.services.change_sets.get(str(rows[0]["id"]))
-    assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+    assert record.change_set.status == ChangeSetStatus.PENDING_APPROVAL
     assert record.change_set.created_files == ["docs/agent-hub-demo.md"]
     assert record.change_set.patch_sha256 == record.change_set.canonical_patch_ref.sha256
 
@@ -174,7 +174,7 @@ async def test_capture_has_no_post_commit_read_before_task_terminal(
             workflow_run_id="run-atomic-capture",
         )
 
-    assert run.status == WorkflowRunStatus.BLOCKED
+    assert run.status == WorkflowRunStatus.WAITING_APPROVAL
     assert early_reads == 0
     record = await original_get(
         (
@@ -185,7 +185,7 @@ async def test_capture_has_no_post_commit_read_before_task_terminal(
         ).change_set.change_set_id
     )
     task = await application.services.runs.get_task(record.change_set.task_id)
-    assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+    assert record.change_set.status == ChangeSetStatus.PENDING_APPROVAL
     assert task.status == TaskStatus.SUCCEEDED
 
 
@@ -432,8 +432,8 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         )
     )
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     injected = False
     reconciliation_started = asyncio.Event()
     original_reconcile = application.services.change_sets._reconcile_capture_commit
@@ -487,17 +487,17 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         if not injected and kwargs["status"] == ChangeSetStatus.CAPTURED:
             injected = True
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 faulting_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 
@@ -540,8 +540,8 @@ async def test_capture_commit_exception_reconciles_durable_outcome(
         if cancel_during_reconciliation:
             assert record.change_set.status == ChangeSetStatus.CAPTURED
         else:
-            assert run.status == WorkflowRunStatus.BLOCKED
-            assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+            assert run.status == WorkflowRunStatus.WAITING_APPROVAL
+            assert record.change_set.status == ChangeSetStatus.PENDING_APPROVAL
         assert task.status == TaskStatus.SUCCEEDED
     else:
         if not cancel_during_reconciliation:
@@ -615,8 +615,8 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
         )
     )
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     injected = False
     active_task_id: str | None = None
     active_run_id: str | None = None
@@ -749,17 +749,17 @@ async def test_capture_commit_reconciliation_rejects_partial_durable_state(
             active_task_id = str(kwargs["task_id"])
             active_run_id = str(kwargs["workflow_run_id"])
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 partially_committed_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 
@@ -840,8 +840,8 @@ async def test_abandoned_capture_reconciliation_requires_security_event(
 
     monkeypatch.setattr(agent_handler._bundles, "cleanup", fail_cleanup_once)
     database = application.services.database
-    original_transaction = database.immediate_transaction
     original_persist = application.services.change_sets.persist_capture
+    original_capture_transaction = application.services.change_sets._capture_transaction
     reconciliation_injected = False
     active_task_id: str | None = None
     active_run_id: str | None = None
@@ -880,17 +880,17 @@ async def test_abandoned_capture_reconciliation_requires_security_event(
             active_task_id = str(kwargs["task_id"])
             active_run_id = str(kwargs["workflow_run_id"])
             monkeypatch.setattr(
-                database,
-                "immediate_transaction",
+                application.services.change_sets,
+                "_capture_transaction",
                 missing_security_event_transaction,
             )
             try:
                 return await original_persist(**kwargs)
             finally:
                 monkeypatch.setattr(
-                    database,
-                    "immediate_transaction",
-                    original_transaction,
+                    application.services.change_sets,
+                    "_capture_transaction",
+                    original_capture_transaction,
                 )
         return await original_persist(**kwargs)
 

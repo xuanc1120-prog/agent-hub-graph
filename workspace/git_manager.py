@@ -563,6 +563,43 @@ class GitManager:
             input_bytes=self._pathspec_bytes(paths),
         )
 
+    def remove_worktree_entries(self, repo: Path, paths: Sequence[str]) -> None:
+        """Remove explicit failed-ChangeSet entries through a pinned root handle."""
+
+        # Do not perform a check-then-path-delete sequence here.  The secure
+        # root keeps POSIX parent directory fds and Windows deny-delete handles
+        # bound while each unlink/rmdir is executed, so a replaced ancestor
+        # cannot redirect rollback outside the repository.
+        from workspace.secure_file import SecureFileError, SecureWorkspaceRoot
+
+        root = repo.expanduser().resolve(strict=True)
+        normalized_paths = tuple(paths)
+        if any(not isinstance(relative, str) or not relative for relative in normalized_paths):
+            raise GitManagerError("rollback path must be a non-empty string")
+        unique = sorted(
+            set(normalized_paths),
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        )
+        try:
+            with SecureWorkspaceRoot(root) as secure_root:
+                for relative in unique:
+                    try:
+                        if secure_root.unlink_regular(relative):
+                            continue
+                    except SecureFileError as file_error:
+                        file_failure = file_error
+                    else:
+                        continue
+                    try:
+                        secure_root.remove_directory(relative)
+                    except SecureFileError:
+                        raise GitManagerError(
+                            f"secure rollback removal failed for {relative}"
+                        ) from file_failure
+        except SecureFileError as error:
+            raise GitManagerError("secure rollback root validation failed") from error
+
     def index_sha256(self, repo: Path) -> str:
         root = repo.expanduser().resolve(strict=True)
         entries = self._run(("ls-files", "--stage", "-z", "--"), cwd=root).stdout
@@ -610,6 +647,169 @@ class GitManager:
         if state.dirty:
             raise GitManagerError("validation baseline commit left a dirty repository")
         return state
+
+    def commit_approved_patch(
+        self,
+        repo: Path,
+        *,
+        parent_commit: str,
+        paths: Sequence[str],
+        patch_bytes: bytes,
+        patch_sha256: str,
+        post_state_hash: str,
+        session_id: str,
+        workflow_run_id: str,
+        change_set_id: str,
+        approval_id: str,
+        expected_index_sha256: str | None = None,
+    ) -> tuple[str, str]:
+        self._require_object_id(parent_commit)
+        if sha256(patch_bytes).hexdigest() != patch_sha256:
+            raise GitManagerError("canonical patch bytes do not match the approved patch hash")
+        root = repo.expanduser().resolve(strict=True)
+        normalized = tuple(sorted(set(paths)))
+        if not normalized:
+            raise GitManagerError("an approved patch must contain at least one path")
+        self._pathspec_bytes(normalized)
+        before = self.state(root)
+        if before.commit != parent_commit or before.staged:
+            raise GitManagerError("approved merge requires the expected parent and clean index")
+        if expected_index_sha256 is not None and self.index_sha256(root) != expected_index_sha256:
+            raise GitManagerError("approved merge index changed before staging")
+        expected_tree = self.canonical_patch_tree(
+            root,
+            parent_commit=parent_commit,
+            patch_bytes=patch_bytes,
+        )
+        self._run(
+            ("add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"),
+            cwd=root,
+            input_bytes=self._pathspec_bytes(normalized),
+        )
+        staged = self._nul_paths(
+            self._run(("diff", "--cached", "--name-only", "-z", "--"), cwd=root).stdout
+        )
+        if not staged:
+            raise GitManagerError("approved merge produced no staged paths")
+        after_stage = self.state(root)
+        if after_stage.unstaged or after_stage.untracked_files:
+            raise GitManagerError("approved merge left unexpected working tree changes")
+        if (
+            self._run(
+                ("diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", "--"),
+                cwd=root,
+                allowed_returncodes={0, 1},
+            ).returncode
+            == 0
+        ):
+            raise GitManagerError("approved patch produced no staged changes")
+        tree_before = self._decode(self._run(("write-tree",), cwd=root).stdout).strip()
+        self._require_object_id(tree_before)
+        if tree_before != expected_tree:
+            raise GitManagerError("staged tree does not match the canonical approved patch")
+        message = (
+            "Agent Hub approved ChangeSet merge\n\n"
+            f"Agent-Hub-Session: {session_id}\n"
+            f"Agent-Hub-Workflow-Run: {workflow_run_id}\n"
+            f"Agent-Hub-Change-Set: {change_set_id}\n"
+            f"Agent-Hub-Approval: {approval_id}\n"
+            f"Agent-Hub-Patch: {patch_sha256}\n"
+            f"Agent-Hub-Post-State: {post_state_hash}\n"
+            f"Agent-Hub-Tree: {tree_before}\n"
+        )
+        self._run(
+            ("commit", "--no-verify", "--no-gpg-sign", "-m", message),
+            cwd=root,
+            extra_environment={
+                "GIT_AUTHOR_NAME": "Agent Hub Master",
+                "GIT_AUTHOR_EMAIL": "agent-hub@localhost.invalid",
+                "GIT_COMMITTER_NAME": "Agent Hub Master",
+                "GIT_COMMITTER_EMAIL": "agent-hub@localhost.invalid",
+            },
+        )
+        state = self.state(root)
+        if state.dirty:
+            raise GitManagerError("Master merge commit left the repository dirty")
+        parent = self._decode(self._run(("rev-parse", "HEAD^"), cwd=root).stdout).strip()
+        if parent != parent_commit:
+            raise GitManagerError("Master merge commit parent does not match the run HEAD")
+        tree = self._decode(self._run(("rev-parse", "HEAD^{tree}"), cwd=root).stdout).strip()
+        self._require_object_id(tree)
+        if tree != tree_before or tree != expected_tree:
+            raise GitManagerError("Master merge tree changed while committing")
+        commit = state.commit
+        metadata = self.read_commit_metadata(root, commit)
+        expected = {
+            "Agent-Hub-Session": session_id,
+            "Agent-Hub-Workflow-Run": workflow_run_id,
+            "Agent-Hub-Change-Set": change_set_id,
+            "Agent-Hub-Approval": approval_id,
+            "Agent-Hub-Patch": patch_sha256,
+            "Agent-Hub-Post-State": post_state_hash,
+            "Agent-Hub-Tree": tree_before,
+        }
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise GitManagerError("Master merge commit trailer verification failed")
+        return commit, tree
+
+    def canonical_patch_tree(
+        self,
+        repo: Path,
+        *,
+        parent_commit: str,
+        patch_bytes: bytes,
+    ) -> str:
+        """Compute the tree produced by a patch from an isolated temporary index."""
+
+        self._require_object_id(parent_commit)
+        root = repo.expanduser().resolve(strict=True)
+        index_root = self.create_private_temporary_directory(prefix="ah-merge-index-")
+        index_path = index_root / "index"
+        environment = {"GIT_INDEX_FILE": str(index_path)}
+        try:
+            self._run(("read-tree", parent_commit), cwd=root, extra_environment=environment)
+            self._run(
+                ("apply", "--cached", "--binary", "--whitespace=nowarn", "-"),
+                cwd=root,
+                input_bytes=patch_bytes,
+                extra_environment=environment,
+            )
+            tree = self._decode(
+                self._run(("write-tree",), cwd=root, extra_environment=environment).stdout
+            ).strip()
+            self._require_object_id(tree)
+            return tree
+        finally:
+            self.remove_private_temporary_directory(index_root)
+
+    def commit_parent(self, repo: Path, commit: str) -> str:
+        self._require_object_id(commit)
+        parent = self._decode(self._run(("rev-parse", f"{commit}^"), cwd=repo).stdout).strip()
+        self._require_object_id(parent)
+        return parent
+
+    def commit_tree(self, repo: Path, commit: str) -> str:
+        self._require_object_id(commit)
+        tree = self._decode(self._run(("rev-parse", f"{commit}^{{tree}}"), cwd=repo).stdout).strip()
+        self._require_object_id(tree)
+        return tree
+
+    def read_commit_metadata(self, repo: Path, commit: str) -> dict[str, str]:
+        self._require_object_id(commit)
+        message = self._decode(
+            self._run(
+                ("show", "-s", "--format=%B", "--no-patch", commit),
+                cwd=repo,
+            ).stdout
+        )
+        result: dict[str, str] = {}
+        for line in message.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key.startswith("Agent-Hub-") and key not in result:
+                result[key] = value.strip()
+        return result
 
     def create_private_temporary_directory(self, *, prefix: str) -> Path:
         if not re.fullmatch(r"ah-[a-z0-9-]{1,48}", prefix):

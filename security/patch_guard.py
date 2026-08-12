@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
 from security.path_policy import PathPolicy, PathPolicyViolation
+from workflow.capability_policy import eligible_actions
 from workspace.change_set import ChangeSetManifest, FileAction
 
 _FORBIDDEN_GIT_FILES = frozenset({".gitattributes", ".gitmodules"})
@@ -58,6 +59,7 @@ class PatchGuard:
         *,
         allowed_existing_files: tuple[str, ...] | list[str],
         allowed_new_files: tuple[str, ...] | list[str],
+        granted_existing_files: tuple[str, ...] | list[str] = (),
         expected_patch_sha256: str | None = None,
     ) -> PatchGuardReport:
         patch_hash = sha256(patch_bytes).hexdigest()
@@ -95,6 +97,7 @@ class PatchGuard:
 
         existing = {self._policy.comparison_key(path): path for path in scope.existing_files}
         new = {self._policy.comparison_key(path): path for path in scope.new_files}
+        granted = {self._policy.comparison_key(path) for path in granted_existing_files}
         created_files = tuple(
             change.path
             for change in manifest.changes
@@ -126,6 +129,20 @@ class PatchGuard:
                 self._validate_action(change.action, change.path, change.old_path, existing, new)
             except (PathPolicyViolation, ValueError) as error:
                 reasons.append(str(error))
+            protected_paths = (
+                (change.old_path, change.path)
+                if change.action == FileAction.RENAMED and change.old_path is not None
+                else (change.path,)
+            )
+            for protected in protected_paths:
+                if eligible_actions(protected) and (
+                    (
+                        protected == change.path
+                        and change.action in {FileAction.CREATED, FileAction.RENAMED}
+                    )
+                    or self._policy.comparison_key(protected) not in granted
+                ):
+                    reasons.append(f"privileged_resource_requires_consumed_grant:{protected}")
 
         if any(pattern.search(patch_bytes) for pattern in _SECRET_PATTERNS):
             return PatchGuardReport(

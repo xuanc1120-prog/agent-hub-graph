@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -168,6 +170,13 @@ class ChangeSetRepository:
         self._master_leases = master_leases
         self._locks = locks
 
+    @asynccontextmanager
+    async def _capture_transaction(self) -> AsyncIterator[Transaction]:
+        """Own the capture-only transaction seam used by reconciliation tests."""
+
+        async with self._database.immediate_transaction() as transaction:
+            yield transaction
+
     async def persist_capture(
         self,
         *,
@@ -321,7 +330,7 @@ class ChangeSetRepository:
                 created_at=timestamp,
                 updated_at=timestamp,
             )
-            async with self._database.immediate_transaction() as transaction:
+            async with self._capture_transaction() as transaction:
                 await self._master_leases.assert_valid_in(
                     transaction,
                     master_lease,

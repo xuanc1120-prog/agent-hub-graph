@@ -52,7 +52,7 @@ async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
             workflow_run_id="run-hub200-command",
         )
 
-    assert run.status == WorkflowRunStatus.BLOCKED
+    assert run.status == WorkflowRunStatus.WAITING_APPROVAL
     assert application.services.git.state(session.shared_repo_path).dirty is False
     assert not (session.shared_repo_path / "tests" / "test_agent_hub_demo.py").exists()
 
@@ -62,13 +62,13 @@ async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
     assert by_type[NodeType.COMMAND_GUARD].status == NodeRunStatus.COMPLETED
     assert by_type[NodeType.TEST].status == NodeRunStatus.COMPLETED
     assert by_type[NodeType.RISK_CLASSIFIER].status == NodeRunStatus.COMPLETED
-    assert by_type[NodeType.APPROVAL].status == NodeRunStatus.BLOCKED_BY_GUARD
+    assert by_type[NodeType.APPROVAL].status == NodeRunStatus.WAITING_APPROVAL
 
     record = await application.services.change_sets.get_for_source_node(
         workflow_run_id=run.workflow_run_id,
         source_node_id="write-test",
     )
-    assert record.change_set.status == ChangeSetStatus.TEST_PASSED
+    assert record.change_set.status == ChangeSetStatus.PENDING_APPROVAL
     assert record.change_set.created_files == ["tests/test_agent_hub_demo.py"]
 
     test_artifact_id = by_type[NodeType.TEST].output_artifact_id

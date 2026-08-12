@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from protocol import PrivilegeAction
 from workspace.change_set import FileAction
 from workspace.git_manager import GitManager
 from workspace.transaction import (
@@ -59,6 +61,76 @@ def _transaction(
         temp_directory=tmp_path / "transaction-temp",
         **limits,
     )
+
+
+def test_capability_seal_must_match_workspace_transaction_preimage(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+) -> None:
+    (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    _git(fixture_source_repo, "add", ".gitignore")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "--message",
+        "add ignored cache",
+    )
+    manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
+    target = repo / "cache" / "settings.json"
+    target.parent.mkdir()
+    original = b'{"name":"demo"}'
+    changed = b'{"name":"prod"}'
+    assert len(original) == len(changed)
+    target.write_bytes(original)
+    from workflow.capability_broker import inspect_capability_resource
+
+    seal = inspect_capability_resource(
+        repo,
+        PrivilegeAction.EDIT_PROJECT_CONFIG,
+        "cache/settings.json",
+    ).as_dict()
+    assert seal["mode"] == stat.S_IMODE(target.stat().st_mode)
+
+    transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp-positive",
+        sealed_preimages={"cache/settings.json": seal},
+    )
+    transaction.begin()
+    transaction.close()
+
+    legacy_seal = dict(seal)
+    legacy_seal["mode"] = target.stat().st_mode
+    legacy_transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp-legacy-mode",
+        sealed_preimages={"cache/settings.json": legacy_seal},
+    )
+    legacy_transaction.begin()
+    legacy_transaction.close()
+
+    target.write_bytes(changed)
+
+    transaction = WorkspaceTransaction(
+        manager,
+        repo,
+        base_commit=commit,
+        expected_branch=branch,
+        temp_directory=tmp_path / "transaction-temp",
+        sealed_preimages={"cache/settings.json": seal},
+    )
+    with pytest.raises(WorkspaceNotClean, match="sealed capability resource"):
+        transaction.begin()
 
 
 def test_capture_canonical_patch_and_restore_mixed_changes(
