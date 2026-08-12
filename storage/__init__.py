@@ -6,6 +6,7 @@ from storage.db import Database, Transaction, normalize_utc, utc_now_text
 from storage.errors import (
     ArtifactCleanupRequired,
     ArtifactNotFound,
+    ArtifactReconciliationRequired,
     BundleError,
     ChangeSetIntegrityError,
     ConcurrencyConflict,
@@ -48,6 +49,7 @@ from storage.repositories import (
 __all__ = [
     "ArtifactCleanupRequired",
     "ArtifactNotFound",
+    "ArtifactReconciliationRequired",
     "ArtifactRecord",
     "ArtifactRepository",
     "ArtifactStore",

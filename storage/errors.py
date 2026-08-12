@@ -47,6 +47,10 @@ class ArtifactCleanupRequired(StorageError):
     """A failed artifact operation left filesystem cleanup to be retried."""
 
 
+class ArtifactReconciliationRequired(StorageError):
+    """An artifact commit outcome is ambiguous or internally inconsistent."""
+
+
 class ContainmentViolation(StorageError):
     """An artifact fails containment, hash, size, or redaction checks."""
 
