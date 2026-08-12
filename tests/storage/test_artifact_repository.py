@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -11,10 +14,11 @@ import storage.artifact_store as artifact_store_module
 from protocol import ArtifactType
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import _CLEANUP_REQUIRED, ArtifactStore, TempWriteResult
-from storage.db import Database
+from storage.db import Database, Transaction
 from storage.errors import (
     ArtifactCleanupRequired,
     ArtifactNotFound,
+    ArtifactReconciliationRequired,
     ContainmentViolation,
     PathEscapeError,
     QuotaExceeded,
@@ -320,6 +324,177 @@ class TestReverification:
 
 
 class TestFailureRecovery:
+    @pytest.mark.asyncio
+    async def test_transaction_rollback_after_publish_removes_artifact(
+        self,
+        database: Database,
+        repo: ArtifactRepository,
+        session_repo: SessionRepository,
+        store: ArtifactStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _create_session(session_repo)
+
+        @asynccontextmanager
+        async def rollback_then_raise() -> AsyncIterator[Transaction]:
+            async with database.connection() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield Transaction(connection)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.rollback()
+                    raise RuntimeError("simulated rollback after transaction body")
+
+        monkeypatch.setattr(database, "immediate_transaction", rollback_then_raise)
+
+        with pytest.raises(RuntimeError, match="simulated rollback"):
+            await repo.create(
+                artifact_id="art-body-rollback",
+                session_id="sess-001",
+                artifact_type=ArtifactType.LOG,
+                content=b"rolled back",
+            )
+
+        assert not store.exists("art-body-rollback", "log")
+        with pytest.raises(ArtifactNotFound):
+            await repo.get("art-body-rollback")
+
+    @pytest.mark.asyncio
+    async def test_post_commit_error_reconciles_as_success(
+        self,
+        database: Database,
+        repo: ArtifactRepository,
+        session_repo: SessionRepository,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _create_session(session_repo)
+        commit_count = 0
+
+        @asynccontextmanager
+        async def commit_then_raise() -> AsyncIterator[Transaction]:
+            nonlocal commit_count
+            async with database.connection() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield Transaction(connection)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    commit_count += 1
+                    raise RuntimeError("simulated post-commit error")
+
+        monkeypatch.setattr(database, "immediate_transaction", commit_then_raise)
+
+        record = await repo.create(
+            artifact_id="art-post-commit",
+            session_id="sess-001",
+            artifact_type=ArtifactType.LOG,
+            content=b"committed",
+        )
+
+        assert commit_count == 1
+        assert "commit succeeded despite commit-path exception" in caplog.text
+        persisted, content = await repo.get_and_verify(
+            "art-post-commit",
+            expected_session_id="sess-001",
+        )
+        assert persisted == record
+        assert content == b"committed"
+
+    @pytest.mark.asyncio
+    async def test_post_commit_metadata_mismatch_fails_closed(
+        self,
+        database: Database,
+        repo: ArtifactRepository,
+        session_repo: SessionRepository,
+        store: ArtifactStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _create_session(session_repo)
+
+        @asynccontextmanager
+        async def commit_corrupt_then_raise() -> AsyncIterator[Transaction]:
+            async with database.connection() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield Transaction(connection)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    await connection.execute(
+                        "UPDATE artifacts SET sha256 = ? WHERE id = ?",
+                        ("f" * 64, "art-post-commit-mismatch"),
+                    )
+                    await connection.commit()
+                    raise RuntimeError("simulated inconsistent post-commit state")
+
+        monkeypatch.setattr(
+            database,
+            "immediate_transaction",
+            commit_corrupt_then_raise,
+        )
+
+        with pytest.raises(
+            ArtifactReconciliationRequired,
+            match="could not be reconciled",
+        ):
+            await repo.create(
+                artifact_id="art-post-commit-mismatch",
+                session_id="sess-001",
+                artifact_type=ArtifactType.LOG,
+                content=b"preserve for recovery",
+            )
+
+        assert store.exists("art-post-commit-mismatch", "log")
+
+    @pytest.mark.asyncio
+    async def test_post_commit_cancellation_finalizes_before_propagating(
+        self,
+        database: Database,
+        repo: ArtifactRepository,
+        session_repo: SessionRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _create_session(session_repo)
+
+        @asynccontextmanager
+        async def commit_then_cancel() -> AsyncIterator[Transaction]:
+            async with database.connection() as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield Transaction(connection)
+                except BaseException:
+                    await connection.rollback()
+                    raise
+                else:
+                    await connection.commit()
+                    raise asyncio.CancelledError
+
+        monkeypatch.setattr(database, "immediate_transaction", commit_then_cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await repo.create(
+                artifact_id="art-post-commit-cancel",
+                session_id="sess-001",
+                artifact_type=ArtifactType.LOG,
+                content=b"committed before cancellation",
+            )
+
+        persisted, content = await repo.get_and_verify(
+            "art-post-commit-cancel",
+            expected_session_id="sess-001",
+        )
+        assert persisted.artifact_id == "art-post-commit-cancel"
+        assert content == b"committed before cancellation"
+
     @pytest.mark.asyncio
     async def test_reconcile_preserves_referenced_artifact(
         self,

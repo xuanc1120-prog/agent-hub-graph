@@ -9,11 +9,13 @@ approach is:
 3. Check no duplicate artifact_id exists.
 4. Call ``store.write_temp`` + ``store.publish`` to get the final file.
 5. INSERT metadata with server-computed fields.
-6. On DB failure, ``store.rollback_publish`` removes the final file.
+6. On a commit-path error, reconcile the stable ID under ``BEGIN IMMEDIATE``:
+   abort a rolled-back file, or verify and finalize a committed artifact.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +29,7 @@ from storage.artifact_store import ArtifactStore, TempWriteResult
 from storage.db import Database, Transaction, utc_now_text
 from storage.errors import (
     ArtifactNotFound,
+    ArtifactReconciliationRequired,
     ContainmentViolation,
     PathEscapeError,
     QuotaExceeded,
@@ -335,7 +338,8 @@ class ArtifactRepository:
         3. In ``BEGIN IMMEDIATE`` transaction: verify session/task/planner
            existence and ownership, check quotas, check no duplicate, publish
            final file, INSERT metadata.
-        4. On DB failure, rollback the published file.
+        4. On a commit-path error, reconcile SQLite and the final file using
+           the stable artifact ID before deciding whether to abort or finalize.
 
         Returns the server-constructed :class:`ArtifactRecord`.
         """
@@ -352,6 +356,8 @@ class ArtifactRepository:
         # Stage file write first (outside transaction for I/O)
         staged = self._store.write_temp(resolved_id, artifact_type.value, content)
         timestamp = utc_now_text(now)
+        expected_record: ArtifactRecord | None = None
+        published = False
 
         try:
             async with self._database.immediate_transaction() as tx:
@@ -432,6 +438,7 @@ class ArtifactRepository:
 
                 # Publish final file (no-overwrite)
                 self._store.publish(staged)
+                published = True
 
                 # Store relative path from store base
                 try:
@@ -442,6 +449,19 @@ class ArtifactRepository:
                     raise ContainmentViolation(
                         f"artifact path is outside store base: {final_path}"
                     ) from exc
+
+                expected_record = ArtifactRecord(
+                    artifact_id=resolved_id,
+                    session_id=resolved_session,
+                    task_id=resolved_task,
+                    planner_run_id=resolved_planner,
+                    artifact_type=artifact_type.value,
+                    relative_path=relative_str,
+                    sha256=staged.sha256,
+                    size_bytes=staged.size_bytes,
+                    redacted=redacted,
+                    created_at=timestamp,
+                )
 
                 # Insert metadata with server-computed fields
                 await tx.execute(
@@ -467,36 +487,150 @@ class ArtifactRepository:
                 )
 
         except BaseException as operation_error:
-            # Preserve the operation error while making cleanup failure visible.
+            if not published or expected_record is None:
+                self._abort_create(staged, operation_error)
+                raise
+
+            reconciliation = asyncio.create_task(
+                self._reconcile_create_commit(expected_record, staged)
+            )
+            deferred_cancellation: asyncio.CancelledError | None = None
+            while not reconciliation.done():
+                try:
+                    await asyncio.shield(reconciliation)
+                except asyncio.CancelledError as cancellation:
+                    deferred_cancellation = cancellation
+                except Exception:
+                    # Inspect and classify the completed task via result() below.
+                    pass
+
+            if reconciliation.cancelled():
+                failure = ArtifactReconciliationRequired(
+                    f"artifact commit reconciliation was cancelled: {resolved_id}"
+                )
+                failure.add_note(f"commit-path error: {operation_error!r}")
+                raise failure from deferred_cancellation
             try:
-                self._store.abort(staged)
-            except Exception as cleanup_err:
-                operation_error.add_note(
-                    f"artifact cleanup failed for {artifact_type.value}/{resolved_id}: "
-                    f"{cleanup_err!r}"
+                committed_record = reconciliation.result()
+            except Exception as reconciliation_error:
+                failure = ArtifactReconciliationRequired(
+                    f"artifact commit outcome could not be reconciled: {resolved_id}"
                 )
-                _LOGGER.exception(
-                    "cleanup after artifact create failure failed for %s/%s",
-                    artifact_type.value,
-                    resolved_id,
+                failure.add_note(f"commit-path error: {operation_error!r}")
+                raise failure from reconciliation_error
+
+            if committed_record is None:
+                if deferred_cancellation is not None:
+                    deferred_cancellation.add_note(
+                        "cancellation was deferred until artifact rollback cleanup completed"
+                    )
+                    raise deferred_cancellation from None
+                raise
+
+            control_error: BaseException | None = deferred_cancellation
+            if control_error is None and isinstance(
+                operation_error,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                control_error = operation_error
+            if control_error is not None:
+                control_error.add_note(
+                    "control-flow interruption was deferred until committed artifact finalized"
                 )
-            raise
+                raise control_error from None
+            _LOGGER.warning(
+                "Artifact commit succeeded despite commit-path exception: %r",
+                operation_error,
+            )
+            return committed_record
 
-        # DB committed — finalize the handle to prevent stale rollback
-        self._store.finalize(staged)
+        assert expected_record is not None
+        self._finalize_committed_create(staged)
+        return expected_record
 
-        return ArtifactRecord(
-            artifact_id=resolved_id,
-            session_id=resolved_session,
-            task_id=resolved_task,
-            planner_run_id=resolved_planner,
-            artifact_type=artifact_type.value,
-            relative_path=relative_str,
-            sha256=staged.sha256,
-            size_bytes=staged.size_bytes,
-            redacted=redacted,
-            created_at=timestamp,
-        )
+    def _abort_create(
+        self,
+        staged: TempWriteResult,
+        operation_error: BaseException,
+    ) -> None:
+        try:
+            self._store.abort(staged)
+        except Exception as cleanup_error:
+            operation_error.add_note(
+                f"artifact cleanup failed for {staged.artifact_type}/{staged.artifact_id}: "
+                f"{cleanup_error!r}"
+            )
+            _LOGGER.exception(
+                "cleanup after artifact create failure failed for %s/%s",
+                staged.artifact_type,
+                staged.artifact_id,
+            )
+
+    def _finalize_committed_create(
+        self,
+        staged: TempWriteResult,
+        operation_error: BaseException | None = None,
+    ) -> None:
+        try:
+            self._store.finalize(staged)
+        except Exception as finalization_error:
+            failure = ArtifactReconciliationRequired(
+                f"committed artifact failed final verification: {staged.artifact_id}"
+            )
+            if operation_error is not None:
+                failure.add_note(f"commit-path error: {operation_error!r}")
+            raise failure from finalization_error
+
+    async def _reconcile_create_commit(
+        self,
+        expected: ArtifactRecord,
+        staged: TempWriteResult,
+    ) -> ArtifactRecord | None:
+        async with self._database.connection() as connection:
+            cursor = await connection.execute("BEGIN IMMEDIATE")
+            await cursor.close()
+            try:
+                cursor = await connection.execute(
+                    "SELECT * FROM artifacts WHERE id = ?",
+                    (expected.artifact_id,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if row is None:
+                    self._store.abort(staged)
+                    outcome = None
+                else:
+                    committed = self._to_record(row)
+                    if committed != expected:
+                        raise ArtifactReconciliationRequired(
+                            f"committed artifact metadata does not match staged write: "
+                            f"{expected.artifact_id}"
+                        )
+                    try:
+                        content = self._store.read_bytes(
+                            committed.artifact_id,
+                            committed.artifact_type,
+                        )
+                    except Exception as verification_error:
+                        raise ArtifactReconciliationRequired(
+                            f"committed artifact file could not be verified: {expected.artifact_id}"
+                        ) from verification_error
+                    if (
+                        len(content) != committed.size_bytes
+                        or sha256(content).hexdigest() != committed.sha256
+                    ):
+                        raise ArtifactReconciliationRequired(
+                            f"committed artifact content does not match metadata: "
+                            f"{expected.artifact_id}"
+                        )
+                    self._store.finalize(staged)
+                    outcome = committed
+            except BaseException:
+                await connection.rollback()
+                raise
+            else:
+                await connection.commit()
+                return outcome
 
     # ------------------------------------------------------------------
     # Read path (with re-verification)
