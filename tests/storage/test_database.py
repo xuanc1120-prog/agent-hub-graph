@@ -77,11 +77,15 @@ async def test_initialize_is_idempotent_and_creates_v1_schema(database: Database
         cursor = await connection.execute("PRAGMA integrity_check")
         integrity = await cursor.fetchone()
         await cursor.close()
+        cursor = await connection.execute("PRAGMA table_info(approvals)")
+        approval_columns = {str(row[1]) for row in await cursor.fetchall()}
+        await cursor.close()
 
     assert tables == EXPECTED_TABLES
     assert [tuple(row) for row in migrations] == [
         (version, 27) for version in range(1, SCHEMA_VERSION + 1)
     ]
+    assert "decision_request_sha256" in approval_columns
     assert foreign_key_errors == []
     assert integrity is not None and integrity[0] == "ok"
 

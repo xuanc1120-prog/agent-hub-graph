@@ -28,12 +28,13 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 | 状态 | 任务 |
 |---|---|
-| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210`、`HUB-220` |
+| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210` |
+| in_progress | `HUB-220`：Phase A 已完成；Phase B 审批 CAS、Merge/Cancel 竞争与 RecoveryManager 故障注入进行中 |
 | queued | `HUB-300`：依赖已满足，阶段 2 gate 后进入当前开发波次 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `3/3`，总任务已集成为 `11/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-220` 已随 `edf5212` 集成。HUB-210 PR #3 的组合 head `c9aefb9` 已通过 Python 3.11/3.12/3.13、前端、Playwright、Ruff、format、`pip-audit` 和 `npm audit` 门禁，最终安全复核无 P0/P1/P2。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `2/3`，总任务已集成为 `10/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-210` 已通过 PR #3 合入 `b5ee36e`。HUB-220 基于最新 `main` 重放 Phase A，Phase B 尚未完成，阶段 2 gate 保持关闭。
 
-协议冻结点为 `contracts-frozen-v1`。当前执行顺序为 `(HUB-210 || HUB-220) -> 阶段 2 gate（已通过） -> HUB-300`；HUB-210 与 HUB-220 已完成并通过组合门禁，下一任务可从合并后的最新 `main` 创建独立分支。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。当前执行顺序为 `HUB-210 -> HUB-220 Phase B -> 阶段 2 gate -> HUB-300`；HUB-210 已完成，HUB-220 尚在进行中，下一任务不得越过阶段 2 gate。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 
@@ -65,7 +66,7 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 | HUB-210 | H | Codex | Claude Code | ApprovalManager、CapabilityBroker、MergePatch、cancel 线性化和 RecoveryManager | HUB-200 |
 | HUB-220 | M | Hermes | Codex | 路径逃逸、dirty workspace、租约过期、测试污染、审批冲突和崩溃恢复测试 | HUB-200 |
 
-阶段门：Mock 写任务完整通过 Guard、Test、Approval、Merge；失败路径恢复 clean。HUB-210/HUB-220 组合分支已通过远端 Linux Python 矩阵、前端 lint/unit/build、Playwright、Ruff、`pip-audit` 和 `npm audit`，最终安全复核无 P0/P1/P2。
+阶段门：Mock 写任务完整通过 Guard、Test、Approval、Merge；失败路径恢复 clean。HUB-210 已满足代码与组合 CI 要求；HUB-220 Phase B 的审批 CAS、Merge/Cancel 竞争和 RecoveryManager 三类故障注入完成后，才可关闭阶段 2 gate。
 
 ### 阶段 3：真实 CLI Agent
 

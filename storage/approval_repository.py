@@ -25,7 +25,7 @@ from protocol import (
     TaskStatus,
 )
 from storage.db import Database, Transaction, utc_now_text
-from storage.errors import ConcurrencyConflict, RecordNotFound
+from storage.errors import ConcurrencyConflict, IdempotencyConflict, RecordNotFound
 from storage.event_repository import EventRepository
 from storage.leases import (
     MasterLease,
@@ -50,6 +50,7 @@ class ApprovalRecord:
     decided_at: str | None
     decision_actor: str | None
     decision_idempotency_key: str | None
+    decision_request_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +165,10 @@ def _approval_record(row: aiosqlite.Row) -> ApprovalRecord:
             privilege_request_id=str(row["privilege_request_id"]),
             evidence_sha256=str(row["evidence_sha256"]),
         )
+    try:
+        decision_request_sha256 = row["decision_request_sha256"]
+    except (IndexError, KeyError):
+        decision_request_sha256 = None
     return ApprovalRecord(
         approval=value,
         created_at=str(row["created_at"]),
@@ -172,7 +177,32 @@ def _approval_record(row: aiosqlite.Row) -> ApprovalRecord:
         decision_idempotency_key=(
             str(row["decision_idempotency_key"]) if row["decision_idempotency_key"] else None
         ),
+        decision_request_sha256=(str(decision_request_sha256) if decision_request_sha256 else None),
     )
+
+
+def _decision_request_sha256(
+    *,
+    approval_id: str,
+    expected_version: int,
+    confirm_subject_hash: str,
+    target: ApprovalStatus,
+    actor_id: str,
+    idempotency_key: str,
+) -> str:
+    request = {
+        "actor_id": actor_id,
+        "approval_id": approval_id,
+        "confirm_subject_hash": confirm_subject_hash,
+        "expected_version": expected_version,
+        "idempotency_key": idempotency_key,
+        "target": target.value,
+    }
+    return sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _grant_record(
@@ -554,13 +584,70 @@ class ApprovalRepository:
             if row is None:
                 raise RecordNotFound(f"approval not found: {approval_id}")
             current = _approval_record(row)
-            if current.approval.subject_sha256 != confirm_subject_hash:
-                raise ConcurrencyConflict("approval subject hash does not match")
+            request_sha256 = _decision_request_sha256(
+                approval_id=approval_id,
+                expected_version=expected_version,
+                confirm_subject_hash=confirm_subject_hash,
+                target=target,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+            )
             if (
-                current.approval.status == target
+                current.approval.status != ApprovalStatus.PENDING
                 and current.decision_idempotency_key == idempotency_key
             ):
+                if current.decision_request_sha256 is None:
+                    legacy_replay = (
+                        current.approval.status
+                        in {
+                            ApprovalStatus.APPROVED,
+                            ApprovalStatus.REJECTED,
+                        }
+                        and current.approval.status == target
+                        and current.decision_actor == actor_id
+                        and current.approval.version == expected_version + 1
+                        and current.approval.subject_sha256 == confirm_subject_hash
+                    )
+                    if not legacy_replay:
+                        raise IdempotencyConflict(
+                            "legacy approval idempotency key was reused with a different request"
+                        )
+                    changed = await tx.execute(
+                        """
+                        UPDATE approvals
+                        SET decision_request_sha256 = ?
+                        WHERE id = ? AND status = ? AND version = ?
+                          AND decision_actor = ? AND decision_idempotency_key = ?
+                          AND subject_sha256 = ? AND decision_request_sha256 IS NULL
+                        """,
+                        (
+                            request_sha256,
+                            approval_id,
+                            current.approval.status.value,
+                            current.approval.version,
+                            actor_id,
+                            idempotency_key,
+                            confirm_subject_hash,
+                        ),
+                    )
+                    if changed != 1:
+                        raise IdempotencyConflict(
+                            "legacy approval idempotency backfill lost its CAS"
+                        )
+                    row = await tx.fetch_one("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+                    assert row is not None
+                    return _approval_record(row)
+                if current.decision_request_sha256 != request_sha256:
+                    raise IdempotencyConflict(
+                        "approval idempotency key was reused with a different request"
+                    )
+                if current.approval.status != target:
+                    raise IdempotencyConflict(
+                        "approval idempotency key was reused with a different target"
+                    )
                 return current
+            if current.approval.subject_sha256 != confirm_subject_hash:
+                raise ConcurrencyConflict("approval subject hash does not match")
             workflow = await tx.fetch_one(
                 "SELECT status, cancel_requested_at FROM workflow_runs WHERE id = ?",
                 (current.approval.workflow_run_id,),
@@ -585,7 +672,7 @@ class ApprovalRepository:
                 """
                 UPDATE approvals
                 SET status = ?, version = version + 1, decision_actor = ?,
-                    decision_idempotency_key = ?, decided_at = ?
+                    decision_idempotency_key = ?, decision_request_sha256 = ?, decided_at = ?
                 WHERE id = ? AND status = 'pending' AND version = ?
                   AND subject_sha256 = ?
                 """,
@@ -593,6 +680,7 @@ class ApprovalRepository:
                     target.value,
                     actor_id,
                     idempotency_key,
+                    request_sha256,
                     timestamp,
                     approval_id,
                     expected_version,
