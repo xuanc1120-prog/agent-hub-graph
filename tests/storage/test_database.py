@@ -367,6 +367,14 @@ async def test_v3_migration_records_typed_events_for_valid_capability_lineage(
             id, display_name, adapter_type, enabled, capabilities_json, created_at
         ) VALUES ('agent-v2', 'Agent v2', 'test', 1, '{{}}', '{TIMESTAMP}');
 
+        INSERT INTO master_leases(
+            lease_key, instance_id, process_id, fencing_token,
+            heartbeat_at, lease_expires_at
+        ) VALUES (
+            'scheduler', 'historical-master-v2', 1, 7,
+            '{TIMESTAMP}', '2026-07-13T00:00:00.000000Z'
+        );
+
         INSERT INTO sessions(
             id, goal, source_repo_path, shared_repo_path, base_commit,
             integration_branch, integration_head_commit, status, created_at, updated_at
@@ -483,6 +491,7 @@ async def test_v3_migration_records_typed_events_for_valid_capability_lineage(
         SELECT
             (SELECT status FROM privilege_requests WHERE id = 'priv-v2-valid'),
             (SELECT status FROM approvals WHERE id = 'approval-v2-valid'),
+            (SELECT version FROM approvals WHERE id = 'approval-v2-valid'),
             (SELECT revoked_at IS NOT NULL FROM capability_grants WHERE id = 'grant-v2-valid')
         """
     ).fetchone()
@@ -490,19 +499,19 @@ async def test_v3_migration_records_typed_events_for_valid_capability_lineage(
 
     assert [row[:4] for row in events] == [
         (
-            "workflow.privilege_request_state_changed",
+            "workflow.schema_migration_state_changed",
             "system",
             "schema-migration-v3",
             1,
         ),
         (
-            "workflow.approval_state_changed",
+            "workflow.schema_migration_state_changed",
             "system",
             "schema-migration-v3",
             2,
         ),
         (
-            "workflow.capability_grant_state_changed",
+            "workflow.schema_migration_state_changed",
             "system",
             "schema-migration-v3",
             3,
@@ -515,14 +524,39 @@ async def test_v3_migration_records_typed_events_for_valid_capability_lineage(
         registry.validate_payload_json(event_type, payload_json)
 
     request_payload, approval_payload, grant_payload = [json.loads(row[4]) for row in events]
+    assert all("master_fencing_token" not in json.loads(row[4]) for row in events)
+    assert [
+        payload["provenance"] for payload in (request_payload, approval_payload, grant_payload)
+    ] == [
+        "schema_migration",
+        "schema_migration",
+        "schema_migration",
+    ]
+    assert [
+        payload["migration_version"]
+        for payload in (request_payload, approval_payload, grant_payload)
+    ] == [
+        3,
+        3,
+        3,
+    ]
+    assert request_payload["subject_type"] == "privilege_request"
+    assert request_payload["subject_id"] == "priv-v2-valid"
     assert request_payload["previous_status"] == "pending"
     assert request_payload["status"] == "denied"
+    assert approval_payload["subject_type"] == "approval"
+    assert approval_payload["subject_id"] == "approval-v2-valid"
     assert approval_payload["previous_status"] == "pending"
     assert approval_payload["status"] == "rejected"
     assert approval_payload["version"] == 4
+    assert approval_payload["subject_sha256"] == "a" * 64
+    assert grant_payload["subject_type"] == "capability_grant"
+    assert grant_payload["subject_id"] == "grant-v2-valid"
+    assert grant_payload["previous_status"] == "active"
+    assert grant_payload["status"] == "revoked"
     assert grant_payload["reason"] == ("schema migration v3: resource seal missing; grant revoked")
     assert next_event_seq == (4,)
-    assert states == ("denied", "rejected", 1)
+    assert states == ("denied", "rejected", 4, 1)
 
 
 def test_naive_timestamps_are_rejected() -> None:
