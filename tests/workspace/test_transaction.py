@@ -69,7 +69,16 @@ def test_capability_seal_must_match_workspace_transaction_preimage(
 ) -> None:
     (fixture_source_repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
     _git(fixture_source_repo, "add", ".gitignore")
-    _git(fixture_source_repo, "commit", "--message", "add ignored cache")
+    _git(
+        fixture_source_repo,
+        "-c",
+        "user.name=Agent Hub Tests",
+        "-c",
+        "user.email=tests@agent-hub.local",
+        "commit",
+        "--message",
+        "add ignored cache",
+    )
     manager, repo, commit, branch = _session_repo(fixture_source_repo, tmp_path)
     target = repo / "cache" / "settings.json"
     target.parent.mkdir()
