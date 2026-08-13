@@ -15,22 +15,22 @@
 | HUB-130 | completed | Context、Artifact、Event 基础设施及故障恢复测试已审查并集成 |
 | HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
 | HUB-200 | completed | WorkspaceTransaction、canonical ChangeSet、Guard/Test NodeHandler 与安全恢复链已复审并集成 |
-| HUB-210 | completed | ApprovalManager、CapabilityBroker、MergePatch、取消线性化与 RecoveryManager；PR #3 已通过最终安全复核与组合 CI |
-| HUB-220 | completed | Workspace/Guard/Recovery 安全回归与失败注入，已随 `main@edf5212` 集成 |
+| HUB-210 | completed | ApprovalManager、CapabilityBroker、MergePatch、取消线性化与 RecoveryManager；已随 PR #3 合入最新 `main` |
+| HUB-220 | in_progress | Phase A 安全故障注入已完成；Phase B 审批 CAS、Merge/Cancel 竞争与 RecoveryManager 故障注入进行中 |
 
-阶段 0 和阶段 1 已完成，阶段 2 已完成 `3/3`，总进度为 `11/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-220` 已通过 `edf5212` 集成；HUB-210 PR #3 的组合 head `c9aefb9` 已通过 Python 3.11/3.12/3.13、前端、Playwright、Ruff、format、`pip-audit` 和 `npm audit` 门禁，最终安全复核无 P0/P1/P2。
+阶段 0 和阶段 1 已完成，阶段 2 已完成 `2/3`，总进度为 `10/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-210` 已通过 PR #3 合入 `b5ee36e`；HUB-220 当前仅 Phase A 已通过，Phase B 尚未完成，不能宣告阶段 2 gate 通过。
 
 ```text
 HUB-200（已完成）
         ├── HUB-210（已完成：Approval、Merge、Cancel、Recovery）
-        └── HUB-220（已完成：安全回归与失败注入）
+        └── HUB-220（进行中：Phase A 已完成，Phase B 进行中）
                     ↓
-          阶段 2 gate（已通过）
+              阶段 2 gate（待 HUB-220）
                     ↓
                  HUB-300
 ```
 
-`HUB-210` 与 `HUB-220` 已完成实现、复审和组合门禁，`HUB-300` 可在阶段 2 gate 通过后进入当前开发波次。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+`HUB-210` 已完成实现、复审和组合门禁；`HUB-220` 正在补齐 Phase B。`HUB-300` 必须等待阶段 2 gate 通过后进入当前开发波次。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 

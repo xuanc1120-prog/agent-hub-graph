@@ -47,7 +47,7 @@ flowchart LR
 
 ## 当前进度
 
-截至 2026-08-08，阶段 0 和阶段 1 均已完成，阶段 2 已完成 `1/3`；`HUB-200` 已通过独立安全复审并合入 `main`：
+截至 2026-08-12，阶段 0 和阶段 1 均已完成，阶段 2 已完成 `2/3`；`HUB-200` 与 `HUB-210` 已通过独立复审并合入 `main`：
 
 | 任务 | 状态 | 内容 |
 |---|---|---|
@@ -60,15 +60,16 @@ flowchart LR
 | `HUB-130` | 已完成 | ContextPack、ArtifactStore、TaskContextBundle 与 EventRegistry |
 | `HUB-110` | 已完成 | Compiler、Scheduler、GraphExecutor 与只读 MockAgent 闭环 |
 | `HUB-200` | 已完成 | Session 独立 clone、canonical WorkspaceTransaction、ChangeSet 持久化、Guard/Test NodeHandler 与安全恢复链 |
+| `HUB-210` | 已完成 | Approval、Capability、Merge、取消线性化与 RecoveryManager |
+| `HUB-220` | 进行中 | 路径、租约、测试污染、审批冲突和崩溃恢复的系统化故障注入；Phase A 已完成，Phase B 收口中 |
 
-当前已集成 `9/25` 个任务。最小可写 demo 仍缺少以下关键路径：
+当前已集成 `10/25` 个任务。最小可写 demo 仍缺少以下关键路径：
 
-- `HUB-210`：Approval、Capability、Merge、取消线性化与 RecoveryManager；
 - `HUB-220`：路径、租约、测试污染、审批冲突和崩溃恢复的系统化故障注入；
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步并行启动 `HUB-210` 和 `HUB-220`，两者通过后完成阶段 2 gate；`HUB-300` 的依赖已满足，但不抢占当前安全闭环。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。下一步完成 `HUB-220` Phase B 并执行阶段 2 gate；`HUB-300` 的依赖已满足，但不抢占当前安全闭环。
 
 ## 技术栈
 
