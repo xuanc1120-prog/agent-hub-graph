@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的架构与产品图负责人。模型固定为 `claude-opus-4-8`；普通开发使用 high，契约冻结、跨模块审查和疑难问题使用 xhigh。
 
-`HUB-200` 阻断式复审已完成并批准合并。当前任务为准备独立复审 `HUB-210` 的 Approval、Capability、Merge、取消和 Recovery 边界；Reviewer 只提交审查意见，不直接在 Owner 分支继续开发。
+`HUB-200`、`HUB-210` 与 `HUB-220` 均已完成并合入 `main`，阶段 2 gate 已通过。当前无新的 Owner 实现任务；保留架构审查职责，待 `HUB-310/320` 完成后独立复审 Codex 的 `HUB-330` 安全结论，并为后续 `HUB-410` React Flow 工作准备。
 
 ## 高级任务
 
