@@ -16,21 +16,21 @@
 | HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
 | HUB-200 | completed | WorkspaceTransaction、canonical ChangeSet、Guard/Test NodeHandler 与安全恢复链已复审并集成 |
 | HUB-210 | completed | ApprovalManager、CapabilityBroker、MergePatch、取消线性化与 RecoveryManager；已随 PR #3 合入最新 `main` |
-| HUB-220 | in_progress | Phase A 安全故障注入已完成；Phase B 审批 CAS、Merge/Cancel 竞争与 RecoveryManager 故障注入进行中 |
+| HUB-220 | completed | Phase A/B 安全与恢复故障注入已完成；已随 PR #4 合入 `540b57f`，PR 与 `main` CI 均通过 |
 
-阶段 0 和阶段 1 已完成，阶段 2 已完成 `2/3`，总进度为 `10/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-210` 已通过 PR #3 合入 `b5ee36e`；HUB-220 当前仅 Phase A 已通过，Phase B 尚未完成，不能宣告阶段 2 gate 通过。
+阶段 0、阶段 1 和阶段 2 均已完成，阶段 2 为 `3/3`，总进度为 `11/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-210` 已通过 PR #3 合入 `b5ee36e`，`HUB-220` 已通过 PR #4 合入 `540b57f`；PR 与合并后的 `main` CI 均通过，阶段 2 gate 正式关闭。
 
 ```text
 HUB-200（已完成）
         ├── HUB-210（已完成：Approval、Merge、Cancel、Recovery）
-        └── HUB-220（进行中：Phase A 已完成，Phase B 进行中）
+        └── HUB-220（已完成：Phase A/B 故障注入）
                     ↓
-              阶段 2 gate（待 HUB-220）
+              阶段 2 gate（已通过）
                     ↓
-                 HUB-300
+            HUB-300（当前待启动）
 ```
 
-`HUB-210` 已完成实现、复审和组合门禁；`HUB-220` 正在补齐 Phase B。`HUB-300` 必须等待阶段 2 gate 通过后进入当前开发波次。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+`HUB-210` 与 `HUB-220` 已完成实现、复审和组合门禁，阶段 2 gate 已通过。`HUB-300` 是当前待启动任务，必须从 `main@540b57f` 或其更新后继提交创建独立 branch/worktree。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 
