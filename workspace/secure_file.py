@@ -19,11 +19,16 @@ class SecureWorkspaceRoot:
     """Pin one trusted workspace root for race-resistant file operations."""
 
     def __init__(self, root: Path) -> None:
-        resolved = root.expanduser().resolve(strict=True)
-        metadata = os.lstat(resolved)
+        lexical = root.expanduser()
+        if not lexical.is_absolute():
+            lexical = Path.cwd() / lexical
+        metadata = os.lstat(lexical)
         if not stat.S_ISDIR(metadata.st_mode):
             raise SecureFileError("workspace root is not a plain directory")
         _assert_not_reparse(metadata, label="workspace root")
+        resolved = lexical.resolve(strict=True)
+        if resolved != lexical:
+            raise SecureFileError("workspace root path contains a symbolic link or reparse point")
         self.path = resolved
         self._root_metadata = metadata
         self._closed = False

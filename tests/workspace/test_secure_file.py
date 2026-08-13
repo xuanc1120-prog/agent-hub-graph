@@ -171,6 +171,30 @@ def test_pinned_parent_link_cannot_escape_destructive_operations(tmp_path: Path)
     assert (detached / "file.txt").read_bytes() == b"workspace"
 
 
+def test_workspace_root_rejects_directory_link(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "linked-root"
+    _create_directory_link(link, target)
+
+    with pytest.raises(SecureFileError):
+        SecureWorkspaceRoot(link)
+
+
+def test_workspace_root_rejects_linked_parent(tmp_path: Path) -> None:
+    target_parent = tmp_path / "target-parent"
+    target_parent.mkdir()
+    (target_parent / "repo").mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _create_directory_link(linked_parent, target_parent)
+
+    with pytest.raises(
+        SecureFileError,
+        match=r"symbolic link|reparse point",
+    ):
+        SecureWorkspaceRoot(linked_parent / "repo")
+
+
 def test_pinned_root_never_reanchors_to_replacement_path(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
