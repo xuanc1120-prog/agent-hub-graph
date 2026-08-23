@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的核心运行时、安全和最终集成负责人。对确定性、事务一致性、路径安全、崩溃恢复和测试结果负责。
 
-`HUB-200`、`HUB-210` 与 `HUB-220` 已完成复审并合入 `main`，阶段 2 gate 已通过。当前职责是集成审查 `HUB-300`，并在 Runner/Adapter 测试稳定后执行 `HUB-330` 阻断式安全审查；不要在 OpenCode Owner 分支代写实现。
+`HUB-200`、`HUB-210` 与 `HUB-220` 已完成复审并合入 `main`，阶段 2 gate 已通过。当前职责是集成审查 `HUB-300`，并在 Runner/Adapter 测试稳定后执行 `HUB-330` 阻断式安全审查；不要在 OpenCode Owner 分支代写实现。`HUB-400` 已完成任务书准备但仍处于 queued，只有看板切换后才创建执行 worktree，见 [HUB-400-codex.md](next-wave/HUB-400-codex.md)。
 
 ## 高级任务
 

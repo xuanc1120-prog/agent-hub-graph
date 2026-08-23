@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+/.pytest-*/
+/.t-*/
+/.tmp-hub*/
 .tmp/
 .ruff_cache/
 .mypy_cache/
@@ -32,6 +35,7 @@ agent-hub.db*
 .idea/
 .vscode/
 .claude/worktrees/
+/.worktrees/
 .DS_Store
 Thumbs.db
 

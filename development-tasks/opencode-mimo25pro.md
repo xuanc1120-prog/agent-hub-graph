@@ -4,7 +4,7 @@
 
 你是 Agent Hub 的 CLI Agent 连接与 OpenCode dogfooding 负责人。目标是让 OpenCode 成为首个真实、可审计、可取消的 Adapter。
 
-`HUB-030`、`HUB-200`、`HUB-210` 与 `HUB-220` 均已完成并集成，阶段 2 gate 已通过。当前任务为 `HUB-300`：从 `main@540b57f` 或其更新后继提交创建独立 branch/worktree，实现通用 CliAgentSpec/CliAgentRunner；继续复用 capability manifest，不修改 Approval 或 Workspace 语义。
+`HUB-030`、`HUB-200`、`HUB-210` 与 `HUB-220` 均已完成并集成，阶段 2 gate 已通过。当前任务为 `HUB-300`：文档刷新合入后，从 `main@dc789dc` 或其更新后继提交创建 `agent/opencode-cli-runner` 与 `E:\agent_hub_worktrees\opencode-hub-300`，实现通用 CliAgentSpec/CliAgentRunner；继续复用 capability manifest，不修改 Approval 或 Workspace 语义。执行任务书见 [HUB-300-opencode.md](next-wave/HUB-300-opencode.md)。
 
 ## 高级任务
 

@@ -68,7 +68,7 @@ flowchart LR
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。阶段 2 gate 已关闭，下一步从最新 `main` 启动 `HUB-300`。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。阶段 2 gate 已关闭，当前从最新 `main` 准备 `HUB-300`；后续按 `HUB-320 -> HUB-310 -> HUB-330 -> HUB-400` 排队。
 
 ## 技术栈
 

@@ -24,16 +24,17 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 
 ## 3. 阶段任务
 
-### 当前执行看板（2026-08-13）
+### 当前执行看板（2026-08-23）
 
 | 状态 | 任务 |
 |---|---|
 | completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210`、`HUB-220` |
-| queued | `HUB-300`：阶段 2 gate 已通过，作为当前待启动任务从最新 `main` 建立独立 branch/worktree |
+| ready | `HUB-300`：阶段 2 gate 已通过；文档刷新合入后，从最新 `main` 建立独立 branch/worktree |
+| queued | `HUB-320 -> HUB-310 -> HUB-330 -> HUB-400`：按当前任务队列依次启动，不因依赖已满足而提前开工 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `3/3`，总任务已集成为 `11/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-210` 已通过 PR #3 合入 `b5ee36e`；`HUB-220` 已通过 PR #4 合入 `540b57f`，PR 与合并后的 `main` CI 均通过。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `3/3`，总任务已集成为 `11/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-210` 已通过 PR #3 合入 `b5ee36e`；`HUB-220` 已通过 PR #4 合入 `540b57f`，收尾文档已通过 PR #5 合入 `dc789dc`。`main@dc789dc` 的 CI 已通过。
 
-协议冻结点为 `contracts-frozen-v1`。`HUB-210 -> HUB-220 Phase B -> 阶段 2 gate` 已全部完成，当前执行顺序从 `HUB-300` 开始。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。`HUB-210 -> HUB-220 Phase B -> 阶段 2 gate` 已全部完成，当前执行顺序从 `HUB-300` 开始。`HUB-400` 虽已满足依赖，但仍按看板排在阶段 3 任务之后，不与 HUB-300 强制并行。`main` 只用于已审查任务的最终集成。
 
 ### 阶段 0：基线与契约
 
