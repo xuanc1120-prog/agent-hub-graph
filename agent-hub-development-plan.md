@@ -1,6 +1,6 @@
 # Agent Hub：多 Coding Agent 可视化调度平台开发方案
 
-## 当前执行基线（2026-08-12）
+## 当前执行基线（2026-08-23）
 
 协议基线已打标签 `contracts-frozen-v1`，项目初始化基线标签为 `hub-000-complete`。冻结协议、ADR、TypeScript mirror 和 schema-only OpenAPI 草案已经通过 Codex 复审，后续修改冻结字段必须先提交新 ADR。
 
@@ -16,9 +16,9 @@
 | HUB-110 | completed | 确定性 Workflow 运行时已通过最终复审、集成和阶段 1 CLI/Mock gate |
 | HUB-200 | completed | WorkspaceTransaction、canonical ChangeSet、Guard/Test NodeHandler 与安全恢复链已复审并集成 |
 | HUB-210 | completed | ApprovalManager、CapabilityBroker、MergePatch、取消线性化与 RecoveryManager；已随 PR #3 合入最新 `main` |
-| HUB-220 | completed | Phase A/B 安全与恢复故障注入已完成；已随 PR #4 合入 `540b57f`，PR 与 `main` CI 均通过 |
+| HUB-220 | completed | Phase A/B 安全与恢复故障注入已完成；PR #4 合入 `540b57f`，收尾文档经 PR #5 合入 `dc789dc`，最新 `main` CI 通过 |
 
-阶段 0、阶段 1 和阶段 2 均已完成，阶段 2 为 `3/3`，总进度为 `11/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-210` 已通过 PR #3 合入 `b5ee36e`，`HUB-220` 已通过 PR #4 合入 `540b57f`；PR 与合并后的 `main` CI 均通过，阶段 2 gate 正式关闭。
+阶段 0、阶段 1 和阶段 2 均已完成，阶段 2 为 `3/3`，总进度为 `11/25`。`HUB-200` 源提交 `0e82e694` 已通过 `d9d60ddd` 合入 `main`，`HUB-210` 已通过 PR #3 合入 `b5ee36e`，`HUB-220` 已通过 PR #4 合入 `540b57f`，阶段 2 收尾文档已通过 PR #5 合入 `dc789dc`。`main@dc789dc` 的 GitHub Actions CI 已通过，阶段 2 gate 正式关闭。
 
 ```text
 HUB-200（已完成）
@@ -30,7 +30,7 @@ HUB-200（已完成）
             HUB-300（当前待启动）
 ```
 
-`HUB-210` 与 `HUB-220` 已完成实现、复审和组合门禁，阶段 2 gate 已通过。`HUB-300` 是当前待启动任务，必须从 `main@540b57f` 或其更新后继提交创建独立 branch/worktree。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
+`HUB-210` 与 `HUB-220` 已完成实现、复审和组合门禁，阶段 2 gate 已通过。`HUB-300` 是当前待启动任务，必须从 `main@dc789dc` 或其更新后继提交创建独立 branch/worktree。当前任务队列为 `HUB-300 -> HUB-320 -> HUB-310 -> HUB-330 -> HUB-400`；依赖已满足不等于自动启动，只有看板切换后才创建后续任务 worktree。任务实现与简报冲突时，以冻结协议、ADR、本方案正文和安全边界为准；不得为通过测试而弱化协议、CAS、租约或幂等约束。
 
 ## 1. 项目定位
 
