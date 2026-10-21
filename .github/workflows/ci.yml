@@ -34,9 +34,11 @@ jobs:
         run: uv pip install -e . --no-deps --python .venv
 
       - name: Ruff check
+        if: matrix.python-version == '3.11'
         run: .venv/bin/python -m ruff check .
 
       - name: Ruff format
+        if: matrix.python-version == '3.11'
         run: .venv/bin/python -m ruff format --check .
 
       - name: Pytest

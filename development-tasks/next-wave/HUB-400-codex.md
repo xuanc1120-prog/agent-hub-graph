@@ -2,9 +2,9 @@
 
 ## 基本信息
 
-- Owner：Codex / GPT-5.6 xhigh
+- Owner：Codex（用户另开会话承接；本次纠偏集成会话不实施 HUB-400）
 - Reviewer：Claude Code / Claude Opus 4.8
-- 状态：queued，当前不启动
+- 状态：下一项主任务，最小 API 切片；纠偏修复集成后启动，不等待 HUB-310
 - Base：看板切换时的最新 `main`
 - Branch：`codex/hub-400-api`（保留名）
 - Worktree：`E:\agent_hub_worktrees\codex-hub-400`（当前不创建）
@@ -12,10 +12,7 @@
 
 ## 启动条件
 
-虽然依赖已满足，当前任务队列仍先完成
-`HUB-300 -> HUB-320 -> HUB-310 -> HUB-330`。只有任务看板明确把 HUB-400 切换为
-ready 时，才从届时最新 `main` 创建独立 worktree；不得从本次资料分支或历史 worktree
-提前开发。
+不再等待整个阶段 3。先读 [修正确认](../handoffs/2026-09-20-course-correction.md)，从包含本轮修正的最新集成基线创建 worktree；先接 Mock，不把真实 Adapter 尚未完成当成 HTTP/UI 的阻塞条件。未经验证的真实执行入口不能启用。
 
 ## 目标
 
@@ -50,7 +47,17 @@ ready 时，才从届时最新 `main` 创建独立 worktree；不得从本次资
 8. `agent-hub serve` 取得 singleton Master lease，同源只读托管受信
    `web/frontend/dist`；SPA fallback 不吞 API/WS 路径。
 
-## 最小验收面
+## 首次闭环验收面
+
+- Session、plan、workflow read/update/validate/run，以及状态查询。
+- 最小图编辑所需数据、diff/artifact 查询、approval approve/reject。
+- 使用既有 durable scheduler；运行测试前明确测试代码的信任边界。
+- 已开放端点的鉴权、幂等、CAS、请求体上限和同源托管负向检查。
+- 状态可先轮询；不使用内存临时状态替代持久化状态。
+
+以下是后续完整范围，不要求首次切片一并完成。实际开放能力才需要对应控制；ticket/Origin 验证完成前不开放 WebSocket。
+
+## 后续完整验收面
 
 - Session、plan、workflow read/update/layout/validate/run
 - workflow run 状态、节点、事件、pause/resume/cancel/rerun
