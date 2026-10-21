@@ -1,6 +1,6 @@
 # Agent Hub 接手入口
 
-本项目处于开发阶段。先读 `development-tasks/handoffs/2026-09-20-course-correction.md` 和 `agent-hub-task-allocation.md`；任务状态以当前 Git 与这两份材料核对，旧 handoff 仅作历史证据。
+本项目处于开发阶段。先读 `development-tasks/handoffs/2026-10-21-course-correction-integration.md`、`development-tasks/handoffs/2026-09-20-course-correction.md` 和 `agent-hub-task-allocation.md`；任务状态以当前 Git 与这些材料核对，旧 handoff 仅作历史证据。
 
 - 用户已授权 2026-09-20 纠偏：优先交付简单图、执行、diff、审批的最小闭环；可先 Mock，再接一个真实 Adapter。
 - HUB-300 已通过 PR #7 合入 `main@1f1715d`；不要按旧简报重复开工。下一项主任务优先 HUB-400 最小 API 切片，先接 Mock，不等待 HUB-310 或整个阶段 3。

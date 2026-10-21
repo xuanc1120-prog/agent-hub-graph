@@ -5,7 +5,7 @@
 - HUB-300 已通过 PR #7 合入 `main@1f1715dfec0df7370a09c0a825f62203dc114c2d`；源 head 为 `eee5241`，实际 base 为 `f274f56`。不要根据下文历史记录重新启动 HUB-300。
 - 遗留修复与本资料由当前会话在 `codex/integrate-course-correction` 集成；接手时核对实际 HEAD、PR 和验证记录，未合并前不能把分支当作已发布 `main`。
 - 下一项主任务是 HUB-400 最小 API 切片，由用户另开的 Codex 会话实施。当前会话不实现业务 API；HUB-310 可独立推进，不是 HUB-400 的前置条件。
-- 本轮增加 spawn/cleanup 边界重复取消回归，确保取消不会中断进程回收，并显式关闭 TestRunner 的 asyncio transport。
+- 本轮增加 spawn/cleanup 边界重复取消回归，确保取消不会中断进程回收，并显式关闭 TestRunner 的 asyncio transport。实际提交和本次独立验证见 [集成交接](2026-10-21-course-correction-integration.md)。
 - 下文的 2026-09-20 测试计数仅是历史证据，本次实际复验单独记录。
 
 ## 授权和当前状态
