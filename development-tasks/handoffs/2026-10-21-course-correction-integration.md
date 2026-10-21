@@ -9,6 +9,8 @@
 - 交付内容：收拢 2026-09-20 未提交的 TestRunner 修复、回归与纠偏资料，更新 HUB-300 已合并状态和 HUB-400 优先级。
 - 未修改 `protocol/**`、`adapters/**` 或业务 API；未实现 HUB-400。
 - 原有未跟踪文件 `tmpq8eohys6` 保留，不提交、不删除。测试数据在忽略的 `.tmp/correction-20261021-*` 与 `.tmp/ci-20261021*`。
+- 集成分支已推送；PR 创建未完成。GitHub 连接器创建 PR 返回 403 `Resource not accessible by integration`；Computer Use 读取 Edge 时无法确认当前 URL，触发工具保护并停止，未提交浏览器表单。
+- 可从 [比较页面](https://github.com/xuanc1120-prog/agent-hub-graph/compare/main...codex/integrate-course-correction?expand=1) 创建待审 PR；合入 main 前仍须独立复审和 PR CI。
 
 ## 行为变化
 
@@ -26,7 +28,7 @@
 - Mock 工作流：`4 passed`，覆盖正常审批、输出超限失败、工作区副作用恢复、Git objects 污染拒绝。
 - 全仓 Ruff check/format、compileall、`git diff --check`、`pip check`：通过。
 - 前端 lint、Vitest `7 passed`、production build：通过。
-- 组合提交的全量 Windows pytest：执行中，最终结果在本节追加；本次 PR CI 与独立复审尚待完成，不引用历史绿灯代替。
+- 组合提交 `dbdee92` 的全量 Windows pytest：`899 passed, 27 skipped`，781.79 秒，无失败或 warning。其后仅修改交接文档。本次 PR CI 与独立复审尚待完成，不引用历史绿灯代替。
 - 沙箱内工作流首次运行在创建 ArtifactStore 私有目录时出现 `WinError 5`；沙箱外使用新 basetemp/cache_dir 后上述 4 项业务断言全部通过，未修改源码或数据目录 ACL 规则。
 
 ## HUB-400 新会话接手

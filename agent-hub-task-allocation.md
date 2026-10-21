@@ -31,7 +31,7 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 | 状态 | 任务 |
 |---|---|
 | completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210`、`HUB-220`、`HUB-300`（PR #7，merge `1f1715d`，源 head `eee5241`） |
-| integration in progress | 本会话：遗留 TestRunner 生命周期/输出修复与纠偏资料，分支 `codex/integrate-course-correction`；新任务基线须包含这些修复 |
+| review / integration pending | 遗留 TestRunner 生命周期/输出修复与纠偏资料已提交并推送至 `codex/integrate-course-correction`；独立复审及合入 main 待完成，新任务集成基线须包含这些修复 |
 | next primary task | `HUB-400` 最小 API 切片由用户另开的 Codex 会话实施；先接 Mock，不等待 HUB-310；HUB-410 随实际可用接口接最小 GUI |
 | independent follow-up | OpenCode：HUB-310 真实 Adapter；Hermes：HUB-320 按缺口补测，随后接 HUB-430 最小 API 验收；HUB-330 在真实执行入口启用前审查 |
 
