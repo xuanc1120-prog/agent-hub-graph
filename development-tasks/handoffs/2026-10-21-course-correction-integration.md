@@ -9,8 +9,8 @@
 - 交付内容：收拢 2026-09-20 未提交的 TestRunner 修复、回归与纠偏资料，更新 HUB-300 已合并状态和 HUB-400 优先级。
 - 未修改 `protocol/**`、`adapters/**` 或业务 API；未实现 HUB-400。
 - 原有未跟踪文件 `tmpq8eohys6` 保留，不提交、不删除。测试数据在忽略的 `.tmp/correction-20261021-*` 与 `.tmp/ci-20261021*`。
-- 集成分支已推送；PR 创建未完成。GitHub 连接器创建 PR 返回 403 `Resource not accessible by integration`；Computer Use 读取 Edge 时无法确认当前 URL，触发工具保护并停止，未提交浏览器表单。
-- 可从 [比较页面](https://github.com/xuanc1120-prog/agent-hub-graph/compare/main...codex/integrate-course-correction?expand=1) 创建待审 PR；合入 main 前仍须独立复审和 PR CI。
+- 集成分支已推送，2026-10-26 已创建 [待审 PR #8](https://github.com/xuanc1120-prog/agent-hub-graph/pull/8)。此前 GitHub 连接器创建 PR 返回 403、Computer Use 无法确认 Edge URL 的限制未通过浏览器重试解决；本次使用 Git 的既有登录完成 PR 创建。
+- 合入 main 前仍须独立复审和当前 Head 的 PR CI；不要将已创建 PR 写成已经合并。
 
 ## 行为变化
 
@@ -20,7 +20,7 @@
 - spawn/cleanup 边界的重复取消不会取消内部清理任务；清理结束后传播 `CancelledError`，同时显式关闭 asyncio transport。
 - Ruff 在 Python 3.11 job 执行一次，完整 Python 兼容矩阵与各环境依赖审计保留。
 
-## 本会话独立验证
+## 2026-10-21 本会话验证
 
 - 修补前定向基线：`80 passed, 1 skipped`。
 - 修补后安全、Runner、故障注入与 OpenAPI 定向：`82 passed, 1 skipped`。
@@ -30,6 +30,16 @@
 - 前端 lint、Vitest `7 passed`、production build：通过。
 - 组合提交 `dbdee92` 的全量 Windows pytest：`899 passed, 27 skipped`，781.79 秒，无失败或 warning。其后仅修改交接文档。本次 PR CI 与独立复审尚待完成，不引用历史绿灯代替。
 - 沙箱内工作流首次运行在创建 ArtifactStore 私有目录时出现 `WinError 5`；沙箱外使用新 basetemp/cache_dir 后上述 4 项业务断言全部通过，未修改源码或数据目录 ACL 规则。
+
+## 2026-10-26 PR CI 与依赖更新
+
+- 首轮 CI：run `40286694342`，待审 head `90fabbd`。Python 3.11 全量 `913 passed, 13 skipped, 1 warning`，但 pip-audit 检出 3 个包中的 7 项漏洞；前端 lint、Vitest `7 passed`、build 通过，npm audit 检出高危依赖，Playwright 因前序失败未执行。其他 Python job 受 fail-fast 取消，不能计为通过。
+- 为解除实际审计阻塞，仅刷新锁文件：certifi `2026.6.17 → 2026.10.19`、filelock `3.29.7 → 4.2.1`、urllib3 `2.7.0 → 2.8.0`；前端在现有 semver 范围内更新 Vite/Vitest、source-map-js、undici、css-tree 及其依赖。
+- Python 锁文件由 uv 定向升级并重新生成 hashes，其余 Python 包版本保持不变；前端仍保留 Vite 8 / Vitest 4 主版本，将 manifest 修复下限提高到 Vite `^8.3.5`、Vitest `^4.1.12`。未修改 UI 源码或审计阈值。filelock 的 major 升级是修复公告指定版本，需在完整 CI 中验证。
+- 修复依据包括 [source-map-js 公告](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)、[Vite/launch-editor 公告](https://github.com/advisories/GHSA-698v-4r3x-3vcv) 及 CI 输出的 Python 安全公告。
+- 更新后的本地 pip-audit --strict：`No known vulnerabilities found`。前端中间版本 Vite 8.3.5 / Vitest 4.1.11 的 lint、Vitest `7 passed`、production build 通过。
+- 此后将 Vitest/mocker 补到 4.1.12，一并关闭 [手动 mock 注册注入](https://github.com/advisories/GHSA-qxg6-89mg-rqv8) 和 [Windows mock 路径检查绕过](https://github.com/advisories/GHSA-xp26-3454-mjgp)；最终锁文件 npm audit 报告 `found 0 vulnerabilities`。实际安装版本和前端回归仍须按最终锁文件干净安装后复验，不能把中间版本结果算为最终补丁已通过。
+- 完整矩阵与 Playwright 以依赖更新后当前 Head 的 PR CI 为准；尚未获得独立复审批准。
 
 ## HUB-400 新会话接手
 
