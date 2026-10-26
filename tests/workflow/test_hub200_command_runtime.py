@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,15 +21,27 @@ from protocol import (
     WorkflowNode,
     WorkflowRunStatus,
 )
+from security.test_runner import TestRunner as SafeTestRunner
 from storage.repositories import NewWorkflow
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exceed_output", [False, True])
 async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
     fixture_source_repo: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exceed_output: bool,
 ) -> None:
-    application = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    application = WorkflowApplication(
+        Settings(data_dir=tmp_path / "agent-hub-data", max_console_bytes_per_run=1024)
+    )
+    if exceed_output:
+        monkeypatch.setattr(
+            SafeTestRunner,
+            "_resolve",
+            staticmethod(lambda _: (sys.executable, ("-c", "print('x' * 20000)"))),
+        )
     await application.initialize()
     await application.register_mock_agent()
     session = await application.create_session(
@@ -52,7 +65,9 @@ async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
             workflow_run_id="run-hub200-command",
         )
 
-    assert run.status == WorkflowRunStatus.WAITING_APPROVAL
+    assert run.status == (
+        WorkflowRunStatus.FAILED if exceed_output else WorkflowRunStatus.WAITING_APPROVAL
+    )
     assert application.services.git.state(session.shared_repo_path).dirty is False
     assert not (session.shared_repo_path / "tests" / "test_agent_hub_demo.py").exists()
 
@@ -60,15 +75,22 @@ async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
     by_type = {node.node_type: node for node in node_runs}
     assert by_type[NodeType.PATCH_GUARD].status == NodeRunStatus.COMPLETED
     assert by_type[NodeType.COMMAND_GUARD].status == NodeRunStatus.COMPLETED
-    assert by_type[NodeType.TEST].status == NodeRunStatus.COMPLETED
-    assert by_type[NodeType.RISK_CLASSIFIER].status == NodeRunStatus.COMPLETED
-    assert by_type[NodeType.APPROVAL].status == NodeRunStatus.WAITING_APPROVAL
+    assert by_type[NodeType.TEST].status == (
+        NodeRunStatus.FAILED if exceed_output else NodeRunStatus.COMPLETED
+    )
+    if not exceed_output:
+        assert by_type[NodeType.RISK_CLASSIFIER].status == NodeRunStatus.COMPLETED
+        assert by_type[NodeType.APPROVAL].status == NodeRunStatus.WAITING_APPROVAL
+    else:
+        assert by_type[NodeType.APPROVAL].status != NodeRunStatus.WAITING_APPROVAL
 
     record = await application.services.change_sets.get_for_source_node(
         workflow_run_id=run.workflow_run_id,
         source_node_id="write-test",
     )
-    assert record.change_set.status == ChangeSetStatus.PENDING_APPROVAL
+    assert record.change_set.status == (
+        ChangeSetStatus.TEST_FAILED if exceed_output else ChangeSetStatus.PENDING_APPROVAL
+    )
     assert record.change_set.created_files == ["tests/test_agent_hub_demo.py"]
 
     test_artifact_id = by_type[NodeType.TEST].output_artifact_id
@@ -80,8 +102,12 @@ async def test_mock_command_test_reaches_approval_and_restores_shared_repo(
     )
     report = json.loads(content)
     assert metadata.artifact_type == "test_result"
-    assert report["passed"] is True
-    assert report["runner"]["exit_code"] == 0
+    assert report["passed"] is not exceed_output
+    assert report["runner"]["output_limit_exceeded"] is exceed_output
+    if exceed_output:
+        assert report["reasons"] == ["test_output_limit_exceeded"]
+    else:
+        assert report["runner"]["exit_code"] == 0
     assert report["runner"]["timed_out"] is False
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import psutil
@@ -23,17 +24,18 @@ async def test_runner_cancellation_terminates_process_and_propagates(
         "import time\n\ndef test_cancel():\n    time.sleep(30)\n",
         encoding="utf-8",
     )
-    terminated: list[int] = []
-    terminate = test_runner_module._terminate_process_tree
+    started: list[int] = []
+    spawn = test_runner_module.asyncio.create_subprocess_exec
 
-    def record_termination(pid: int) -> None:
-        terminated.append(pid)
-        terminate(pid)
+    async def record_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await spawn(*args, **kwargs)
+        started.append(process.pid)
+        return process
 
     monkeypatch.setattr(
-        test_runner_module,
-        "_terminate_process_tree",
-        record_termination,
+        test_runner_module.asyncio,
+        "create_subprocess_exec",
+        record_spawn,
     )
     runner = SafeTestRunner(CommandGuard(), timeout_seconds=60)
     running = asyncio.create_task(
@@ -49,5 +51,71 @@ async def test_runner_cancellation_terminates_process_and_propagates(
     with pytest.raises(asyncio.CancelledError):
         await running
 
-    assert len(terminated) == 1
-    assert not psutil.pid_exists(terminated[0])
+    assert len(started) == 1
+    assert not psutil.pid_exists(started[0])
+
+
+@pytest.mark.parametrize("boundary", ["spawn", "cleanup"])
+async def test_repeated_cancellation_keeps_process_cleanup_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    entered = asyncio.Event()
+    spawned = asyncio.Event()
+    release = asyncio.Event()
+    processes: list[asyncio.subprocess.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+    original_finish = test_runner_module._finish_process
+
+    async def gated_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await original_spawn(*args, **kwargs)
+        processes.append(process)
+        spawned.set()
+        if boundary == "spawn":
+            entered.set()
+            await release.wait()
+        return process
+
+    async def gated_finish(process, readers, job) -> None:
+        if boundary == "cleanup":
+            entered.set()
+            await release.wait()
+        await original_finish(process, readers, job)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", gated_spawn)
+    monkeypatch.setattr(test_runner_module, "_finish_process", gated_finish)
+    monkeypatch.setattr(
+        SafeTestRunner,
+        "_resolve",
+        staticmethod(lambda _: (sys.executable, ("-c", "import time; time.sleep(30)"))),
+    )
+    runner = SafeTestRunner(CommandGuard(), timeout_seconds=60)
+    running = asyncio.create_task(
+        runner.run(["pytest"], repo=tmp_path, runtime_directory=tmp_path.parent / "runtime")
+    )
+    try:
+        await asyncio.wait_for(spawned.wait(), timeout=10)
+        if boundary == "cleanup":
+            running.cancel()
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        for _ in range(3):
+            running.cancel()
+            await asyncio.sleep(0)
+        assert not running.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=15)
+        assert len(processes) == 1
+        process = processes[0]
+        assert process.returncode is not None
+        assert process._transport.is_closing()
+        assert not psutil.pid_exists(process.pid)
+    finally:
+        release.set()
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            process._transport.close()

@@ -4,13 +4,19 @@
 
 - Owner：OpenCode / MiMo-V2.5-Pro
 - Reviewer：Codex / GPT-5.6 xhigh
-- 状态：ready，资料刷新合入后启动
-- Base：从届时最新 `main` 创建；当前已验证基线为 `dc789dc`
+- 状态：completed；已通过 PR #7 合并，不重复启动
+- Base：`f274f56556b419609b9f084031e65a551261a7e3`
+- Source Head：`eee524181189c2c950354892a46ca4f63ae2a452`
+- Merge：`1f1715dfec0df7370a09c0a825f62203dc114c2d`
 - Branch：`agent/opencode-cli-runner`
 - Worktree：`E:\agent_hub_worktrees\opencode-hub-300`
 - 依赖：HUB-030、HUB-200，均已完成
 
 ## 目标
+
+2026-10-21 状态同步：HUB-300 已合入；以下保留实现要求。HUB-320 只补缺口，HUB-310 接真实 Adapter，HUB-400 最小 Mock API 是当前主任务且不等待 HUB-310。先读 [修正确认](../handoffs/2026-09-20-course-correction.md)。
+
+遗留 P2：`adapters/cli/runner.py` 使用不存在的 `proc.transport.close()` 且抑制异常，Linux Python 3.11/3.12 CI 曾出现 transport 析构时 `Event loop is closed` 警告。由 Runner Owner 在后续修改中修复并补生命周期回归；本次 TestRunner 纠偏集成不跨改 `adapters/**`。
 
 实现与具体 Agent 无关的 `CliAgentSpec` 和 `CliAgentRunner`，提供固定 argv、
 binary 身份复核、JSON Lines 增量解析、有界输出、最小环境以及 timeout/cancel
@@ -51,8 +57,8 @@ Planner/Executor Adapter 或 Console 持久化。
 6. JSON Lines 从原始 bytes 增量解码；解析与脱敏分离。未知事件可作为已脱敏的
    bounded event 交给调用方，坏行产生明确错误但不得泄漏原始内容或破坏后续行。
 7. timeout、显式取消、输出超限和异常退出均返回稳定 error code，并终止整个进程树。
-   Windows 使用新 process group 与 psutil 递归回收；POSIX 使用独立 process group，
-   先 TERM、后 KILL，并有界 wait。
+   Windows 使用 suspended spawn、Job 绑定和 resume 前镜像核验；POSIX 使用独立
+   process group，先 TERM、后 KILL，并有界 wait。主动 setsid() 逃逸的宿主隔离仍由 HUB-330 审查。
 8. 传输层返回受限的 `CliRunResult`/事件，不伪造 `ChangeSet`；HUB-310 再将结果映射为
    `AgentResult`，文件变更仍只信任 Master 的 `WorkspaceTransaction`。
 9. 不执行真实 OpenCode，不读取真实凭据，不产生模型调用费用。真实 OpenCode smoke
@@ -76,17 +82,20 @@ HUB-320 将在接口稳定后独立补充 fake CLI 和故障注入矩阵；HUB-3
 E:\agent_hub_graph\.venv\Scripts\python.exe -m pytest tests/adapters -q
 E:\agent_hub_graph\.venv\Scripts\python.exe -m ruff check adapters tests/adapters
 E:\agent_hub_graph\.venv\Scripts\python.exe -m ruff format --check adapters tests/adapters
-E:\agent_hub_graph\.venv\Scripts\python.exe -m pytest
 ```
+
+完整 pytest 留在最终集成复验；局部修补先跑上述相关检查，按实际风险补测试，不机械重跑所有前后端门禁。
 
 - 不修改冻结协议或其他 Owner 文件。
 - `git diff --check` 通过，工作区只含任务内文件。
-- 单次提交：`feat(HUB-300): add generic cli agent runner`。
+- 保留现有提交；必要修复追加清晰提交，不为了单次提交重写历史。
 - 不自行 push/merge；交付时报告 base、commit、文件、测试、skip 和残余风险。
 
-## 给 OpenCode 的启动指令
+## 后续维护
+
+任务已合入；后续维护从最新 `main` 建独立分支，不把旧 worktree 当新任务基线。
 
 先读取本任务书、`agent-hub-development-plan.md` 第 20 节、
 `agent-hub-task-allocation.md`、HUB-030 manifest/兼容性报告和现有 Adapter 接口。
-先回报实际 base、分支、worktree 与 owned-path 检查，再开始实现。若任务书与冻结协议
+先回报实际 base、分支、worktree 与 owned-path 检查，再开始必要修补。若任务书与冻结协议
 或生产代码冲突，立即 fail closed 并报告，不通过放宽安全约束解决。

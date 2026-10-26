@@ -47,7 +47,7 @@ flowchart LR
 
 ## 当前进度
 
-截至 2026-08-13，阶段 0、阶段 1 和阶段 2 均已完成；`HUB-200`、`HUB-210` 与 `HUB-220` 已通过独立复审并合入 `main`：
+截至 2026-10-21，阶段 0、阶段 1 和阶段 2 均已完成；HUB-300 也已通过 PR #7 合入 `main@1f1715d`：
 
 | 任务 | 状态 | 内容 |
 |---|---|---|
@@ -62,13 +62,14 @@ flowchart LR
 | `HUB-200` | 已完成 | Session 独立 clone、canonical WorkspaceTransaction、ChangeSet 持久化、Guard/Test NodeHandler 与安全恢复链 |
 | `HUB-210` | 已完成 | Approval、Capability、Merge、取消线性化与 RecoveryManager |
 | `HUB-220` | 已完成 | 路径、租约、测试污染、审批冲突和崩溃恢复的系统化故障注入；Phase A/B 与 Linux CI 已通过 |
+| `HUB-300` | 已完成 | 通用 CLI Runner、固定 argv、JSONL、可执行文件绑定、输出脱敏与进程回收；PR #7 已合并 |
 
-当前已集成 `11/25` 个任务。最小可写 demo 仍缺少以下关键路径：
+当前已集成 `12/25` 个任务。最小可写 demo 仍缺少以下关键路径：
 
 - OpenCode 真实执行 Adapter；
 - FastAPI 业务 API 与完整 React Flow GUI。
 
-任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。阶段 2 gate 已关闭，当前从最新 `main` 准备 `HUB-300`；后续按 `HUB-320 -> HUB-310 -> HUB-330 -> HUB-400` 排队。
+任务状态和 Owner 以 [开发任务看板](agent-hub-task-allocation.md) 为准。按 [接手修正](development-tasks/handoffs/2026-09-20-course-correction.md)，下一项主任务优先 HUB-400 最小 API 切片，先接 Mock，不等待 HUB-310 或整个阶段 3。下一里程碑是简单图、执行、diff 和审批的最小可操作闭环。
 
 ## 技术栈
 
@@ -138,6 +139,15 @@ npm run dev
 当前前端仍是契约与图 fixture 基线，完整工作流编辑体验将在后续阶段实现。
 
 ## 验证
+
+开发期先运行受影响范围，复用现有环境。例如本轮进程与输出修正：
+
+```powershell
+.venv\Scripts\python.exe -m ruff check security tests/security
+.venv\Scripts\python.exe -m pytest tests/security/test_test_runner.py tests/security/test_test_runner_cancellation.py tests/security/test_test_runner_lifecycle.py
+```
+
+下面的完整入口用于最终集成/发布复验，会重建环境；不要求每次小改动执行。
 
 Windows PowerShell 下运行完整本地 CI：
 

@@ -471,6 +471,8 @@ class TestNodeHandler(_ChangeSetHandler):
                     raise operation_error
                 return None, (f"test_runner_error:{type(operation_error).__name__}",)
         assert result is not None
+        if result.output_limit_exceeded:
+            return result, ("test_output_limit_exceeded",)
         if result.timed_out:
             return result, ("test_timeout",)
         if result.exit_code != 0:

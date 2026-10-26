@@ -268,6 +268,133 @@ async def test_concurrent_initializers_share_one_migration_lock(
     assert {"available", "auto_assignable", "unavailable_reason"} <= columns
 
 
+@pytest.mark.parametrize("operation", ["initialize", "connect"])
+async def test_wal_setup_retries_transient_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    original_execute = aiosqlite.Connection.execute
+    attempts = 0
+
+    async def execute(connection, query, parameters=()):
+        nonlocal attempts
+        if query == "PRAGMA journal_mode=WAL":
+            attempts += 1
+            if attempts == 1:
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+        return await original_execute(connection, query, parameters)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+    database = Database(tmp_path / "transient-wal.db")
+    if operation == "initialize":
+        assert await database.initialize() == SCHEMA_VERSION
+    else:
+        connection = await database.connect()
+        await connection.close()
+    assert attempts == 2
+    with sqlite3.connect(database.path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+async def test_wal_setup_busy_timeout_is_bounded_and_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "held-wal.db", busy_timeout_ms=50)
+    holder = sqlite3.connect(database.path, isolation_level=None)
+    holder.execute("CREATE TABLE held(value INTEGER)")
+    holder.execute("BEGIN IMMEDIATE")
+    connections: list[aiosqlite.Connection] = []
+    original_connect = aiosqlite.connect
+
+    async def connect(*args, **kwargs):
+        connection = await original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(aiosqlite, "connect", connect)
+    started = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            await database.connect()
+        assert asyncio.get_running_loop().time() - started < 2
+        assert len(connections) == 1
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        holder.rollback()
+        holder.close()
+        for connection in connections:
+            await connection.close()
+    assert await database.initialize() == SCHEMA_VERSION
+
+
+async def test_wal_setup_non_busy_error_propagates_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_execute = aiosqlite.Connection.execute
+    attempts = 0
+    connections: list[aiosqlite.Connection] = []
+
+    async def execute(connection, query, parameters=()):
+        nonlocal attempts
+        if query == "PRAGMA journal_mode=WAL":
+            connections.append(connection)
+            attempts += 1
+            error = sqlite3.OperationalError("injected disk I/O error")
+            error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise error
+        return await original_execute(connection, query, parameters)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            await Database(tmp_path / "io-error.db").connect()
+        assert attempts == 1
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        for connection in connections:
+            await connection.close()
+
+
+async def test_wal_setup_cancellation_closes_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_execute = aiosqlite.Connection.execute
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    connections: list[aiosqlite.Connection] = []
+
+    async def execute(connection, query, parameters=()):
+        if query == "PRAGMA journal_mode=WAL":
+            connections.append(connection)
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+        return await original_execute(connection, query, parameters)
+
+    async def sleep(_delay):
+        waiting.set()
+        await release.wait()
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    running = asyncio.create_task(Database(tmp_path / "cancel-wal.db").connect())
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=2)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        with pytest.raises(ValueError, match="no active connection"):
+            await connections[0].execute("SELECT 1")
+    finally:
+        release.set()
+        await asyncio.gather(running, return_exceptions=True)
+        for connection in connections:
+            await connection.close()
+
+
 async def test_newer_schema_fails_before_applying_v1(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     connection = sqlite3.connect(path)

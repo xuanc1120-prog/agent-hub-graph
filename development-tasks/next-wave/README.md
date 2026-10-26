@@ -1,39 +1,28 @@
-# 当前开发波次
+# 当前开发波次（2026-10-21 同步）
 
-## 基线
+接手先读 [修正确认与交接](../handoffs/2026-09-20-course-correction.md)。历史简报只保留证据，不能覆盖本页的当前状态。
 
-- 集成分支：`main`
-- 冻结协议：`contracts-frozen-v1`
-- 当前已完成：`HUB-000/010/020/030/100/110/120/130/200/210/220`
-- 当前待启动任务：`HUB-300`
-- 当前任务基线：`main@dc789dc` 或本次资料刷新后的更新后继提交
-- 后续队列：`HUB-320 -> HUB-310 -> HUB-330 -> HUB-400`
-- 阶段 1：CLI/Mock gate 已通过
-- 阶段 2：`3/3`，安全链、审批与恢复 gate 已通过
-- Agent 不直接 merge 或 push
+## 基线与事实
 
-## 当前分配
+- 已集成：HUB-000/010/020/030/100/110/120/130/200/210/220/300；冻结协议 `contracts-frozen-v1`。
+- 本轮修正起点：`main@f274f56`。实际提交/集成状态以 Git 为准，不能把工作区改动当成已发布。
+- HUB-300 已通过 PR #7 合入 `main@1f1715d`，源 head `eee5241`，base `f274f56`；历史 worktree `E:/agent_hub_worktrees/opencode-hub-300` 不用于重复开发。
+- 当前会话只集成遗留修复与纠偏资料；HUB-400 由用户另开的 Codex 会话承接，从包含本次修复的最新 `main` 创建独立 worktree。
+- 阶段 1/2 历史 gate 保持关闭；本轮是增量维护，不重开旧审查。
 
-| 任务 | Agent | 状态 | 分支 | Worktree | 简报 |
-|---|---|---|---|---|---|
-| `HUB-210` | Codex + GPT-5.6 xhigh | completed | `codex/hub-210-approval-recovery` | historical | 已通过 PR #3 合入最新 `main` |
-| `HUB-220` | Hermes + MiMo-V2.5-Pro | completed | `agent/hermes-security-fault-injection` | historical | PR #4 合入实现，PR #5 合入阶段收尾资料 |
-| `HUB-300` | OpenCode + MiMo-V2.5-Pro | ready | `agent/opencode-cli-runner`（计划） | `E:\agent_hub_worktrees\opencode-hub-300`（待资料合入后创建） | [HUB-300-opencode.md](HUB-300-opencode.md) |
-| `HUB-400` | Codex + GPT-5.6 xhigh | queued | `codex/hub-400-api`（保留名） | 尚不创建 | [HUB-400-codex.md](HUB-400-codex.md) |
-| `HUB-200` | Codex + GPT-5.6 xhigh | completed | `codex/hub-200-workspace-security` | historical | [HUB-200-codex.md](HUB-200-codex.md) |
-| `HUB-130` | Hermes + MiMo-V2.5-Pro | completed | `agent/hermes-context-artifacts` | historical | [HUB-130-hermes.md](HUB-130-hermes.md) |
-| `HUB-110` | Codex + GPT-5.6 xhigh | completed | `codex/hub-110-review-fixes` | historical | [HUB-110-codex.md](HUB-110-codex.md) |
+## 下一里程碑
 
-HUB-110/HUB-130/HUB-200 的历史简报和交接提示词保留为任务证据，不再用于继续开发。
+在测试仓库完成：创建简单图 → 编辑/确认 → 执行 → 查看 diff → 批准或拒绝。先用 Mock 验证 API/UI，再接一个真实 Adapter。既有工作区、审批、凭据与命令安全边界保持有效。
 
-## 当前执行顺序
+| 任务 | 当前安排 | 简报 |
+|---|---|---|
+| HUB-300 | completed，PR #7 已合并；进程 transport 清理 P2 留给 Runner Owner 后续处理 | [Runner](HUB-300-opencode.md) |
+| HUB-400 | 下一项主任务，用户另开会话实施；修正集成后先接 Mock，不等 HUB-310 | [API](HUB-400-codex.md) |
+| HUB-410 | 在可用 API 上提供最小图编辑、执行、diff 和审批入口 | 总任务看板 |
+| HUB-320/310/330 | 按缺口补测，接一个真实 Adapter，审查真实执行边界 | 总任务看板 |
 
-1. 本次资料刷新合入后，基于最新 `main` 为 HUB-300 创建独立 branch/worktree，并在任务书记录实际 base commit。
-2. 实现并审查 CliAgentSpec/CliAgentRunner、固定 argv、JSONL、timeout/cancel 和进程树回收。
-3. HUB-300 接口稳定后启动 HUB-320 fake CLI 与异常注入测试，再进入 HUB-310 OpenCode Adapter 和 HUB-330 安全门禁。
-4. HUB-400 已准备任务边界，但保持 queued；只有看板推进到该任务时才从届时最新 `main` 创建 worktree。
+按人力顺序或并行推进，不强制创建多个 Agent。WebSocket 完整续传、全操作面板、移动端精修后置，不阻塞首次闭环。
 
-HUB-200/210/220 均已完成独立复审并合入 `main`。HUB-220 的 Phase A/B、
-Linux PR gate 与合并后的 `main@dc789dc` CI 均通过，阶段 2 gate 正式关闭。
+## 交付规则
 
-历史上的 `agent/*` worktree 基于旧任务提交，只作为任务证据，不能直接用于新开发。新任务必须从最新 `main` 创建 task-specific branch/worktree，并在交付报告中记录实际 base commit。
+记录 actual base/head、已改路径、实际验证、未完成项和下一步。尚未验证明确写未验证；不能把“测试通过”扩写成“整个产品可用”。允许必要的修复提交；Agent 不自行 push/merge。针对性测试通过后不无理由重复扩大门禁。

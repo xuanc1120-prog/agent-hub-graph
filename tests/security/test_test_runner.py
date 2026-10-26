@@ -33,7 +33,7 @@ async def test_runner_uses_minimal_environment_and_bounded_output(
         encoding="utf-8",
     )
     monkeypatch.setenv("AGENT_HUB_DEMO_TOKEN", "must-not-reach-child")
-    runner = SafeTestRunner(CommandGuard(), timeout_seconds=30, max_output_bytes=64)
+    runner = SafeTestRunner(CommandGuard(), timeout_seconds=30, max_output_bytes=4096)
 
     result = await runner.run(
         ["pytest", "-q", "tests/test_environment.py"],
@@ -42,13 +42,13 @@ async def test_runner_uses_minimal_environment_and_bounded_output(
     )
 
     assert result.passed
-    assert result.output_truncated
+    assert not result.output_limit_exceeded
     assert "must-not-reach-child" not in result.output
-    assert len(result.output.encode("utf-8")) <= 64
+    assert len(result.output.encode("utf-8")) <= 4096
 
 
 @pytest.mark.asyncio
-async def test_runner_times_out_and_reaps_process_tree(tmp_path: Path) -> None:
+async def test_runner_reports_timeout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     tests = repo / "tests"
     tests.mkdir(parents=True)

@@ -18,23 +18,26 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 3. 每个任务使用从最新 `main` 创建的独立 branch/worktree；历史 worktree 只保留任务证据，不能作为新任务基线。
 4. 同一文件只能有一个 Owner；Reviewer 只提交审查意见，不直接抢改 Owner 文件。
 5. 每个任务必须携带 base commit、允许路径、验收标准和测试命令。
-6. 每个任务一个提交，格式：`type(HUB-xxx): summary`。Agent 不直接 merge 或 push。
+6. 每个任务保留清晰的提交边界，允许必要修复提交，格式：`type(HUB-xxx): summary`。Agent 不直接 merge 或 push；不为凑单次提交改写他人历史。
 7. 任务完成时输出：修改文件、测试结果、残余风险、建议后续任务。
 8. 协议变更必须先提交 ADR，由 Claude Code 提案、Codex 确认后才能修改冻结模型。
 
 ## 3. 阶段任务
 
-### 当前执行看板（2026-08-23）
+### 当前执行看板（2026-10-21 同步）
+
+接手先读 [修正确认与交接](development-tasks/handoffs/2026-09-20-course-correction.md)。完整任务总表保留为路线图，不是首次 Demo 必须一次完成的清单。
 
 | 状态 | 任务 |
 |---|---|
-| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210`、`HUB-220` |
-| ready | `HUB-300`：阶段 2 gate 已通过；文档刷新合入后，从最新 `main` 建立独立 branch/worktree |
-| queued | `HUB-320 -> HUB-310 -> HUB-330 -> HUB-400`：按当前任务队列依次启动，不因依赖已满足而提前开工 |
+| completed | `HUB-000`、`HUB-010`、`HUB-020`、`HUB-030`、`HUB-100`、`HUB-110`、`HUB-120`、`HUB-130`、`HUB-200`、`HUB-210`、`HUB-220`、`HUB-300`（PR #7，merge `1f1715d`，源 head `eee5241`） |
+| review / integration pending | 遗留 TestRunner 生命周期/输出修复与纠偏资料已提交并推送至 `codex/integrate-course-correction`；独立复审及合入 main 待完成，新任务集成基线须包含这些修复 |
+| next primary task | `HUB-400` 最小 API 切片由用户另开的 Codex 会话实施；先接 Mock，不等待 HUB-310；HUB-410 随实际可用接口接最小 GUI |
+| independent follow-up | OpenCode：HUB-310 真实 Adapter；Hermes：HUB-320 按缺口补测，随后接 HUB-430 最小 API 验收；HUB-330 在真实执行入口启用前审查 |
 
-当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `3/3`，总任务已集成为 `11/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-210` 已通过 PR #3 合入 `b5ee36e`；`HUB-220` 已通过 PR #4 合入 `540b57f`，收尾文档已通过 PR #5 合入 `dc789dc`。`main@dc789dc` 的 CI 已通过。
+当前进度：阶段 0 为 `4/4`，阶段 1 为 `4/4`，阶段 2 为 `3/3`，总任务已集成为 `12/25`。`HUB-200` 的最终独立复审结论为无 P0/P1/P2，源提交 `0e82e694` 已通过 merge commit `d9d60ddd` 合入 `main`；`HUB-210` 已通过 PR #3 合入 `b5ee36e`；`HUB-220` 已通过 PR #4 合入 `540b57f`，收尾文档已通过 PR #5 合入 `dc789dc`。HUB-300 已通过 PR #7 合入 `1f1715d`，源 head `eee5241` 的 Python 3.11/3.12/3.13 与前端 CI 均通过。
 
-协议冻结点为 `contracts-frozen-v1`。`HUB-210 -> HUB-220 Phase B -> 阶段 2 gate` 已全部完成，当前执行顺序从 `HUB-300` 开始。`HUB-400` 虽已满足依赖，但仍按看板排在阶段 3 任务之后，不与 HUB-300 强制并行。`main` 只用于已审查任务的最终集成。
+协议冻结点为 `contracts-frozen-v1`。阶段 2 历史 gate 保持关闭；本轮修正是增量维护，不重开旧审查。下一里程碑为“选择测试仓库 → 简单图 → 执行 → diff → 批准/拒绝”，可先 Mock 再接一个真实 Agent。API/UI 与 Adapter 按人力顺序或并行推进，不强制并行，也不设无依赖的硬等待。完整恢复面板、WebSocket 续传、移动端精修后置。`12/25` 只表示已集成任务数，不表示产品可用度。
 
 ### 阶段 0：基线与契约
 
@@ -117,7 +120,14 @@ Claude Opus 4.8 固定配置到 Claude Code。Codex 是 integration owner，只�
 | OpenCode | `adapters/`、`console/console_manager.py`、`console/console_stream.py`、`console/streaming_redactor.py`、`console/console_repository.py` |
 | Hermes | `context/`（不含 `planner_bundle.py`）、`storage/artifact_store.py`、`storage/artifact_repository.py`、`storage/event_registry.py`、`storage/event_repository.py`、`tests/fixtures/`、CI、测试报告和使用文档 |
 
-`console/approval_manager.py` 属于 Codex。跨 Owner 修改必须拆成接口提案和 Owner 实现两个任务。
+`workflow/approval_manager.py` 属于 Codex。协议、安全语义或并发事务边界变更先记录接口影响；小型跨模块修复可由集成负责人在同一任务协调完成，列明涉及路径，不强制拆成两个任务。本轮用户已授权 Codex 修复审阅中确认的问题。
+
+### 开发期验收分层
+
+- 文档：检查状态、链接及 diff，不重建环境或跑全量测试。
+- 普通代码：相关 lint/format、受影响行为测试，不要求待开发功能提前通过验收。
+- 文件写入、审批、凭据、进程生命周期：增加直接覆盖改动边界的负向测试，保留关键回归。
+- 合并/发布：使用完整 CI；按实际支持范围验证跨平台兼容性。历史“无 P0/P1/P2”只代表当次审阅，不是每个开发任务的零缺陷承诺。
 
 ## 5. 任务交付模板
 
