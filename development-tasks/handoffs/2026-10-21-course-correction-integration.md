@@ -38,8 +38,16 @@
 - Python 锁文件由 uv 定向升级并重新生成 hashes，其余 Python 包版本保持不变；前端仍保留 Vite 8 / Vitest 4 主版本，将 manifest 修复下限提高到 Vite `^8.3.5`、Vitest `^4.1.12`。未修改 UI 源码或审计阈值。filelock 的 major 升级是修复公告指定版本，需在完整 CI 中验证。
 - 修复依据包括 [source-map-js 公告](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)、[Vite/launch-editor 公告](https://github.com/advisories/GHSA-698v-4r3x-3vcv) 及 CI 输出的 Python 安全公告。
 - 更新后的本地 pip-audit --strict：`No known vulnerabilities found`。前端中间版本 Vite 8.3.5 / Vitest 4.1.11 的 lint、Vitest `7 passed`、production build 通过。
-- 此后将 Vitest/mocker 补到 4.1.12，一并关闭 [手动 mock 注册注入](https://github.com/advisories/GHSA-qxg6-89mg-rqv8) 和 [Windows mock 路径检查绕过](https://github.com/advisories/GHSA-xp26-3454-mjgp)；最终锁文件 npm audit 报告 `found 0 vulnerabilities`。实际安装版本和前端回归仍须按最终锁文件干净安装后复验，不能把中间版本结果算为最终补丁已通过。
+- 此后将 Vitest/mocker 补到 4.1.12，一并关闭 [手动 mock 注册注入](https://github.com/advisories/GHSA-qxg6-89mg-rqv8) 和 [Windows mock 路径检查绕过](https://github.com/advisories/GHSA-xp26-3454-mjgp)；干净 npm ci 后核对实际 Vitest/mocker 均为 4.1.12，lint、Vitest `7 passed`、production build 通过，最终 npm audit 报告 `found 0 vulnerabilities`。
 - 完整矩阵与 Playwright 以依赖更新后当前 Head 的 PR CI 为准；尚未获得独立复审批准。
+
+## 2026-10-26 CI 复现的 WAL 初始化竞争
+
+- 依赖更新提交 `ef40b3f` 的 run `40288565790` 中，Python 3.11 在 `test_concurrent_initializers_share_one_migration_lock[fresh]` 失败：迁移提交后的 `PRAGMA journal_mode=WAL` 与另一个初始化者竞争，返回 `SQLITE_BUSY`。Python 3.12 完整 job 通过；3.13 测试与审计步骤成功，但 job 被 fail-fast 标记取消，不能计为完整通过。
+- 仅针对这个实际失败点补修：连接配置和迁移后 WAL 设置共用有界重试，仅重试 SQLite 的 `SQLITE_BUSY` 主错误码；其他 SQL 错误直接传播，未成功切到 WAL 时拒绝继续。连接配置失败/取消时关闭未交付的连接；`BEGIN IMMEDIATE`、迁移事务、CAS 与 fencing 校验未改变。
+- 新增 5 个回归实例：初始化/普通连接的瞬时 busy 恢复、真实持锁导致的有界失败、非 busy 错误不重试、取消等待后关闭连接。修复前选择的 4 个实例均失败，修复后数据库测试 `17 passed`；既有 fresh/v1 并发初始化测试额外独立运行 10 轮，20 项全部通过。
+- 数据库、lease、基础 Repository 与 idempotency 组合回归：`33 passed`；Ruff check/format、compileall、diff-check 通过。
+- WAL 设置必须位于事务外，相关行为参考 [SQLite WAL 文档](https://sqlite.org/wal.html)；本次没有重开历史存储全局审计或变更 schema。
 
 ## HUB-400 新会话接手
 

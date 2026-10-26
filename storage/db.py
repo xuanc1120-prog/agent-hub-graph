@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -122,13 +123,43 @@ class Database:
             "PRAGMA foreign_keys=ON",
             f"PRAGMA busy_timeout={self.busy_timeout_ms}",
         ]
-        if configure_journal_mode:
-            statements.append("PRAGMA journal_mode=WAL")
-        for statement in statements:
-            cursor = await connection.execute(statement)
-            await cursor.fetchone()
-            await cursor.close()
+        try:
+            for statement in statements:
+                cursor = await connection.execute(statement)
+                try:
+                    await cursor.fetchone()
+                finally:
+                    await cursor.close()
+            if configure_journal_mode:
+                await self._enable_wal(connection)
+        except BaseException:
+            await connection.close()
+            raise
         return connection
+
+    async def _enable_wal(self, connection: aiosqlite.Connection) -> None:
+        # WAL selection must run outside the migration transaction. A second
+        # initializer can acquire BEGIN IMMEDIATE after our commit, and SQLite
+        # may return SQLITE_BUSY here without invoking its busy handler.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.busy_timeout_ms / 1_000
+        while True:
+            try:
+                cursor = await connection.execute("PRAGMA journal_mode=WAL")
+                try:
+                    row = await cursor.fetchone()
+                finally:
+                    await cursor.close()
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                remaining = deadline - loop.time()
+                if code != sqlite3.SQLITE_BUSY or remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.01, remaining))
+                continue
+            if row is None or str(row[0]).lower() != "wal":
+                raise sqlite3.OperationalError("SQLite did not enable WAL mode")
+            return
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -213,9 +244,7 @@ class Database:
                 raise
             else:
                 await connection.commit()
-                cursor = await connection.execute("PRAGMA journal_mode=WAL")
-                await cursor.fetchone()
-                await cursor.close()
+                await self._enable_wal(connection)
         return version
 
     @staticmethod
