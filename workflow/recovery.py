@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import UTC, datetime
@@ -256,7 +257,7 @@ class RecoveryManager:
                                 if orphan_reason is None:
                                     change_set_id = change_set.change_set.change_set_id
                                     repo = Path(session.shared_repo_path)
-                                    state = self._git.state(repo)
+                                    state = await asyncio.to_thread(self._git.state, repo)
                                     held.assert_healthy()
                                     if state.commit == run.current_commit and not state.dirty:
                                         result = await self._runs.clear_merge_finalizing(
@@ -273,16 +274,27 @@ class RecoveryManager:
                                         _stored, patch = await self._change_sets.load_patch(
                                             change_set_id
                                         )
-                                        expected_tree = self._git.canonical_patch_tree(
+                                        expected_tree = await asyncio.to_thread(
+                                            self._git.canonical_patch_tree,
                                             repo,
                                             parent_commit=change_set.change_set.base_commit,
                                             patch_bytes=patch,
                                         )
-                                        metadata = self._git.read_commit_metadata(
-                                            repo, state.commit
+                                        metadata = await asyncio.to_thread(
+                                            self._git.read_commit_metadata,
+                                            repo,
+                                            state.commit,
                                         )
-                                        tree = self._git.commit_tree(repo, state.commit)
-                                        parent = self._git.commit_parent(repo, state.commit)
+                                        tree = await asyncio.to_thread(
+                                            self._git.commit_tree,
+                                            repo,
+                                            state.commit,
+                                        )
+                                        parent = await asyncio.to_thread(
+                                            self._git.commit_parent,
+                                            repo,
+                                            state.commit,
+                                        )
                                         expected = {
                                             "Agent-Hub-Session": run.session_id,
                                             "Agent-Hub-Workflow-Run": run.workflow_run_id,

@@ -341,54 +341,76 @@ async def _serve_application(settings: Settings, *, host: str, port: int) -> Non
     runtime_settings = Settings.model_validate(runtime_values)
     service = WorkflowApplication(runtime_settings)
     await service.initialize()
+    api_token = secrets.token_urlsafe(32)
+    application = create_app(
+        runtime_settings,
+        workflow_application=service,
+        master_lease=None,
+        api_token=api_token,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            application,
+            host=resolved_host,
+            port=port,
+            workers=1,
+            proxy_headers=False,
+            access_log=False,
+        )
+    )
     leases = service.services.leases
     lease = await leases.acquire(
         instance_id=f"master-{uuid.uuid4().hex}",
         process_id=os.getpid(),
         ttl_seconds=runtime_settings.master_lease_ttl_seconds,
     )
+    application.state.master_lease = lease
     scheduler_stop = asyncio.Event()
     heartbeat: asyncio.Task[None] | None = None
     scheduler: asyncio.Task[None] | None = None
-    server: uvicorn.Server | None = None
+    startup: asyncio.Task[None] | None = None
     try:
-        await service.register_mock_agent()
-        await service.services.recovery.recover(lease=lease)
-        api_token = secrets.token_urlsafe(32)
-        server = uvicorn.Server(
-            uvicorn.Config(
-                create_app(
-                    runtime_settings,
-                    workflow_application=service,
-                    master_lease=lease,
-                    api_token=api_token,
-                ),
-                host=resolved_host,
-                port=port,
-                workers=1,
-                proxy_headers=False,
-                access_log=False,
-            )
-        )
-        typer.echo(f"Agent Hub API bearer token (shown once): {api_token}", err=True)
         heartbeat = asyncio.create_task(
             _heartbeat_master_lease(leases, lease, runtime_settings, server)
         )
+        startup = asyncio.create_task(_initialize_runtime(service, lease))
+        await _await_startup_with_heartbeat(startup, heartbeat)
+        typer.echo(f"Agent Hub API bearer token (shown once): {api_token}", err=True)
         scheduler = asyncio.create_task(_poll_scheduler(service, lease, scheduler_stop, server))
         await server.serve()
     finally:
-        if server is not None:
-            server.should_exit = True
+        server.should_exit = True
         scheduler_stop.set()
         if heartbeat is not None and not heartbeat.done():
             heartbeat.cancel()
-        background_tasks = [task for task in (heartbeat, scheduler) if task is not None]
+        if startup is not None and not startup.done():
+            startup.cancel()
+        background_tasks = [task for task in (heartbeat, scheduler, startup) if task is not None]
         background_results = await asyncio.gather(*background_tasks, return_exceptions=True)
         with suppress(LeaseLost):
             await leases.release(lease)
     for result in background_results:
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             raise result
+
+
+async def _initialize_runtime(service: WorkflowApplication, lease: MasterLease) -> None:
+    await service.register_mock_agent()
+    await service.services.recovery.recover(lease=lease)
+
+
+async def _await_startup_with_heartbeat(
+    startup: asyncio.Task[None],
+    heartbeat: asyncio.Task[None],
+) -> None:
+    done, _pending = await asyncio.wait(
+        (startup, heartbeat),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if heartbeat in done:
+        await heartbeat
+        raise RuntimeError("Master heartbeat stopped during startup.")
+    await startup
 
 
 async def _poll_scheduler(

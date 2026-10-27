@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import TypeVar
 
 from pydantic import TypeAdapter
 
@@ -86,6 +87,23 @@ from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
 
 _ENTITY_ID = TypeAdapter(EntityId)
+_T = TypeVar("_T")
+
+
+async def _settle_task(task: asyncio.Task[_T]) -> tuple[_T | None, BaseException | None]:
+    """Wait for an owned worker despite repeated cancellation of its caller."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    try:
+        return task.result(), None
+    except BaseException as error:
+        return None, error
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +157,7 @@ class RuntimeServices:
 class WorkflowApplication:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._session_io_slots = asyncio.Semaphore(2)
         self.services = _build_services(settings)
         self.services.scheduler.set_planner_handler(self._execute_queued_plan)
 
@@ -261,6 +280,47 @@ class WorkflowApplication:
             integration_head_commit=state.commit,
         )
 
+    async def prepare_session_in_worker(
+        self,
+        *,
+        repo: Path,
+        goal: str,
+        session_id: str | None = None,
+    ) -> NewSession:
+        """Run blocking repository preparation without stalling the event loop.
+
+        If the request is cancelled, retain ownership until the worker finishes,
+        then remove any prepared clone before propagating cancellation.
+        """
+
+        async with self._session_io_slots:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self.prepare_session,
+                    repo=repo,
+                    goal=goal,
+                    session_id=session_id,
+                )
+            )
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError as cancellation:
+                prepared, worker_error = await _settle_task(worker)
+                if worker_error is None and prepared is not None:
+                    cleanup = asyncio.create_task(
+                        asyncio.to_thread(self.discard_prepared_session, prepared)
+                    )
+                    _discarded, cleanup_error = await _settle_task(cleanup)
+                    if cleanup_error is not None:
+                        cancellation.add_note(
+                            f"cancelled session preparation cleanup failed: {cleanup_error!r}"
+                        )
+                elif worker_error is not None:
+                    cancellation.add_note(
+                        f"cancelled session preparation worker failed: {worker_error!r}"
+                    )
+                raise
+
     async def persist_prepared_session(
         self,
         transaction: Transaction,
@@ -274,6 +334,17 @@ class WorkflowApplication:
             allowed_root=self.services.paths.shared_workspaces,
         )
 
+    async def discard_prepared_session_in_worker(self, prepared: NewSession) -> None:
+        async with self._session_io_slots:
+            worker = asyncio.create_task(asyncio.to_thread(self.discard_prepared_session, prepared))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as cancellation:
+                _discarded, worker_error = await _settle_task(worker)
+                if worker_error is not None:
+                    cancellation.add_note(f"session clone cleanup failed: {worker_error!r}")
+                raise
+
     async def create_session(
         self,
         *,
@@ -281,13 +352,17 @@ class WorkflowApplication:
         goal: str,
         session_id: str | None = None,
     ) -> SessionRecord:
-        prepared = self.prepare_session(repo=repo, goal=goal, session_id=session_id)
+        prepared = await self.prepare_session_in_worker(
+            repo=repo,
+            goal=goal,
+            session_id=session_id,
+        )
         try:
             async with self.services.database.immediate_transaction() as transaction:
                 return await self.persist_prepared_session(transaction, prepared)
         except BaseException as operation_error:
             try:
-                self.discard_prepared_session(prepared)
+                await self.discard_prepared_session_in_worker(prepared)
             except Exception as cleanup_error:
                 operation_error.add_note(f"session clone cleanup failed: {cleanup_error!r}")
             raise

@@ -85,7 +85,7 @@ class ApiBoundaryMiddleware:
             value for key, value in scope.get("headers", ()) if key.lower() == b"content-length"
         ]
         if len(content_lengths) > 1:
-            await _json_error(400, "invalid_content_length", "Invalid request framing.")
+            await _json_error(send, 400, "invalid_content_length", "Invalid request framing.")
             return
         if content_lengths:
             try:
@@ -93,13 +93,15 @@ class ApiBoundaryMiddleware:
                     raise ValueError
                 declared_length = int(content_lengths[0])
             except ValueError:
-                await _json_error(400, "invalid_content_length", "Invalid request framing.")
+                await _json_error(send, 400, "invalid_content_length", "Invalid request framing.")
                 return
             if declared_length < 0:
-                await _json_error(400, "invalid_content_length", "Invalid request framing.")
+                await _json_error(send, 400, "invalid_content_length", "Invalid request framing.")
                 return
             if declared_length > self.max_body_bytes:
-                await _json_error(413, "request_body_too_large", "Request body exceeds the limit.")
+                await _json_error(
+                    send, 413, "request_body_too_large", "Request body exceeds the limit."
+                )
                 return
 
         buffered: list[Message] = []

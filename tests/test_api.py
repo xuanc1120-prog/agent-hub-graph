@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.cli import _heartbeat_master_lease
 from app.config import Settings
 from app.main import create_app
 from app.services import WorkflowApplication
@@ -400,6 +405,170 @@ async def test_actual_streamed_body_limit_without_content_length(tmp_path: Path)
 
     assert sent[0]["status"] == 413
     assert json.loads(sent[1]["body"])["error"]["code"] == "request_body_too_large"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_lengths", "body", "expected_status", "expected_code"),
+    [
+        (
+            [(b"content-length", b"12"), (b"content-length", b"12")],
+            b"",
+            400,
+            "invalid_content_length",
+        ),
+        ([(b"content-length", b"12x")], b"", 400, "invalid_content_length"),
+        ([(b"content-length", b"-1")], b"", 400, "invalid_content_length"),
+        ([(b"content-length", b"1025")], b"", 413, "request_body_too_large"),
+        ([(b"content-length", b"1024")], b"x" * 1024, 404, None),
+    ],
+)
+async def test_content_length_framing_errors_are_json_not_server_errors(
+    tmp_path: Path,
+    content_lengths: list[tuple[bytes, bytes]],
+    body: bytes,
+    expected_status: int,
+    expected_code: str | None,
+) -> None:
+    settings = Settings(data_dir=tmp_path, api_port=API_PORT, max_http_body_bytes=1024)
+    application = create_app(settings, api_token=API_TOKEN)
+    sent: list[dict[str, Any]] = []
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        return messages.pop(0)
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/v1/not-an-endpoint",
+        "raw_path": b"/api/v1/not-an-endpoint",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", f"127.0.0.1:{API_PORT}".encode()),
+            (b"authorization", f"Bearer {API_TOKEN}".encode()),
+            *content_lengths,
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", API_PORT),
+        "state": {},
+    }
+    await application(scope, receive, send)
+
+    assert sent[0]["status"] == expected_status
+    response = json.loads(sent[1]["body"])
+    if expected_code is not None:
+        assert response["error"]["code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_slow_session_preparation_does_not_block_master_heartbeat(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "slow-session",
+        api_port=API_PORT,
+        master_lease_ttl_seconds=5,
+        lease_heartbeat_seconds=1,
+    )
+    service = WorkflowApplication(settings)
+    await service.initialize()
+    leases = service.services.leases
+    lease = await leases.acquire(instance_id="slow-session-master", process_id=1234, ttl_seconds=5)
+    original_prepare = service.prepare_session
+
+    def slow_prepare(**kwargs: Any) -> Any:
+        time.sleep(5.3)
+        return original_prepare(**kwargs)
+
+    heartbeat_calls = 0
+    original_heartbeat = leases.heartbeat
+
+    async def tracked_heartbeat(*args: Any, **kwargs: Any) -> Any:
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        return await original_heartbeat(*args, **kwargs)
+
+    monkeypatch.setattr(service, "prepare_session", slow_prepare)
+    monkeypatch.setattr(leases, "heartbeat", tracked_heartbeat)
+    application = create_app(
+        settings,
+        workflow_application=service,
+        master_lease=lease,
+        api_token=API_TOKEN,
+    )
+    heartbeat_server = SimpleNamespace(should_exit=False)
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_master_lease(leases, lease, settings, heartbeat_server)
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url=f"http://127.0.0.1:{API_PORT}",
+            headers=API_HEADERS,
+        ) as client:
+            response = await client.post(
+                "/api/v1/sessions",
+                json={"repository": str(fixture_source_repo), "goal": "Keep the lease alive."},
+                headers={"Idempotency-Key": "slow-session-create"},
+            )
+        assert response.status_code == 201, response.text
+        assert heartbeat_calls >= 4
+    finally:
+        heartbeat_server.should_exit = True
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_preparation_waits_for_worker_and_removes_clone(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowApplication(Settings(data_dir=tmp_path / "cancel-session-worker"))
+    await service.initialize()
+    entered_worker = threading.Event()
+    release_worker = threading.Event()
+    original_prepare = service.prepare_session
+
+    def blocked_prepare(**kwargs: Any) -> Any:
+        entered_worker.set()
+        if not release_worker.wait(timeout=10):
+            raise TimeoutError("test worker was not released")
+        return original_prepare(**kwargs)
+
+    monkeypatch.setattr(service, "prepare_session", blocked_prepare)
+    preparation = asyncio.create_task(
+        service.prepare_session_in_worker(
+            repo=fixture_source_repo,
+            goal="Cancel without leaking an unowned clone.",
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered_worker.wait), timeout=3)
+        preparation.cancel()
+        await asyncio.sleep(0.05)
+        assert not preparation.done()
+    finally:
+        release_worker.set()
+        if not preparation.done():
+            await asyncio.gather(preparation, return_exceptions=True)
+    with pytest.raises(asyncio.CancelledError):
+        await preparation
+
+    shared_root = service.services.paths.shared_workspaces
+    assert not shared_root.exists() or list(shared_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

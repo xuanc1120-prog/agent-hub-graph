@@ -288,7 +288,10 @@ async def create_session(
     if replay is not None:
         return _json_response(replay)
 
-    prepared = service.prepare_session(repo=Path(body.repository), goal=body.goal)
+    prepared = await service.prepare_session_in_worker(
+        repo=Path(body.repository),
+        goal=body.goal,
+    )
 
     async def mutation(transaction: Transaction) -> StoredResponse:
         await service.services.leases.assert_valid_in(transaction, _master_lease(request))
@@ -309,10 +312,10 @@ async def create_session(
         try:
             await service.services.sessions.get(prepared.session_id)
         except RecordNotFound:
-            service.discard_prepared_session(prepared)
+            await service.discard_prepared_session_in_worker(prepared)
         raise
     if result.replayed:
-        service.discard_prepared_session(prepared)
+        await service.discard_prepared_session_in_worker(prepared)
     return _json_response(result)
 
 
