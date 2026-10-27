@@ -38,6 +38,7 @@ from storage.errors import (
     ChangeSetIntegrityError,
     ChangeSetReconciliationRequired,
     ConcurrencyConflict,
+    QuotaExceeded,
     RecordNotFound,
 )
 from storage.event_repository import EventRepository
@@ -553,8 +554,20 @@ class ChangeSetRepository:
                 )
         return await self.get(change_set_id)
 
-    async def get(self, change_set_id: str) -> ChangeSetRecord:
+    async def get(
+        self,
+        change_set_id: str,
+        *,
+        expected_session_id: str | None = None,
+        max_artifact_bytes: int | None = None,
+        max_total_artifact_bytes: int | None = None,
+    ) -> ChangeSetRecord:
         """Load and cryptographically verify a persisted ChangeSet."""
+        if any(
+            value is not None and value < 0
+            for value in (max_artifact_bytes, max_total_artifact_bytes)
+        ):
+            raise ValueError("artifact read limits must not be negative")
 
         async with self._database.connection() as connection:
             cursor = await connection.execute(
@@ -572,7 +585,13 @@ class ChangeSetRepository:
             await cursor.close()
         if row is None:
             raise RecordNotFound(f"ChangeSet not found: {change_set_id}")
-        return await self._verified_record(row)
+        if expected_session_id is not None and str(row["session_id"]) != expected_session_id:
+            raise RecordNotFound("ChangeSet not found")
+        return await self._verified_record(
+            row,
+            max_artifact_bytes=max_artifact_bytes,
+            max_total_artifact_bytes=max_total_artifact_bytes,
+        )
 
     async def get_by_task(self, task_id: str) -> ChangeSetRecord:
         async with self._database.connection() as connection:
@@ -1402,7 +1421,13 @@ class ChangeSetRepository:
                 )
         return cleaned
 
-    async def _verified_record(self, row: aiosqlite.Row) -> ChangeSetRecord:
+    async def _verified_record(
+        self,
+        row: aiosqlite.Row,
+        *,
+        max_artifact_bytes: int | None = None,
+        max_total_artifact_bytes: int | None = None,
+    ) -> ChangeSetRecord:
         try:
             document = StoredChangeSetDocument.model_validate_json(
                 str(row["manifest_json"]),
@@ -1435,12 +1460,26 @@ class ChangeSetRepository:
         ]
         if len(refs) != len({ref.artifact_id for ref in refs}):
             raise ChangeSetIntegrityError("ChangeSet artifact references are not unique")
+        if max_total_artifact_bytes is not None and sum(ref.size_bytes for ref in refs) > (
+            max_total_artifact_bytes
+        ):
+            raise QuotaExceeded("ChangeSet artifacts exceed the bounded read limit")
         contents: dict[str, bytes] = {}
+        verified_bytes = 0
         for ref in refs:
+            remaining = (
+                max_total_artifact_bytes - verified_bytes
+                if max_total_artifact_bytes is not None
+                else None
+            )
+            read_limit = max_artifact_bytes
+            if remaining is not None:
+                read_limit = remaining if read_limit is None else min(read_limit, remaining)
             metadata, content = await self._artifacts.get_and_verify(
                 ref.artifact_id,
                 expected_session_id=str(row["session_id"]),
                 expected_task_id=str(row["task_id"]),
+                max_bytes=read_limit,
             )
             if (
                 metadata.task_id != str(row["task_id"])
@@ -1453,6 +1492,7 @@ class ChangeSetRepository:
                 raise ChangeSetIntegrityError(
                     f"ChangeSet artifact metadata mismatch: {ref.artifact_id}"
                 )
+            verified_bytes += len(content)
             contents[ref.artifact_id] = content
 
         if patch_ref.artifact_type != ArtifactType.PATCH:

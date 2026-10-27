@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import platform
+import secrets
 import sys
 import uuid
 from contextlib import suppress
@@ -17,7 +18,7 @@ import typer
 import uvicorn
 
 from app import __version__
-from app.config import DataPaths, Settings, ensure_data_directories
+from app.config import DataPaths, Settings, ensure_data_directories, validate_loopback_host
 from app.main import create_app
 from app.services import WorkflowApplication
 from master.planner import TemplateKind
@@ -334,43 +335,57 @@ def serve(
 
 
 async def _serve_application(settings: Settings, *, host: str, port: int) -> None:
-    service = WorkflowApplication(settings)
+    resolved_host = validate_loopback_host(host)
+    runtime_values = settings.model_dump(mode="python")
+    runtime_values.update({"api_host": resolved_host, "api_port": port})
+    runtime_settings = Settings.model_validate(runtime_values)
+    service = WorkflowApplication(runtime_settings)
     await service.initialize()
     leases = service.services.leases
     lease = await leases.acquire(
         instance_id=f"master-{uuid.uuid4().hex}",
         process_id=os.getpid(),
-        ttl_seconds=settings.master_lease_ttl_seconds,
+        ttl_seconds=runtime_settings.master_lease_ttl_seconds,
     )
     scheduler_stop = asyncio.Event()
-    server = uvicorn.Server(
-        uvicorn.Config(
-            create_app(settings),
-            host=host,
-            port=port,
-            workers=1,
-            proxy_headers=False,
-        )
-    )
-    heartbeat = asyncio.create_task(_heartbeat_master_lease(leases, lease, settings, server))
-    scheduler = asyncio.create_task(_poll_scheduler(service, lease, scheduler_stop, server))
-    background_results: list[object] = []
+    heartbeat: asyncio.Task[None] | None = None
+    scheduler: asyncio.Task[None] | None = None
+    server: uvicorn.Server | None = None
     try:
+        await service.register_mock_agent()
+        await service.services.recovery.recover(lease=lease)
+        api_token = secrets.token_urlsafe(32)
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(
+                    runtime_settings,
+                    workflow_application=service,
+                    master_lease=lease,
+                    api_token=api_token,
+                ),
+                host=resolved_host,
+                port=port,
+                workers=1,
+                proxy_headers=False,
+                access_log=False,
+            )
+        )
+        typer.echo(f"Agent Hub API bearer token (shown once): {api_token}", err=True)
+        heartbeat = asyncio.create_task(
+            _heartbeat_master_lease(leases, lease, runtime_settings, server)
+        )
+        scheduler = asyncio.create_task(_poll_scheduler(service, lease, scheduler_stop, server))
         await server.serve()
     finally:
-        server.should_exit = True
+        if server is not None:
+            server.should_exit = True
         scheduler_stop.set()
-        if not heartbeat.done():
+        if heartbeat is not None and not heartbeat.done():
             heartbeat.cancel()
-        try:
-            background_results = await asyncio.gather(
-                heartbeat,
-                scheduler,
-                return_exceptions=True,
-            )
-        finally:
-            with suppress(LeaseLost):
-                await leases.release(lease)
+        background_tasks = [task for task in (heartbeat, scheduler) if task is not None]
+        background_results = await asyncio.gather(*background_tasks, return_exceptions=True)
+        with suppress(LeaseLost):
+            await leases.release(lease)
     for result in background_results:
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             raise result

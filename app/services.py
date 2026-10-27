@@ -39,16 +39,17 @@ from storage.approval_repository import ApprovalRepository
 from storage.artifact_repository import ArtifactRepository
 from storage.artifact_store import ArtifactStore
 from storage.change_set_repository import ChangeSetRepository
-from storage.db import Database
-from storage.errors import LeaseLost
+from storage.db import Database, Transaction
+from storage.errors import ConcurrencyConflict, LeaseLost
 from storage.event_repository import EventRecord, EventRepository
+from storage.idempotency_repository import IdempotencyRepository
 from storage.leases import (
     MasterLease,
     MasterLeaseRepository,
     WorkspaceLease,
     WorkspaceLeaseRepository,
 )
-from storage.planner_repository import PlannerRunRepository
+from storage.planner_repository import PlannerRunRecord, PlannerRunRepository
 from storage.repositories import (
     NewSession,
     NewWorkflow,
@@ -96,9 +97,24 @@ class PlanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedValidation:
+    workflow: WorkflowRecord
+    session: SessionRecord
+    response: ValidateResponse
+    workspace_lease: WorkspaceLease
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWorkflowRun:
+    value: NewWorkflowRun
+    workspace_lease: WorkspaceLease
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeServices:
     paths: DataPaths
     database: Database
+    idempotency: IdempotencyRepository
     git: GitManager
     agents: AgentRepository
     sessions: SessionRepository
@@ -124,6 +140,7 @@ class WorkflowApplication:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self.services = _build_services(settings)
+        self.services.scheduler.set_planner_handler(self._execute_queued_plan)
 
     async def initialize(self) -> None:
         ensure_data_directories(self._settings)
@@ -212,13 +229,13 @@ class WorkflowApplication:
     async def register_mock_agent(self) -> None:
         await self.services.agents.register_mock()
 
-    async def create_session(
+    def prepare_session(
         self,
         *,
         repo: Path,
         goal: str,
         session_id: str | None = None,
-    ) -> SessionRecord:
+    ) -> NewSession:
         resolved_repo = repo.expanduser().resolve(strict=True)
         source = self.services.git.inspect_source_repository(resolved_repo)
         if source.dirty:
@@ -229,29 +246,48 @@ class WorkflowApplication:
         directory_id = sha256(resolved_id.encode("utf-8")).hexdigest()[:32]
         shared_parent = self.services.paths.shared_workspaces / f"session-{directory_id}"
         shared = shared_parent / "repo"
+        state = self.services.git.create_session_repository(
+            source=source,
+            destination=shared,
+            session_id=resolved_id,
+        )
+        return NewSession(
+            session_id=resolved_id,
+            goal=goal,
+            source_repo_path=resolved_repo,
+            shared_repo_path=shared,
+            base_commit=source.commit,
+            integration_branch=state.branch,
+            integration_head_commit=state.commit,
+        )
+
+    async def persist_prepared_session(
+        self,
+        transaction: Transaction,
+        prepared: NewSession,
+    ) -> SessionRecord:
+        return await self.services.sessions.create_in(transaction, prepared)
+
+    def discard_prepared_session(self, prepared: NewSession) -> None:
+        self.services.git.remove_session_repository(
+            prepared.shared_repo_path,
+            allowed_root=self.services.paths.shared_workspaces,
+        )
+
+    async def create_session(
+        self,
+        *,
+        repo: Path,
+        goal: str,
+        session_id: str | None = None,
+    ) -> SessionRecord:
+        prepared = self.prepare_session(repo=repo, goal=goal, session_id=session_id)
         try:
-            state = self.services.git.create_session_repository(
-                source=source,
-                destination=shared,
-                session_id=resolved_id,
-            )
-            return await self.services.sessions.create(
-                NewSession(
-                    session_id=resolved_id,
-                    goal=goal,
-                    source_repo_path=resolved_repo,
-                    shared_repo_path=shared,
-                    base_commit=source.commit,
-                    integration_branch=state.branch,
-                    integration_head_commit=state.commit,
-                )
-            )
+            async with self.services.database.immediate_transaction() as transaction:
+                return await self.persist_prepared_session(transaction, prepared)
         except BaseException as operation_error:
             try:
-                self.services.git.remove_session_repository(
-                    shared,
-                    allowed_root=self.services.paths.shared_workspaces,
-                )
+                self.discard_prepared_session(prepared)
             except Exception as cleanup_error:
                 operation_error.add_note(f"session clone cleanup failed: {cleanup_error!r}")
             raise
@@ -324,6 +360,85 @@ class WorkflowApplication:
             demo_read_only=not full_template,
         )
 
+    async def enqueue_plan(
+        self,
+        session_id: str,
+        *,
+        lease: MasterLease,
+        planner_run_id: str | None = None,
+        transaction: Transaction | None = None,
+    ) -> PlannerRunRecord:
+        """Persist the default deterministic Mock plan for scheduler execution."""
+
+        session = await self.services.sessions.get(session_id)
+        planner = RuleBasedPlanner()
+        values = {
+            "planner_run_id": planner_run_id or f"planner-{uuid.uuid4().hex}",
+            "session_id": session.session_id,
+            "planner_id": planner.planner_id,
+            "planner_type": planner.planner_type,
+            "integration_base_commit": session.integration_head_commit,
+            "lease": lease,
+        }
+        if transaction is not None:
+            return await self.services.planner_runs.create_in(transaction, **values)
+        return await self.services.planner_runs.create(**values)
+
+    async def _execute_queued_plan(
+        self,
+        planner_run_id: str,
+        *,
+        lease: MasterLease,
+    ) -> None:
+        pending = await self.services.planner_runs.get(planner_run_id)
+        if pending.status != PlannerRunStatus.PENDING:
+            return
+        running = await self.services.planner_runs.transition(
+            planner_run_id,
+            expected=PlannerRunStatus.PENDING,
+            target=PlannerRunStatus.RUNNING,
+            lease=lease,
+        )
+        try:
+            session = await self.services.sessions.get(running.session_id)
+            if (
+                session.status != SessionStatus.ACTIVE
+                or session.integration_head_commit != running.integration_base_commit
+            ):
+                raise ConcurrencyConflict("planner session changed before execution")
+            planner = RuleBasedPlanner(planner_id=running.planner_id)
+            context = PlannerContextBundle.create(
+                session_id=session.session_id,
+                goal=session.goal,
+                integration_base_commit=running.integration_base_commit,
+            )
+            output = await planner.plan(PlannerInput(context_bundle=context))
+            workflow_id = f"workflow-{uuid.uuid5(uuid.NAMESPACE_URL, planner_run_id).hex}"
+            await self.services.planner_runs.succeed_with_workflow(
+                planner_run_id,
+                workflow_repository=self.services.workflows,
+                workflow=NewWorkflow(
+                    workflow_id=workflow_id,
+                    session_id=session.session_id,
+                    source_planner_run_id=planner_run_id,
+                    author_graph=_readonly_demo_graph(
+                        AuthorGraph(nodes=output.draft.nodes, edges=output.draft.edges)
+                    ),
+                    layout=WorkflowLayout(),
+                ),
+                lease=lease,
+            )
+        except LeaseLost:
+            raise
+        except Exception as error:
+            await self.services.planner_runs.transition(
+                planner_run_id,
+                expected=PlannerRunStatus.RUNNING,
+                target=PlannerRunStatus.FAILED,
+                error_code=f"planning_{type(error).__name__.lower()}",
+                lease=lease,
+            )
+
     async def validate(self, workflow_id: str) -> ValidateResponse:
         workflow = await self.services.workflows.get(workflow_id)
         session = await self.services.sessions.get(workflow.session_id)
@@ -337,12 +452,98 @@ class WorkflowApplication:
                 workspace_lease=workspace_lease,
             )
 
+    @asynccontextmanager
+    async def prepare_validation(
+        self,
+        workflow_id: str,
+        *,
+        owner_kind: WorkspaceOwnerKind = WorkspaceOwnerKind.VALIDATE,
+    ):
+        """Compile under a workspace lease without committing the preview yet."""
+
+        initial = await self.services.workflows.get(workflow_id)
+        async with self.temporary_workspace(
+            initial.session_id,
+            owner_kind=owner_kind,
+        ) as workspace_lease:
+            workflow = await self.services.workflows.get(workflow_id)
+            session = await self.services.sessions.get(workflow.session_id)
+            response = await self._validate_loaded(
+                workflow,
+                session,
+                workspace_lease=workspace_lease,
+                persist_preview=False,
+            )
+            yield PreparedValidation(
+                workflow=workflow,
+                session=session,
+                response=response,
+                workspace_lease=workspace_lease,
+            )
+
+    @asynccontextmanager
+    async def prepare_run(
+        self,
+        workflow_id: str,
+        *,
+        expected_semantic_version: int,
+        confirmed_compiled_hash: str,
+        workflow_run_id: str,
+    ):
+        """Prepare an immutable run snapshot for an atomic idempotent enqueue."""
+
+        async with self.prepare_validation(
+            workflow_id,
+            owner_kind=WorkspaceOwnerKind.RUN,
+        ) as prepared:
+            workflow = prepared.workflow
+            session = prepared.session
+            validation = prepared.response
+            if workflow.semantic_version != expected_semantic_version:
+                raise ConcurrencyConflict("workflow semantic version is stale")
+            if (
+                not validation.ok
+                or validation.compiled_graph is None
+                or validation.compiled_hash is None
+            ):
+                raise ConcurrencyConflict("workflow is not executable")
+            if confirmed_compiled_hash != validation.compiled_hash:
+                raise ConcurrencyConflict("confirmed compiled hash is stale")
+            final_state = self.services.git.state(session.shared_repo_path)
+            if final_state.dirty or final_state.commit != validation.integration_base_commit:
+                raise ConcurrencyConflict("session integration repository changed before run")
+            catalog = await self.services.agents.catalog()
+            if catalog.catalog_hash != validation.agent_catalog_hash:
+                raise ConcurrencyConflict("agent catalog changed before run snapshot creation")
+            planner_run = (
+                await self.services.planner_runs.get(workflow.source_planner_run_id)
+                if workflow.source_planner_run_id is not None
+                else None
+            )
+            if planner_run is not None and planner_run.result_workflow_id != workflow.workflow_id:
+                raise ConcurrencyConflict("workflow planner lineage is inconsistent")
+            value = NewWorkflowRun(
+                workflow_run_id=workflow_run_id,
+                workflow=workflow,
+                compiled_graph=validation.compiled_graph,
+                agent_catalog=catalog,
+                current_commit=validation.integration_base_commit,
+                planner_run_id=workflow.source_planner_run_id,
+                planner_id=planner_run.planner_id if planner_run is not None else None,
+                planner_model=planner_run.planner_model if planner_run is not None else None,
+            )
+            yield PreparedWorkflowRun(
+                value=value,
+                workspace_lease=prepared.workspace_lease,
+            )
+
     async def _validate_loaded(
         self,
         workflow: WorkflowRecord,
         session: SessionRecord,
         *,
         workspace_lease: WorkspaceLease,
+        persist_preview: bool = True,
     ) -> ValidateResponse:
         state = self.services.git.state(session.shared_repo_path)
         preflight_errors: list[ValidationIssue] = []
@@ -394,7 +595,7 @@ class WorkflowApplication:
                 )
             )
         ok = compilation.graph is not None and not errors
-        if ok:
+        if ok and persist_preview:
             assert compilation.graph is not None
             await self.services.workflows.save_compiled_preview(
                 workflow.workflow_id,
@@ -544,6 +745,7 @@ def _readonly_demo_graph(graph: AuthorGraph) -> AuthorGraph:
 def _build_services(settings: Settings) -> RuntimeServices:
     paths = DataPaths.from_settings(settings)
     database = Database(paths.database)
+    idempotency = IdempotencyRepository(database)
     git = GitManager(
         paths.profiles / "git",
         max_tracked_paths=settings.max_source_tracked_paths,
@@ -661,16 +863,19 @@ def _build_services(settings: Settings) -> RuntimeServices:
         locks,
         artifacts,
         capabilities=capabilities,
+        planner_runs=planner_runs,
     )
     executor = GraphExecutor(runs, sessions, artifacts, registry)
     scheduler = DurableScheduler(
         runs,
         executor,
         poll_interval_seconds=settings.scheduler_poll_ms / 1_000,
+        planner_runs=planner_runs,
     )
     return RuntimeServices(
         paths=paths,
         database=database,
+        idempotency=idempotency,
         git=git,
         agents=agents,
         sessions=sessions,

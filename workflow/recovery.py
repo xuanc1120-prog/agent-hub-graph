@@ -14,6 +14,7 @@ from storage.artifact_repository import ArtifactRepository
 from storage.errors import RecordNotFound
 from storage.event_repository import EventRepository
 from storage.leases import MasterLease
+from storage.planner_repository import PlannerRunRepository
 from storage.workflow_run_repository import WorkflowRunRecord, WorkflowRunRepository
 from workflow.approval_evidence import ApprovalEvidenceError, build_manifest, manifest_hash
 from workflow.capability_broker import CapabilityBroker
@@ -97,6 +98,7 @@ class RecoveryManager:
         locks: LockManager,
         artifacts: ArtifactRepository | None = None,
         capabilities: CapabilityBroker | None = None,
+        planner_runs: PlannerRunRepository | None = None,
     ) -> None:
         self._runs = runs
         self._sessions = sessions
@@ -107,8 +109,11 @@ class RecoveryManager:
         self._locks = locks
         self._artifacts = artifacts
         self._capabilities = capabilities
+        self._planner_runs = planner_runs
 
     async def recover(self, *, lease: MasterLease) -> list[WorkflowRunRecord]:
+        if self._planner_runs is not None:
+            await self._planner_runs.orphan_running(lease=lease)
         recovered: list[WorkflowRunRecord] = []
         for run in await self._runs.list_recoverable():
             if run.cancel_requested_at is not None and run.merge_finalizing_at is None:

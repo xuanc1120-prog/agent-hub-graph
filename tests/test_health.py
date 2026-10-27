@@ -12,7 +12,7 @@ async def test_health_endpoint_reports_single_master_mode(tmp_path: Path) -> Non
     application = create_app(Settings(data_dir=tmp_path, api_port=9876))
 
     transport = ASGITransport(app=application)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1:9876") as client:
         response = await client.get("/healthz")
 
     assert response.status_code == 200

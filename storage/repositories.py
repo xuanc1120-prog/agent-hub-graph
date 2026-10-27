@@ -322,6 +322,26 @@ class WorkflowRepository:
         expected_semantic_version: int,
         now: datetime | None = None,
     ) -> WorkflowRecord:
+        async with self._database.immediate_transaction() as transaction:
+            return await self.update_author_graph_in(
+                transaction,
+                workflow_id,
+                author_graph,
+                expected_semantic_version=expected_semantic_version,
+                now=now,
+            )
+
+    async def update_author_graph_in(
+        self,
+        transaction: Transaction,
+        workflow_id: str,
+        author_graph: AuthorGraph,
+        *,
+        expected_semantic_version: int,
+        now: datetime | None = None,
+    ) -> WorkflowRecord:
+        """CAS-update the author graph in a caller-owned transaction."""
+
         if expected_semantic_version < 1:
             raise ValueError("expected_semantic_version must be positive")
         resolved_id = _entity_id(workflow_id)
@@ -329,23 +349,20 @@ class WorkflowRepository:
         payload = canonical_json(normalized_author).decode("utf-8")
         payload_hash = _model_hash(normalized_author)
         timestamp = utc_now_text(now)
-        async with self._database.immediate_transaction() as transaction:
-            changed = await transaction.execute(
-                """
-                UPDATE workflows
-                SET author_graph_json = ?, author_graph_hash = ?,
-                    semantic_version = semantic_version + 1, updated_at = ?
-                WHERE id = ? AND semantic_version = ?
-                """,
-                (payload, payload_hash, timestamp, resolved_id, expected_semantic_version),
+        changed = await transaction.execute(
+            """
+            UPDATE workflows
+            SET author_graph_json = ?, author_graph_hash = ?,
+                semantic_version = semantic_version + 1, updated_at = ?
+            WHERE id = ? AND semantic_version = ?
+            """,
+            (payload, payload_hash, timestamp, resolved_id, expected_semantic_version),
+        )
+        if changed != 1:
+            await self._raise_workflow_conflict(
+                transaction, resolved_id, "semantic_version", expected_semantic_version
             )
-            if changed != 1:
-                await self._raise_workflow_conflict(
-                    transaction, resolved_id, "semantic_version", expected_semantic_version
-                )
-            row = await _fetchone(
-                transaction, "SELECT * FROM workflows WHERE id = ?", (resolved_id,)
-            )
+        row = await _fetchone(transaction, "SELECT * FROM workflows WHERE id = ?", (resolved_id,))
         assert row is not None
         return self._to_record(row)
 
@@ -396,61 +413,84 @@ class WorkflowRepository:
     ) -> WorkflowRecord:
         """Persist a compile preview only if its complete source tuple is current."""
 
+        async with self._database.immediate_transaction() as transaction:
+            return await self.save_compiled_preview_in(
+                transaction,
+                workflow_id,
+                compiled_graph,
+                expected_semantic_version=expected_semantic_version,
+                workspace_lease=workspace_lease,
+                workspace_leases=workspace_leases,
+                now=now,
+            )
+
+    async def save_compiled_preview_in(
+        self,
+        transaction: Transaction,
+        workflow_id: str,
+        compiled_graph: CompiledGraph,
+        *,
+        expected_semantic_version: int,
+        workspace_lease: WorkspaceLease,
+        workspace_leases: WorkspaceLeaseRepository,
+        now: datetime | None = None,
+    ) -> WorkflowRecord:
+        """Fenced preview write inside the HTTP idempotency transaction."""
+
         if expected_semantic_version < 1:
             raise ValueError("expected_semantic_version must be positive")
         resolved_id = _entity_id(workflow_id)
         payload = canonical_json(compiled_graph).decode("utf-8")
         payload_hash = sha256(canonical_json(compiled_graph)).hexdigest()
         timestamp = utc_now_text(now)
-        async with self._database.immediate_transaction() as transaction:
-            current = await _fetchone(
+        current = await _fetchone(
+            transaction,
+            "SELECT session_id FROM workflows WHERE id = ?",
+            (resolved_id,),
+        )
+        if current is None:
+            raise RecordNotFound(f"workflow not found: {resolved_id}")
+        expected_resource = f"session:{current['session_id']}:integration"
+        if workspace_lease.resource_key != expected_resource:
+            raise ValueError("workspace lease does not belong to the workflow session")
+        await workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
+        changed = await transaction.execute(
+            """
+            UPDATE workflows
+            SET last_compiled_graph_json = ?,
+                last_compiled_graph_hash = ?,
+                last_compiled_semantic_version = ?,
+                last_compiled_agent_catalog_hash = ?,
+                last_compiled_base_commit = ?,
+                policy_version = ?,
+                updated_at = ?
+            WHERE id = ? AND semantic_version = ? AND author_graph_hash = ?
+            """,
+            (
+                payload,
+                payload_hash,
+                expected_semantic_version,
+                compiled_graph.agent_catalog_snapshot_hash,
+                compiled_graph.integration_base_commit,
+                compiled_graph.policy_version,
+                timestamp,
+                resolved_id,
+                expected_semantic_version,
+                compiled_graph.source_author_hash,
+            ),
+        )
+        if changed != 1:
+            await self._raise_workflow_conflict(
                 transaction,
-                "SELECT session_id FROM workflows WHERE id = ?",
-                (resolved_id,),
+                resolved_id,
+                "semantic_version",
+                expected_semantic_version,
             )
-            if current is None:
-                raise RecordNotFound(f"workflow not found: {resolved_id}")
-            expected_resource = f"session:{current['session_id']}:integration"
-            if workspace_lease.resource_key != expected_resource:
-                raise ValueError("workspace lease does not belong to the workflow session")
-            await workspace_leases.assert_valid_in(transaction, workspace_lease, now=now)
-            changed = await transaction.execute(
-                """
-                UPDATE workflows
-                SET last_compiled_graph_json = ?,
-                    last_compiled_graph_hash = ?,
-                    last_compiled_semantic_version = ?,
-                    last_compiled_agent_catalog_hash = ?,
-                    last_compiled_base_commit = ?,
-                    policy_version = ?,
-                    updated_at = ?
-                WHERE id = ? AND semantic_version = ? AND author_graph_hash = ?
-                """,
-                (
-                    payload,
-                    payload_hash,
-                    expected_semantic_version,
-                    compiled_graph.agent_catalog_snapshot_hash,
-                    compiled_graph.integration_base_commit,
-                    compiled_graph.policy_version,
-                    timestamp,
-                    resolved_id,
-                    expected_semantic_version,
-                    compiled_graph.source_author_hash,
-                ),
-            )
-            if changed != 1:
-                await self._raise_workflow_conflict(
-                    transaction,
-                    resolved_id,
-                    "semantic_version",
-                    expected_semantic_version,
-                )
-            row = await _fetchone(
-                transaction,
-                "SELECT * FROM workflows WHERE id = ?",
-                (resolved_id,),
-            )
+        row = await _fetchone(
+            transaction,
+            "SELECT * FROM workflows WHERE id = ?",
+            (resolved_id,),
+        )
         assert row is not None
         return self._to_record(row)
 

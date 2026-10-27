@@ -572,8 +572,16 @@ class ArtifactStore:
             _check_containment_path(final, self._base)
             return _unlink_path_entry(final)
 
-    def read_bytes(self, artifact_id: str, artifact_type: str) -> bytes:
-        """Read artifact bytes after full containment verification."""
+    def read_bytes(
+        self,
+        artifact_id: str,
+        artifact_type: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Read verified artifact bytes, optionally enforcing a hard read bound."""
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must not be negative")
         target = self.resolve(artifact_id, artifact_type)
         if not target.exists():
             raise PathEscapeError(f"artifact file missing: {target}")
@@ -582,7 +590,15 @@ class ArtifactStore:
             raise PathEscapeError(f"symlink/reparse point detected: {target}")
         if _is_hardlink(target):
             raise PathEscapeError(f"hardlink detected: {target}")
-        return target.read_bytes()
+        if max_bytes is None:
+            return target.read_bytes()
+        if target.stat().st_size > max_bytes:
+            raise QuotaExceeded(f"artifact exceeds bounded read limit {max_bytes}")
+        with target.open("rb") as stream:
+            content = stream.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise QuotaExceeded(f"artifact exceeds bounded read limit {max_bytes}")
+        return content
 
     def cleanup_temp(
         self,

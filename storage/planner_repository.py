@@ -65,51 +65,130 @@ class PlannerRunRepository:
         lease: MasterLease,
         now: datetime | None = None,
     ) -> PlannerRunRecord:
-        timestamp = utc_now_text(now)
         async with self._database.immediate_transaction() as transaction:
-            await self._leases.assert_valid_in(transaction, lease, now=now)
-            session = await transaction.fetch_one(
-                "SELECT id, status, integration_head_commit FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            if session is None:
-                raise RecordNotFound(f"session not found: {session_id}")
-            if str(session["status"]) != "active":
-                raise ConcurrencyConflict("planner run requires an active session")
-            if str(session["integration_head_commit"]) != integration_base_commit:
-                raise ConcurrencyConflict("planner base commit is stale")
-            await transaction.execute(
-                """
-                INSERT INTO planner_runs(
-                    id, session_id, planner_id, planner_type, planner_model,
-                    integration_base_commit, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                """,
-                (
-                    planner_run_id,
-                    session_id,
-                    planner_id,
-                    planner_type.value,
-                    planner_model,
-                    integration_base_commit,
-                    timestamp,
-                ),
-            )
-            await self._append_event(
+            return await self.create_in(
                 transaction,
-                lease,
                 planner_run_id=planner_run_id,
                 session_id=session_id,
-                previous=None,
-                target=PlannerRunStatus.PENDING,
+                planner_id=planner_id,
+                planner_type=planner_type,
+                integration_base_commit=integration_base_commit,
+                planner_model=planner_model,
+                lease=lease,
                 now=now,
             )
-            row = await transaction.fetch_one(
-                "SELECT * FROM planner_runs WHERE id = ?",
-                (planner_run_id,),
-            )
+
+    async def create_in(
+        self,
+        transaction: Transaction,
+        *,
+        planner_run_id: str,
+        session_id: str,
+        planner_id: str,
+        planner_type: PlannerType,
+        integration_base_commit: str,
+        lease: MasterLease,
+        planner_model: str | None = None,
+        now: datetime | None = None,
+    ) -> PlannerRunRecord:
+        """Create the durable planner queue item in its caller's transaction."""
+
+        timestamp = utc_now_text(now)
+        await self._leases.assert_valid_in(transaction, lease, now=now)
+        session = await transaction.fetch_one(
+            "SELECT id, status, integration_head_commit FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        if session is None:
+            raise RecordNotFound(f"session not found: {session_id}")
+        if str(session["status"]) != "active":
+            raise ConcurrencyConflict("planner run requires an active session")
+        if str(session["integration_head_commit"]) != integration_base_commit:
+            raise ConcurrencyConflict("planner base commit is stale")
+        await transaction.execute(
+            """
+            INSERT INTO planner_runs(
+                id, session_id, planner_id, planner_type, planner_model,
+                integration_base_commit, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                planner_run_id,
+                session_id,
+                planner_id,
+                planner_type.value,
+                planner_model,
+                integration_base_commit,
+                timestamp,
+            ),
+        )
+        await self._append_event(
+            transaction,
+            lease,
+            planner_run_id=planner_run_id,
+            session_id=session_id,
+            previous=None,
+            target=PlannerRunStatus.PENDING,
+            now=now,
+        )
+        row = await transaction.fetch_one(
+            "SELECT * FROM planner_runs WHERE id = ?",
+            (planner_run_id,),
+        )
         assert row is not None
         return _to_record(row)
+
+    async def next_schedulable_run_id(self, *, lease: MasterLease) -> str | None:
+        """Return a durable pending planner run; the RUNNING CAS is separate."""
+
+        await self._leases.assert_valid(lease)
+        async with self._database.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT id FROM planner_runs "
+                "WHERE status = 'pending' ORDER BY created_at, id LIMIT 1"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return str(row["id"]) if row is not None else None
+
+    async def orphan_running(self, *, lease: MasterLease) -> list[PlannerRunRecord]:
+        """Quarantine planner work left RUNNING by a prior Master process."""
+
+        timestamp = utc_now_text()
+        recovered: list[PlannerRunRecord] = []
+        async with self._database.immediate_transaction() as transaction:
+            await self._leases.assert_valid_in(transaction, lease)
+            rows = await transaction.fetch_all(
+                "SELECT * FROM planner_runs WHERE status = 'running' ORDER BY created_at, id"
+            )
+            for current in rows:
+                planner_run_id = str(current["id"])
+                changed = await transaction.execute(
+                    """
+                    UPDATE planner_runs
+                    SET status = 'orphaned', finished_at = ?,
+                        error_code = 'startup_found_running_planner_without_owner'
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (timestamp, planner_run_id),
+                )
+                if changed != 1:
+                    raise ConcurrencyConflict("planner recovery lost its running-state CAS")
+                await self._append_event(
+                    transaction,
+                    lease,
+                    planner_run_id=planner_run_id,
+                    session_id=str(current["session_id"]),
+                    previous=PlannerRunStatus.RUNNING,
+                    target=PlannerRunStatus.ORPHANED,
+                    error_code="startup_found_running_planner_without_owner",
+                )
+                updated = await transaction.fetch_one(
+                    "SELECT * FROM planner_runs WHERE id = ?", (planner_run_id,)
+                )
+                assert updated is not None
+                recovered.append(_to_record(updated))
+        return recovered
 
     async def transition(
         self,
