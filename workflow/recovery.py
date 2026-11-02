@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, TypeVar
 
 from protocol import ActorType, ApprovalStatus, ChangeSetStatus, NodeRunStatus, NodeType
 from storage.approval_repository import ApprovalRepository
@@ -22,6 +24,39 @@ from workflow.capability_broker import CapabilityBroker
 from workflow.events import RECOVERY_ACTION, RecoveryEventPayload
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
+
+_T = TypeVar("_T")
+
+
+async def _settle_thread_task(task: asyncio.Task[_T]) -> tuple[_T | None, BaseException | None]:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    try:
+        return task.result(), None
+    except BaseException as error:
+        return None, error
+
+
+async def _run_owned_thread(
+    operation: Callable[..., _T],
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Keep Recovery's lease scope alive until its blocking Git worker settles."""
+
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        _result, worker_error = await _settle_thread_task(worker)
+        if worker_error is not None:
+            cancellation.add_note(f"cancelled Recovery Git worker failed: {worker_error!r}")
+        raise
 
 
 class CancellationManager:
@@ -257,7 +292,7 @@ class RecoveryManager:
                                 if orphan_reason is None:
                                     change_set_id = change_set.change_set.change_set_id
                                     repo = Path(session.shared_repo_path)
-                                    state = await asyncio.to_thread(self._git.state, repo)
+                                    state = await _run_owned_thread(self._git.state, repo)
                                     held.assert_healthy()
                                     if state.commit == run.current_commit and not state.dirty:
                                         result = await self._runs.clear_merge_finalizing(
@@ -274,23 +309,24 @@ class RecoveryManager:
                                         _stored, patch = await self._change_sets.load_patch(
                                             change_set_id
                                         )
-                                        expected_tree = await asyncio.to_thread(
+                                        expected_tree = await _run_owned_thread(
                                             self._git.canonical_patch_tree,
                                             repo,
                                             parent_commit=change_set.change_set.base_commit,
                                             patch_bytes=patch,
+                                            isolate_object_writes=True,
                                         )
-                                        metadata = await asyncio.to_thread(
+                                        metadata = await _run_owned_thread(
                                             self._git.read_commit_metadata,
                                             repo,
                                             state.commit,
                                         )
-                                        tree = await asyncio.to_thread(
+                                        tree = await _run_owned_thread(
                                             self._git.commit_tree,
                                             repo,
                                             state.commit,
                                         )
-                                        parent = await asyncio.to_thread(
+                                        parent = await _run_owned_thread(
                                             self._git.commit_parent,
                                             repo,
                                             state.commit,

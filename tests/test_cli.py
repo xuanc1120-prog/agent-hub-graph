@@ -12,7 +12,7 @@ from app.cli import app
 from app.config import Settings
 from app.services import WorkflowApplication
 from storage.db import SCHEMA_VERSION, Database
-from storage.errors import LeaseLost
+from storage.errors import LeaseLost, LeaseUnavailable
 from storage.leases import MasterLeaseRepository
 
 runner = CliRunner()
@@ -288,6 +288,7 @@ async def test_serve_cancellation_during_recovery_releases_master_lease(
     servers = _install_fake_serve_runtime(monkeypatch, service)
     recovery_started = asyncio.Event()
     recovery_cancelled = asyncio.Event()
+    release_recovery = asyncio.Event()
 
     async def blocked_recovery(*, lease: object) -> list[object]:
         recovery_started.set()
@@ -295,22 +296,40 @@ async def test_serve_cancellation_during_recovery_releases_master_lease(
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             recovery_cancelled.set()
+            await release_recovery.wait()
             raise
 
     monkeypatch.setattr(service.services.recovery, "recover", blocked_recovery)
     serving = asyncio.create_task(
         cli_module._serve_application(settings, host="127.0.0.1", port=9876)
     )
-    await asyncio.wait_for(recovery_started.wait(), timeout=3)
-    serving.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await serving
+    try:
+        await asyncio.wait_for(recovery_started.wait(), timeout=3)
+        serving.cancel()
+        await asyncio.wait_for(recovery_cancelled.wait(), timeout=3)
+        # Startup cancellation is still draining. The Master heartbeat must
+        # continue beyond the original five-second lease lifetime.
+        await asyncio.sleep(5.2)
+        with pytest.raises(LeaseUnavailable):
+            await service.services.leases.acquire(
+                instance_id="takeover-during-startup-drain",
+                process_id=5678,
+                ttl_seconds=5,
+            )
+        release_recovery.set()
+        with pytest.raises(asyncio.CancelledError):
+            await serving
 
-    assert recovery_cancelled.is_set()
-    assert not servers[0].serve_called
-    replacement = await service.services.leases.acquire(
-        instance_id="replacement-after-startup-cancel",
-        process_id=1234,
-        ttl_seconds=5,
-    )
-    await service.services.leases.release(replacement)
+        assert recovery_cancelled.is_set()
+        assert not servers[0].serve_called
+        replacement = await service.services.leases.acquire(
+            instance_id="replacement-after-startup-cancel",
+            process_id=1234,
+            ttl_seconds=5,
+        )
+        await service.services.leases.release(replacement)
+    finally:
+        release_recovery.set()
+        if not serving.done():
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)

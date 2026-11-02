@@ -12,7 +12,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import uvicorn
@@ -366,12 +366,14 @@ async def _serve_application(settings: Settings, *, host: str, port: int) -> Non
     )
     application.state.master_lease = lease
     scheduler_stop = asyncio.Event()
+    heartbeat_stop = asyncio.Event()
     heartbeat: asyncio.Task[None] | None = None
     scheduler: asyncio.Task[None] | None = None
     startup: asyncio.Task[None] | None = None
+    background_results: list[object] = []
     try:
         heartbeat = asyncio.create_task(
-            _heartbeat_master_lease(leases, lease, runtime_settings, server)
+            _heartbeat_master_lease(leases, lease, runtime_settings, server, heartbeat_stop)
         )
         startup = asyncio.create_task(_initialize_runtime(service, lease))
         await _await_startup_with_heartbeat(startup, heartbeat)
@@ -381,14 +383,19 @@ async def _serve_application(settings: Settings, *, host: str, port: int) -> Non
     finally:
         server.should_exit = True
         scheduler_stop.set()
-        if heartbeat is not None and not heartbeat.done():
-            heartbeat.cancel()
         if startup is not None and not startup.done():
             startup.cancel()
-        background_tasks = [task for task in (heartbeat, scheduler, startup) if task is not None]
-        background_results = await asyncio.gather(*background_tasks, return_exceptions=True)
-        with suppress(LeaseLost):
-            await leases.release(lease)
+        runtime_tasks = [task for task in (scheduler, startup) if task is not None]
+        try:
+            background_results.extend(await _gather_owned_tasks(runtime_tasks))
+        finally:
+            heartbeat_stop.set()
+            try:
+                if heartbeat is not None:
+                    background_results.extend(await _gather_owned_tasks([heartbeat]))
+            finally:
+                with suppress(LeaseLost):
+                    await leases.release(lease)
     for result in background_results:
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             raise result
@@ -413,6 +420,22 @@ async def _await_startup_with_heartbeat(
     await startup
 
 
+async def _gather_owned_tasks(tasks: list[asyncio.Task[Any]]) -> list[object]:
+    if not tasks:
+        return []
+    gatherer = asyncio.gather(*tasks, return_exceptions=True)
+    interrupted = False
+    while not gatherer.done():
+        try:
+            await asyncio.shield(gatherer)
+        except asyncio.CancelledError:
+            interrupted = True
+    results = list(gatherer.result())
+    if interrupted:
+        raise asyncio.CancelledError
+    return results
+
+
 async def _poll_scheduler(
     service: WorkflowApplication,
     lease: MasterLease,
@@ -431,6 +454,7 @@ async def _heartbeat_master_lease(
     lease: MasterLease,
     settings: Settings,
     server: uvicorn.Server,
+    stop: asyncio.Event,
 ) -> None:
     current = lease
     interval = min(
@@ -438,12 +462,14 @@ async def _heartbeat_master_lease(
         max(1, settings.master_lease_ttl_seconds // 3),
     )
     try:
-        while not server.should_exit:
-            await asyncio.sleep(interval)
-            current = await repository.heartbeat(
-                current,
-                ttl_seconds=settings.master_lease_ttl_seconds,
-            )
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                current = await repository.heartbeat(
+                    current,
+                    ttl_seconds=settings.master_lease_ttl_seconds,
+                )
     except Exception:
         server.should_exit = True
         raise

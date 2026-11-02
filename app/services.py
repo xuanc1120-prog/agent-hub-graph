@@ -335,15 +335,20 @@ class WorkflowApplication:
         )
 
     async def discard_prepared_session_in_worker(self, prepared: NewSession) -> None:
+        cleanup = asyncio.create_task(self._discard_prepared_session_owned(prepared))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as cancellation:
+            _discarded, cleanup_error = await _settle_task(cleanup)
+            if cleanup_error is not None:
+                cancellation.add_note(f"session clone cleanup failed: {cleanup_error!r}")
+            raise
+
+    async def _discard_prepared_session_owned(self, prepared: NewSession) -> None:
+        # Shielding starts before slot acquisition so cancellation cannot drop
+        # cleanup responsibility while this operation is queued.
         async with self._session_io_slots:
-            worker = asyncio.create_task(asyncio.to_thread(self.discard_prepared_session, prepared))
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError as cancellation:
-                _discarded, worker_error = await _settle_task(worker)
-                if worker_error is not None:
-                    cancellation.add_note(f"session clone cleanup failed: {worker_error!r}")
-                raise
+            await asyncio.to_thread(self.discard_prepared_session, prepared)
 
     async def create_session(
         self,

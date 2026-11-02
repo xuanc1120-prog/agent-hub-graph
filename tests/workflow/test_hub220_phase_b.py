@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from contextlib import suppress
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +31,7 @@ from storage.errors import (
     ChangeSetReconciliationRequired,
     ConcurrencyConflict,
     IdempotencyConflict,
+    LeaseUnavailable,
 )
 from storage.repositories import NewWorkflow
 from workflow.events import APPROVAL_STATE_CHANGED
@@ -485,3 +487,153 @@ async def test_phase_b_recovery_orphans_ambiguous_finalization(
         assert recovered.merge_finalizing_at is not None
         marker.unlink()
         assert restarted.services.git.state(session.shared_repo_path).dirty is False
+
+
+@pytest.mark.asyncio
+async def test_hub400_cancelled_recovery_retains_workspace_ownership_until_git_worker_settles(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application, session, run = await _waiting_application(
+        fixture_source_repo, tmp_path, suffix="hub400-recovery-worker-owner"
+    )
+    _change_set, approval = await _change_set_and_approval(application, run)
+    async with application.temporary_master() as lease:
+        await _approve(application, approval, lease)
+
+        async def fail_after_git_publish(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("injected crash after commit publication")
+
+        with (
+            patch.object(application.services.runs, "finalize_merge", fail_after_git_publish),
+            pytest.raises(ChangeSetReconciliationRequired),
+        ):
+            await application.services.scheduler.run_until_stable(
+                run.workflow_run_id,
+                lease=lease,
+            )
+        interrupted = await application.services.runs.get(run.workflow_run_id)
+        published_state = application.services.git.state(session.shared_repo_path)
+        assert interrupted.status == WorkflowRunStatus.RUNNING
+        assert interrupted.merge_finalizing_at is not None
+        assert interrupted.current_commit == run.current_commit
+        assert published_state.commit != run.current_commit
+        assert not published_state.dirty
+
+    restarted = WorkflowApplication(Settings(data_dir=tmp_path / "agent-hub-data"))
+    await restarted.initialize()
+    old_master = await restarted.services.leases.acquire(
+        instance_id="hub400-recovery-worker-old-master",
+        process_id=os.getpid(),
+        ttl_seconds=60,
+    )
+    git_entered = threading.Event()
+    release_git = threading.Event()
+    git_finished = threading.Event()
+    object_directories: list[Path] = []
+    git_commands: list[tuple[object, ...]] = []
+    git_errors: list[str] = []
+    original_run = restarted.services.git._run
+
+    def gated_run(args: object, **kwargs: object) -> object:
+        git_commands.append(tuple(args) if args else ())
+        if args and args[0] == "write-tree":
+            environment = kwargs.get("extra_environment")
+            assert isinstance(environment, dict)
+            object_directories.append(Path(environment["GIT_OBJECT_DIRECTORY"]))
+            git_entered.set()
+            if not release_git.wait(timeout=20):
+                raise TimeoutError("test Git worker gate was not released")
+            try:
+                return original_run(args, **kwargs)
+            except Exception as error:
+                git_errors.append(repr(error))
+                raise
+            finally:
+                git_finished.set()
+        try:
+            return original_run(args, **kwargs)
+        except Exception as error:
+            git_errors.append(repr(error))
+            raise
+
+    monkeypatch.setattr(restarted.services.git, "_run", gated_run)
+    recovering = asyncio.create_task(restarted.services.recovery.recover(lease=old_master))
+    replacement_master = None
+    replacement_workspace = None
+    old_master_released = False
+    try:
+        await asyncio.sleep(0)
+        assert not recovering.done(), "Recovery returned before canonical patch verification"
+
+        async def wait_for_thread_event(event: threading.Event, timeout: float) -> bool:
+            deadline = asyncio.get_running_loop().time() + timeout
+            while not event.is_set():
+                if recovering.done():
+                    return False
+                if asyncio.get_running_loop().time() >= deadline:
+                    return False
+                await asyncio.sleep(0.01)
+            return True
+
+        assert await wait_for_thread_event(git_entered, timeout=20), (
+            f"Recovery did not reach write-tree; completed={recovering.done()}, "
+            f"commands={git_commands!r}, errors={git_errors!r}"
+        )
+        assert len(object_directories) == 1
+        assert object_directories[0].is_dir()
+        assert (
+            object_directories[0].resolve()
+            != (session.shared_repo_path / ".git" / "objects").resolve()
+        )
+
+        recovering.cancel()
+        await asyncio.sleep(0.05)
+        assert not recovering.done()
+        assert not git_finished.is_set()
+        with pytest.raises(LeaseUnavailable):
+            await restarted.services.locks.acquire(
+                session_id=session.session_id,
+                owner_kind=WorkspaceOwnerKind.RUN,
+                owner_operation_id="hub400-recovery-takeover-attempt",
+                owner_process_id=os.getpid(),
+                ttl_seconds=60,
+            )
+        with pytest.raises(LeaseUnavailable):
+            await restarted.services.leases.acquire(
+                instance_id="hub400-recovery-takeover-attempt",
+                process_id=os.getpid(),
+                ttl_seconds=60,
+            )
+
+        release_git.set()
+        with pytest.raises(asyncio.CancelledError):
+            await recovering
+        assert git_finished.is_set()
+
+        await restarted.services.leases.release(old_master)
+        old_master_released = True
+        replacement_master = await restarted.services.leases.acquire(
+            instance_id="hub400-recovery-after-worker",
+            process_id=os.getpid(),
+            ttl_seconds=60,
+        )
+        replacement_workspace = await restarted.services.locks.acquire(
+            session_id=session.session_id,
+            owner_kind=WorkspaceOwnerKind.RUN,
+            owner_operation_id="hub400-recovery-after-worker",
+            owner_process_id=os.getpid(),
+            ttl_seconds=60,
+        )
+    finally:
+        release_git.set()
+        if not recovering.done():
+            recovering.cancel()
+        await asyncio.gather(recovering, return_exceptions=True)
+        if replacement_workspace is not None:
+            await restarted.services.locks.release(replacement_workspace)
+        if replacement_master is not None:
+            await restarted.services.leases.release(replacement_master)
+        if not old_master_released:
+            await restarted.services.leases.release(old_master)

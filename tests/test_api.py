@@ -507,8 +507,9 @@ async def test_slow_session_preparation_does_not_block_master_heartbeat(
         api_token=API_TOKEN,
     )
     heartbeat_server = SimpleNamespace(should_exit=False)
+    heartbeat_stop = asyncio.Event()
     heartbeat_task = asyncio.create_task(
-        _heartbeat_master_lease(leases, lease, settings, heartbeat_server)
+        _heartbeat_master_lease(leases, lease, settings, heartbeat_server, heartbeat_stop)
     )
     try:
         async with AsyncClient(
@@ -524,9 +525,7 @@ async def test_slow_session_preparation_does_not_block_master_heartbeat(
         assert response.status_code == 201, response.text
         assert heartbeat_calls >= 4
     finally:
-        heartbeat_server.should_exit = True
-        if not heartbeat_task.done():
-            heartbeat_task.cancel()
+        heartbeat_stop.set()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
@@ -569,6 +568,104 @@ async def test_cancelled_session_preparation_waits_for_worker_and_removes_clone(
 
     shared_root = service.services.paths.shared_workspaces
     assert not shared_root.exists() or list(shared_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_api_waits_for_queued_clone_cleanup(
+    fixture_source_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "queued-cleanup", api_port=API_PORT)
+    service = WorkflowApplication(settings)
+    await service.initialize()
+    lease = await service.services.leases.acquire(
+        instance_id="queued-cleanup-master",
+        process_id=1234,
+        ttl_seconds=60,
+    )
+    prepared_sessions: list[Any] = []
+    cleanup_started = asyncio.Event()
+    original_prepare = service.prepare_session_in_worker
+    original_discard = service.discard_prepared_session_in_worker
+    held_slots = False
+
+    async def prepare_with_full_queue(**kwargs: Any) -> Any:
+        nonlocal held_slots
+        prepared = await original_prepare(**kwargs)
+        prepared_sessions.append(prepared)
+        await service._session_io_slots.acquire()
+        await service._session_io_slots.acquire()
+        held_slots = True
+        return prepared
+
+    async def fail_before_persist(**_kwargs: Any) -> Any:
+        raise RuntimeError("injected pre-commit persistence failure")
+
+    async def tracked_discard(prepared: Any) -> None:
+        cleanup_started.set()
+        await original_discard(prepared)
+
+    monkeypatch.setattr(service, "prepare_session_in_worker", prepare_with_full_queue)
+    monkeypatch.setattr(service.services.idempotency, "execute", fail_before_persist)
+    monkeypatch.setattr(service, "discard_prepared_session_in_worker", tracked_discard)
+    application = create_app(
+        settings,
+        workflow_application=service,
+        master_lease=lease,
+        api_token=API_TOKEN,
+    )
+    request: asyncio.Task[Any] | None = None
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url=f"http://127.0.0.1:{API_PORT}",
+            headers=API_HEADERS,
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/api/v1/sessions",
+                    json={"repository": str(fixture_source_repo), "goal": "Clean queued clone"},
+                    headers={"Idempotency-Key": "queued-cleanup-cancel"},
+                )
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=20)
+
+            # Ensure the owned cleanup task has reached the semaphore wait queue.
+            async def wait_until_cleanup_is_queued() -> None:
+                while not service._session_io_slots._waiters:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_until_cleanup_is_queued(), timeout=3)
+            request.cancel()
+            await asyncio.sleep(0.05)
+            assert not request.done()
+            service._session_io_slots.release()
+            service._session_io_slots.release()
+            held_slots = False
+            await asyncio.gather(request, return_exceptions=True)
+
+        assert prepared_sessions
+        assert not prepared_sessions[0].shared_repo_path.exists()
+        async with (
+            service.services.database.connection() as connection,
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?",
+                (prepared_sessions[0].session_id,),
+            ) as cursor,
+        ):
+            assert (await cursor.fetchone())[0] == 0
+    finally:
+        if held_slots:
+            service._session_io_slots.release()
+            service._session_io_slots.release()
+        if request is not None and not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        for prepared in prepared_sessions:
+            if prepared.shared_repo_path.exists():
+                await original_discard(prepared)
+        await service.services.leases.release(lease)
 
 
 @pytest.mark.asyncio
