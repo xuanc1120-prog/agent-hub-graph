@@ -45,6 +45,45 @@ class IdempotencyRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    async def lookup(
+        self,
+        *,
+        actor_scope: str,
+        operation_scope: str,
+        idempotency_key: str,
+        request_sha256: str,
+        now: datetime | None = None,
+    ) -> IdempotencyResult | None:
+        """Read a valid replay before callers stage non-database side effects."""
+
+        self._validate_text("actor_scope", actor_scope, 256)
+        self._validate_text("operation_scope", operation_scope, 512)
+        self._validate_text("idempotency_key", idempotency_key, 256)
+        resolved_hash = _SHA256.validate_python(request_sha256)
+        timestamp = utc_now_text(now)
+        async with self._database.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT request_sha256, response_status, response_json, expires_at
+                FROM idempotency_keys
+                WHERE actor_scope = ? AND operation_scope = ? AND idempotency_key = ?
+                """,
+                (actor_scope, operation_scope, idempotency_key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None or str(row["expires_at"]) <= timestamp:
+            return None
+        if str(row["request_sha256"]) != resolved_hash:
+            raise IdempotencyConflict("idempotency key already belongs to a different request")
+        return IdempotencyResult(
+            response=StoredResponse(
+                status_code=int(row["response_status"]),
+                response_json=str(row["response_json"]),
+            ),
+            replayed=True,
+        )
+
     async def execute(
         self,
         *,

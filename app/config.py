@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -22,6 +23,21 @@ def _default_data_dir() -> Path:
     if xdg_data_home:
         return Path(xdg_data_home) / "agent-hub"
     return Path.home() / ".local" / "share" / "agent-hub"
+
+
+def validate_loopback_host(value: str) -> str:
+    host = value.strip().casefold()
+    if host != value or not host or "%" in host:
+        raise ValueError("API host must be a loopback address")
+    if host == "localhost":
+        return host
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise ValueError("API host must be a loopback address") from error
+    if not address.is_loopback:
+        raise ValueError("API host must be a loopback address")
+    return host
 
 
 class Settings(BaseSettings):
@@ -51,6 +67,7 @@ class Settings(BaseSettings):
 
     max_graph_json_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
     max_http_body_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
+    max_http_artifact_bytes: int = Field(default=8 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     max_console_bytes_per_run: int = Field(default=10 * 1024 * 1024, ge=1024)
     max_console_chunk_bytes: int = Field(default=64 * 1024, ge=1024, le=64 * 1024)
     max_patch_bytes: int = Field(default=20 * 1024 * 1024, ge=1024)
@@ -65,6 +82,11 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_data_dir(cls, value: Path) -> Path:
         return value.expanduser().resolve(strict=False)
+
+    @field_validator("api_host")
+    @classmethod
+    def restrict_api_host_to_loopback(cls, value: str) -> str:
+        return validate_loopback_host(value)
 
 
 @dataclass(frozen=True, slots=True)

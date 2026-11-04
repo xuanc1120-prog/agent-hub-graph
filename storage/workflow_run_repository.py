@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -163,12 +165,24 @@ class WorkflowRunRepository:
         self._agents = AgentRepository(database)
         self._policy_version = policy_version
 
+    @asynccontextmanager
+    async def _transaction_scope(
+        self,
+        transaction: Transaction | None,
+    ) -> AsyncIterator[Transaction]:
+        if transaction is not None:
+            yield transaction
+            return
+        async with self._database.immediate_transaction() as owned:
+            yield owned
+
     async def create(
         self,
         value: NewWorkflowRun,
         *,
         lease: MasterLease,
         workspace_lease: WorkspaceLease,
+        transaction: Transaction | None = None,
         now: datetime | None = None,
     ) -> WorkflowRunRecord:
         workflow = value.workflow
@@ -213,7 +227,7 @@ class WorkflowRunRepository:
         if layout_hash != workflow.layout_hash:
             raise SnapshotIntegrityError("workflow layout hash is invalid")
 
-        async with self._database.immediate_transaction() as transaction:
+        async with self._transaction_scope(transaction) as transaction:
             await self._leases.assert_valid_in(transaction, lease, now=now)
             expected_resource = f"session:{workflow.session_id}:integration"
             if workspace_lease.resource_key != expected_resource:
@@ -382,6 +396,25 @@ class WorkflowRunRepository:
             )
         assert row is not None
         return _run_record(row)
+
+    async def create_in(
+        self,
+        transaction: Transaction,
+        value: NewWorkflowRun,
+        *,
+        lease: MasterLease,
+        workspace_lease: WorkspaceLease,
+        now: datetime | None = None,
+    ) -> WorkflowRunRecord:
+        """Create a pending immutable run snapshot in a caller transaction."""
+
+        return await self.create(
+            value,
+            lease=lease,
+            workspace_lease=workspace_lease,
+            transaction=transaction,
+            now=now,
+        )
 
     async def get(self, workflow_run_id: str) -> WorkflowRunRecord:
         async with self._database.connection() as connection:

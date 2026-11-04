@@ -267,6 +267,18 @@ class ApprovalRepository:
             raise RecordNotFound(f"approval not found: {approval_id}")
         return _approval_record(row)
 
+    async def list_for_workflow_run(self, workflow_run_id: str) -> list[ApprovalRecord]:
+        """List durable approval projections for a run, oldest first."""
+
+        async with self._database.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM approvals WHERE workflow_run_id = ? ORDER BY created_at, id",
+                (workflow_run_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [_approval_record(row) for row in rows]
+
     async def get_for_change_set(self, change_set_id: str) -> ApprovalRecord | None:
         async with self._database.connection() as connection:
             row = await _conn_one(

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 from protocol import WorkflowRunStatus
 from storage.leases import MasterLease
+from storage.planner_repository import PlannerRunRepository
 from storage.workflow_run_repository import WorkflowRunRecord, WorkflowRunRepository
 from workflow.executor import GraphExecutor
 
@@ -27,6 +29,7 @@ class DurableScheduler:
         executor: GraphExecutor,
         *,
         poll_interval_seconds: float = 0.25,
+        planner_runs: PlannerRunRepository | None = None,
     ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
@@ -34,6 +37,13 @@ class DurableScheduler:
         self._executor = executor
         self._poll_interval = poll_interval_seconds
         self._handler_lock = asyncio.Lock()
+        self._planner_runs = planner_runs
+        self._planner_handler: Callable[..., Awaitable[None]] | None = None
+
+    def set_planner_handler(self, handler: Callable[..., Awaitable[None]]) -> None:
+        if self._planner_runs is None:
+            raise ValueError("planner_runs is required before setting a planner handler")
+        self._planner_handler = handler
 
     async def tick(self, workflow_run_id: str, *, lease: MasterLease) -> WorkflowRunRecord:
         async with self._handler_lock:
@@ -49,9 +59,15 @@ class DurableScheduler:
         """Poll SQLite and execute at most one globally serialized handler."""
 
         workflow_run_id = await self._runs.next_schedulable_run_id(lease=lease)
-        if workflow_run_id is None:
+        if workflow_run_id is not None:
+            return await self.tick(workflow_run_id, lease=lease)
+        if self._planner_runs is None or self._planner_handler is None:
             return None
-        return await self.tick(workflow_run_id, lease=lease)
+        planner_run_id = await self._planner_runs.next_schedulable_run_id(lease=lease)
+        if planner_run_id is not None:
+            async with self._handler_lock:
+                await self._planner_handler(planner_run_id, lease=lease)
+        return None
 
     async def run_until_stable(
         self,

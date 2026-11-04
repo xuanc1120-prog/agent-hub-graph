@@ -4,10 +4,15 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+import app.cli as cli_module
 from app.cli import app
+from app.config import Settings
+from app.services import WorkflowApplication
 from storage.db import SCHEMA_VERSION, Database
+from storage.errors import LeaseLost, LeaseUnavailable
 from storage.leases import MasterLeaseRepository
 
 runner = CliRunner()
@@ -158,3 +163,173 @@ def test_create_session_rejects_path_like_id_before_workspace_creation(
     assert not escaped.exists()
     shared_root = data_root / "workspaces" / "shared"
     assert not shared_root.exists() or list(shared_root.iterdir()) == []
+
+
+class _FakeServer:
+    def __init__(self, _config: object) -> None:
+        self.should_exit = False
+        self.serve_called = False
+
+    async def serve(self) -> None:
+        self.serve_called = True
+
+
+def _install_fake_serve_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    service: WorkflowApplication,
+) -> list[_FakeServer]:
+    servers: list[_FakeServer] = []
+
+    def build_server(config: object) -> _FakeServer:
+        server = _FakeServer(config)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr(cli_module, "WorkflowApplication", lambda _settings: service)
+    monkeypatch.setattr(cli_module.uvicorn, "Server", build_server)
+    return servers
+
+
+@pytest.mark.asyncio
+async def test_serve_renews_master_lease_during_slow_startup_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "slow-recovery",
+        master_lease_ttl_seconds=5,
+        lease_heartbeat_seconds=1,
+    )
+    service = WorkflowApplication(settings)
+    servers = _install_fake_serve_runtime(monkeypatch, service)
+    leases = service.services.leases
+    original_heartbeat = leases.heartbeat
+    heartbeat_calls = 0
+    recovery_finished = asyncio.Event()
+
+    async def tracked_heartbeat(*args: object, **kwargs: object) -> object:
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        return await original_heartbeat(*args, **kwargs)
+
+    async def slow_recovery(*, lease: object) -> list[object]:
+        await asyncio.sleep(5.2)
+        await leases.assert_valid(lease)
+        recovery_finished.set()
+        return []
+
+    monkeypatch.setattr(leases, "heartbeat", tracked_heartbeat)
+    monkeypatch.setattr(service.services.recovery, "recover", slow_recovery)
+
+    await cli_module._serve_application(settings, host="127.0.0.1", port=9876)
+
+    assert recovery_finished.is_set()
+    assert heartbeat_calls >= 4
+    assert len(servers) == 1 and servers[0].serve_called
+
+
+@pytest.mark.asyncio
+async def test_serve_heartbeat_failure_cancels_startup_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "heartbeat-failure",
+        master_lease_ttl_seconds=5,
+        lease_heartbeat_seconds=1,
+    )
+    service = WorkflowApplication(settings)
+    servers = _install_fake_serve_runtime(monkeypatch, service)
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+    heartbeat_failed = asyncio.Event()
+
+    async def fail_heartbeat(*_args: object, **_kwargs: object) -> object:
+        heartbeat_failed.set()
+        raise LeaseLost("injected heartbeat failure")
+
+    async def blocked_recovery(*, lease: object) -> list[object]:
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            recovery_cancelled.set()
+            raise
+
+    monkeypatch.setattr(service.services.leases, "heartbeat", fail_heartbeat)
+    monkeypatch.setattr(service.services.recovery, "recover", blocked_recovery)
+
+    with pytest.raises(LeaseLost, match="injected heartbeat failure"):
+        await cli_module._serve_application(settings, host="127.0.0.1", port=9876)
+
+    assert recovery_started.is_set()
+    assert heartbeat_failed.is_set()
+    assert recovery_cancelled.is_set()
+    assert not servers[0].serve_called
+    replacement = await service.services.leases.acquire(
+        instance_id="replacement-after-heartbeat-failure",
+        process_id=1234,
+        ttl_seconds=5,
+    )
+    await service.services.leases.release(replacement)
+
+
+@pytest.mark.asyncio
+async def test_serve_cancellation_during_recovery_releases_master_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "startup-cancel",
+        master_lease_ttl_seconds=5,
+        lease_heartbeat_seconds=1,
+    )
+    service = WorkflowApplication(settings)
+    servers = _install_fake_serve_runtime(monkeypatch, service)
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+    release_recovery = asyncio.Event()
+
+    async def blocked_recovery(*, lease: object) -> list[object]:
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            recovery_cancelled.set()
+            await release_recovery.wait()
+            raise
+
+    monkeypatch.setattr(service.services.recovery, "recover", blocked_recovery)
+    serving = asyncio.create_task(
+        cli_module._serve_application(settings, host="127.0.0.1", port=9876)
+    )
+    try:
+        await asyncio.wait_for(recovery_started.wait(), timeout=3)
+        serving.cancel()
+        await asyncio.wait_for(recovery_cancelled.wait(), timeout=3)
+        # Startup cancellation is still draining. The Master heartbeat must
+        # continue beyond the original five-second lease lifetime.
+        await asyncio.sleep(5.2)
+        with pytest.raises(LeaseUnavailable):
+            await service.services.leases.acquire(
+                instance_id="takeover-during-startup-drain",
+                process_id=5678,
+                ttl_seconds=5,
+            )
+        release_recovery.set()
+        with pytest.raises(asyncio.CancelledError):
+            await serving
+
+        assert recovery_cancelled.is_set()
+        assert not servers[0].serve_called
+        replacement = await service.services.leases.acquire(
+            instance_id="replacement-after-startup-cancel",
+            process_id=1234,
+            ttl_seconds=5,
+        )
+        await service.services.leases.release(replacement)
+    finally:
+        release_recovery.set()
+        if not serving.done():
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)

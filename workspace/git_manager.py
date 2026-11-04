@@ -758,8 +758,9 @@ class GitManager:
         *,
         parent_commit: str,
         patch_bytes: bytes,
+        isolate_object_writes: bool = False,
     ) -> str:
-        """Compute the tree produced by a patch from an isolated temporary index."""
+        """Compute a patch tree, optionally keeping new Git objects private."""
 
         self._require_object_id(parent_commit)
         root = repo.expanduser().resolve(strict=True)
@@ -767,6 +768,30 @@ class GitManager:
         index_path = index_root / "index"
         environment = {"GIT_INDEX_FILE": str(index_path)}
         try:
+            if isolate_object_writes:
+                object_path = index_root / "objects"
+                object_info = object_path / "info"
+                object_info.mkdir(parents=True)
+                source_object_path = self._decode(
+                    self._run(("rev-parse", "--git-path", "objects"), cwd=root).stdout
+                ).strip()
+                source_objects = Path(source_object_path)
+                if not source_objects.is_absolute():
+                    source_objects = root / source_objects
+                source_objects = source_objects.resolve(strict=True)
+                if (
+                    not source_objects.is_dir()
+                    or "\n" in str(source_objects)
+                    or "\r" in str(source_objects)
+                ):
+                    raise GitManagerError("repository object database path is invalid")
+                # Git writes tree objects to this private ODB and reads existing
+                # objects through its alternates file; cancellation cannot leave
+                # a background writer mutating the shared repository's objects.
+                # The alternates parser expects LF-delimited paths; text-mode
+                # newline translation would leave a trailing CR on Windows.
+                (object_info / "alternates").write_bytes(f"{source_objects}\n".encode())
+                environment["GIT_OBJECT_DIRECTORY"] = str(object_path)
             self._run(("read-tree", parent_commit), cwd=root, extra_environment=environment)
             self._run(
                 ("apply", "--cached", "--binary", "--whitespace=nowarn", "-"),

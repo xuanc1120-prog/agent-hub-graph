@@ -6,18 +6,19 @@ import asyncio
 import json
 import os
 import platform
+import secrets
 import sys
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import uvicorn
 
 from app import __version__
-from app.config import DataPaths, Settings, ensure_data_directories
+from app.config import DataPaths, Settings, ensure_data_directories, validate_loopback_host
 from app.main import create_app
 from app.services import WorkflowApplication
 from master.planner import TemplateKind
@@ -334,46 +335,105 @@ def serve(
 
 
 async def _serve_application(settings: Settings, *, host: str, port: int) -> None:
-    service = WorkflowApplication(settings)
+    resolved_host = validate_loopback_host(host)
+    runtime_values = settings.model_dump(mode="python")
+    runtime_values.update({"api_host": resolved_host, "api_port": port})
+    runtime_settings = Settings.model_validate(runtime_values)
+    service = WorkflowApplication(runtime_settings)
     await service.initialize()
+    api_token = secrets.token_urlsafe(32)
+    application = create_app(
+        runtime_settings,
+        workflow_application=service,
+        master_lease=None,
+        api_token=api_token,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            application,
+            host=resolved_host,
+            port=port,
+            workers=1,
+            proxy_headers=False,
+            access_log=False,
+        )
+    )
     leases = service.services.leases
     lease = await leases.acquire(
         instance_id=f"master-{uuid.uuid4().hex}",
         process_id=os.getpid(),
-        ttl_seconds=settings.master_lease_ttl_seconds,
+        ttl_seconds=runtime_settings.master_lease_ttl_seconds,
     )
+    application.state.master_lease = lease
     scheduler_stop = asyncio.Event()
-    server = uvicorn.Server(
-        uvicorn.Config(
-            create_app(settings),
-            host=host,
-            port=port,
-            workers=1,
-            proxy_headers=False,
-        )
-    )
-    heartbeat = asyncio.create_task(_heartbeat_master_lease(leases, lease, settings, server))
-    scheduler = asyncio.create_task(_poll_scheduler(service, lease, scheduler_stop, server))
+    heartbeat_stop = asyncio.Event()
+    heartbeat: asyncio.Task[None] | None = None
+    scheduler: asyncio.Task[None] | None = None
+    startup: asyncio.Task[None] | None = None
     background_results: list[object] = []
     try:
+        heartbeat = asyncio.create_task(
+            _heartbeat_master_lease(leases, lease, runtime_settings, server, heartbeat_stop)
+        )
+        startup = asyncio.create_task(_initialize_runtime(service, lease))
+        await _await_startup_with_heartbeat(startup, heartbeat)
+        typer.echo(f"Agent Hub API bearer token (shown once): {api_token}", err=True)
+        scheduler = asyncio.create_task(_poll_scheduler(service, lease, scheduler_stop, server))
         await server.serve()
     finally:
         server.should_exit = True
         scheduler_stop.set()
-        if not heartbeat.done():
-            heartbeat.cancel()
+        if startup is not None and not startup.done():
+            startup.cancel()
+        runtime_tasks = [task for task in (scheduler, startup) if task is not None]
         try:
-            background_results = await asyncio.gather(
-                heartbeat,
-                scheduler,
-                return_exceptions=True,
-            )
+            background_results.extend(await _gather_owned_tasks(runtime_tasks))
         finally:
-            with suppress(LeaseLost):
-                await leases.release(lease)
+            heartbeat_stop.set()
+            try:
+                if heartbeat is not None:
+                    background_results.extend(await _gather_owned_tasks([heartbeat]))
+            finally:
+                with suppress(LeaseLost):
+                    await leases.release(lease)
     for result in background_results:
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             raise result
+
+
+async def _initialize_runtime(service: WorkflowApplication, lease: MasterLease) -> None:
+    await service.register_mock_agent()
+    await service.services.recovery.recover(lease=lease)
+
+
+async def _await_startup_with_heartbeat(
+    startup: asyncio.Task[None],
+    heartbeat: asyncio.Task[None],
+) -> None:
+    done, _pending = await asyncio.wait(
+        (startup, heartbeat),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if heartbeat in done:
+        await heartbeat
+        raise RuntimeError("Master heartbeat stopped during startup.")
+    await startup
+
+
+async def _gather_owned_tasks(tasks: list[asyncio.Task[Any]]) -> list[object]:
+    if not tasks:
+        return []
+    gatherer = asyncio.gather(*tasks, return_exceptions=True)
+    interrupted = False
+    while not gatherer.done():
+        try:
+            await asyncio.shield(gatherer)
+        except asyncio.CancelledError:
+            interrupted = True
+    results = list(gatherer.result())
+    if interrupted:
+        raise asyncio.CancelledError
+    return results
 
 
 async def _poll_scheduler(
@@ -394,6 +454,7 @@ async def _heartbeat_master_lease(
     lease: MasterLease,
     settings: Settings,
     server: uvicorn.Server,
+    stop: asyncio.Event,
 ) -> None:
     current = lease
     interval = min(
@@ -401,12 +462,14 @@ async def _heartbeat_master_lease(
         max(1, settings.master_lease_ttl_seconds // 3),
     )
     try:
-        while not server.should_exit:
-            await asyncio.sleep(interval)
-            current = await repository.heartbeat(
-                current,
-                ttl_seconds=settings.master_lease_ttl_seconds,
-            )
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                current = await repository.heartbeat(
+                    current,
+                    ttl_seconds=settings.master_lease_ttl_seconds,
+                )
     except Exception:
         server.should_exit = True
         raise

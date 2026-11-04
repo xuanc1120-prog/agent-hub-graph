@@ -653,6 +653,7 @@ class ArtifactRepository:
         *,
         expected_session_id: str,
         expected_task_id: str | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[ArtifactRecord, bytes]:
         """Fetch metadata, verify ownership, re-verify containment and read.
 
@@ -663,6 +664,10 @@ class ArtifactRepository:
         Returns ``(record, content_bytes)``.
         """
         record = await self.get(artifact_id)
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must not be negative")
+        if max_bytes is not None and record.size_bytes > max_bytes:
+            raise QuotaExceeded(f"artifact exceeds bounded read limit {max_bytes}")
 
         # Session ownership check
         if record.session_id != expected_session_id:
@@ -670,18 +675,22 @@ class ArtifactRepository:
                 f"artifact {artifact_id} does not belong to session {expected_session_id}"
             )
 
-        # Task ownership check (if requested and artifact is task-scoped)
-        if (
-            expected_task_id is not None
-            and record.task_id is not None
-            and record.task_id != expected_task_id
-        ):
+        if expected_task_id is not None and record.task_id != expected_task_id:
             raise ArtifactNotFound(
                 f"artifact {artifact_id} does not belong to task {expected_task_id}"
             )
 
+        # Revalidate task/planner lineage against the durable owner records,
+        # rather than treating artifact metadata as authoritative by itself.
+        async with self._database.connection() as connection:
+            await self._validate_owner_in(Transaction(connection), record)
+
         # Re-verify on disk
-        content = self._store.read_bytes(artifact_id, record.artifact_type)
+        content = self._store.read_bytes(
+            artifact_id,
+            record.artifact_type,
+            max_bytes=max_bytes,
+        )
 
         # Hash re-verification
         from hashlib import sha256 as _sha256
@@ -701,13 +710,20 @@ class ArtifactRepository:
 
         return record, content
 
-    async def list_by_session(self, session_id: str) -> list[ArtifactRecord]:
-        """List all artifacts for a session."""
+    async def list_by_session(
+        self,
+        session_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[ArtifactRecord]:
+        """List a bounded set of artifacts for a session."""
+        if not 1 <= limit <= 500:
+            raise ValueError("artifact list limit must be in 1..500")
         resolved_id = _entity_id(session_id)
         async with self._database.connection() as conn:
             cursor = await conn.execute(
-                "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at",
-                (resolved_id,),
+                "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at, id LIMIT ?",
+                (resolved_id, limit),
             )
             rows = await cursor.fetchall()
             await cursor.close()

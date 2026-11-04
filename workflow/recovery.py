@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, TypeVar
 
 from protocol import ActorType, ApprovalStatus, ChangeSetStatus, NodeRunStatus, NodeType
 from storage.approval_repository import ApprovalRepository
@@ -14,12 +17,46 @@ from storage.artifact_repository import ArtifactRepository
 from storage.errors import RecordNotFound
 from storage.event_repository import EventRepository
 from storage.leases import MasterLease
+from storage.planner_repository import PlannerRunRepository
 from storage.workflow_run_repository import WorkflowRunRecord, WorkflowRunRepository
 from workflow.approval_evidence import ApprovalEvidenceError, build_manifest, manifest_hash
 from workflow.capability_broker import CapabilityBroker
 from workflow.events import RECOVERY_ACTION, RecoveryEventPayload
 from workspace.git_manager import GitManager
 from workspace.lock_manager import LockManager, WorkspaceOwnerKind
+
+_T = TypeVar("_T")
+
+
+async def _settle_thread_task(task: asyncio.Task[_T]) -> tuple[_T | None, BaseException | None]:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    try:
+        return task.result(), None
+    except BaseException as error:
+        return None, error
+
+
+async def _run_owned_thread(
+    operation: Callable[..., _T],
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Keep Recovery's lease scope alive until its blocking Git worker settles."""
+
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        _result, worker_error = await _settle_thread_task(worker)
+        if worker_error is not None:
+            cancellation.add_note(f"cancelled Recovery Git worker failed: {worker_error!r}")
+        raise
 
 
 class CancellationManager:
@@ -97,6 +134,7 @@ class RecoveryManager:
         locks: LockManager,
         artifacts: ArtifactRepository | None = None,
         capabilities: CapabilityBroker | None = None,
+        planner_runs: PlannerRunRepository | None = None,
     ) -> None:
         self._runs = runs
         self._sessions = sessions
@@ -107,8 +145,11 @@ class RecoveryManager:
         self._locks = locks
         self._artifacts = artifacts
         self._capabilities = capabilities
+        self._planner_runs = planner_runs
 
     async def recover(self, *, lease: MasterLease) -> list[WorkflowRunRecord]:
+        if self._planner_runs is not None:
+            await self._planner_runs.orphan_running(lease=lease)
         recovered: list[WorkflowRunRecord] = []
         for run in await self._runs.list_recoverable():
             if run.cancel_requested_at is not None and run.merge_finalizing_at is None:
@@ -251,7 +292,7 @@ class RecoveryManager:
                                 if orphan_reason is None:
                                     change_set_id = change_set.change_set.change_set_id
                                     repo = Path(session.shared_repo_path)
-                                    state = self._git.state(repo)
+                                    state = await _run_owned_thread(self._git.state, repo)
                                     held.assert_healthy()
                                     if state.commit == run.current_commit and not state.dirty:
                                         result = await self._runs.clear_merge_finalizing(
@@ -268,16 +309,28 @@ class RecoveryManager:
                                         _stored, patch = await self._change_sets.load_patch(
                                             change_set_id
                                         )
-                                        expected_tree = self._git.canonical_patch_tree(
+                                        expected_tree = await _run_owned_thread(
+                                            self._git.canonical_patch_tree,
                                             repo,
                                             parent_commit=change_set.change_set.base_commit,
                                             patch_bytes=patch,
+                                            isolate_object_writes=True,
                                         )
-                                        metadata = self._git.read_commit_metadata(
-                                            repo, state.commit
+                                        metadata = await _run_owned_thread(
+                                            self._git.read_commit_metadata,
+                                            repo,
+                                            state.commit,
                                         )
-                                        tree = self._git.commit_tree(repo, state.commit)
-                                        parent = self._git.commit_parent(repo, state.commit)
+                                        tree = await _run_owned_thread(
+                                            self._git.commit_tree,
+                                            repo,
+                                            state.commit,
+                                        )
+                                        parent = await _run_owned_thread(
+                                            self._git.commit_parent,
+                                            repo,
+                                            state.commit,
+                                        )
                                         expected = {
                                             "Agent-Hub-Session": run.session_id,
                                             "Agent-Hub-Workflow-Run": run.workflow_run_id,
