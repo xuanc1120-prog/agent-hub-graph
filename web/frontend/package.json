@@ -9,6 +9,7 @@
     "lint": "oxlint",
     "test": "vitest run",
     "test:e2e": "playwright test --project=smoke",
+    "test:e2e:mock": "playwright test --config=playwright.mock.config.ts",
     "test:watch": "vitest",
     "preview": "vite preview"
   },

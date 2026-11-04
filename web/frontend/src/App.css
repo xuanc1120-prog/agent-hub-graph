@@ -1,167 +1,91 @@
-.app-shell {
-  display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
-  grid-template-rows: 52px minmax(0, 1fr) 40px;
-  min-height: 100vh;
-  color: #20242a;
-  background: #f4f6f7;
-}
-
-.app-header {
-  grid-column: 1 / -1;
+.app-shell { max-width: 1660px; margin: auto; }
+.app-header, .session-bar, .run-area { padding: 14px 24px; }
+.app-header, .session-bar, .toolbar, .actions, .run-summary, .session-summary {
   display: flex;
+  gap: 12px;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 18px;
-  border-bottom: 1px solid #d9dee2;
-  background: #ffffff;
+  flex-wrap: wrap;
 }
-
-.brand,
-.agent-panel h2,
-.activity-bar {
-  display: flex;
+.app-header { background: #172b33; color: #fff; min-height: 64px; }
+.app-header strong, .tag, button, .run-area h2 {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
-
-.brand strong {
-  font-size: 15px;
-}
-
-.baseline-status,
-.phase-label {
-  color: #216b46;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.agent-panel {
-  padding: 18px 14px;
-  border-right: 1px solid #d9dee2;
-  background: #ffffff;
-}
-
-.agent-panel h2 {
-  margin: 0 6px 14px;
-  font-size: 13px;
-}
-
-.agent-panel ul {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.agent-panel li {
-  display: grid;
-  gap: 3px;
+.app-header strong { font-size: 19px; }
+.app-header .tag { color: #c7f2df; background: #25443f; }
+.token { margin-left: auto; }
+.app-header .token { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.token input { width: min(230px, 100%); }
+.session-bar { background: #fff; border-bottom: 1px solid #d7e1e5; }
+.session-bar form { display: flex; flex: 1 1 100%; flex-wrap: wrap; align-items: end; gap: 12px; }
+.session-bar form label { flex: 1 1 220px; }
+.session-summary { min-width: 0; }
+label { display: grid; gap: 5px; font-size: 13px; font-weight: 600; }
+input:not([type="checkbox"]), textarea, select {
+  border: 1px solid #aabcc4;
+  border-radius: 5px;
+  padding: 8px 10px;
+  color: #172b33;
+  background: #fff;
   min-width: 0;
-  padding: 9px 10px;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  width: 100%;
 }
-
-.agent-panel li:first-child {
-  border-color: #b9d7c8;
-  background: #eef8f2;
+textarea { resize: vertical; }
+button {
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid #aabcc4;
+  border-radius: 5px;
+  background: #fff;
+  color: #172b33;
+  font-size: 13px;
+  font-weight: 650;
+  padding: 6px 12px;
+  cursor: pointer;
 }
-
-.agent-panel span,
-.agent-panel small {
+button:not(:disabled):hover { background: #e4f1ee; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.primary { background: #0d6a57; color: #fff; border-color: #0d6a57; }
+.primary:not(:disabled):hover { background: #095745; }
+:focus-visible { outline: 2px solid #198a76; outline-offset: 2px; }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 300px); }
+.graph-area { min-width: 0; }
+.toolbar, .actions, .validation { padding: 12px 24px; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 19px; }
+h2 { font-size: 15px; }
+.tag { font-size: 12px; border-radius: 4px; padding: 4px 8px; background: #dfece9; color: #204840; }
+.segmented { display: flex; gap: 2px; padding: 2px; border-radius: 6px; background: #e3e9ed; }
+.segmented button { min-height: 29px; border-color: transparent; background: transparent; }
+.segmented button[aria-pressed="true"] { background: #fff; }
+.canvas { height: 370px; background: #eef4f6; border-block: 1px solid #d7e1e5; }
+.empty { height: 100%; display: grid; align-content: center; justify-items: center; gap: 10px; color: #4c6572; }
+.react-flow__node strong {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
-
-.agent-panel span {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.agent-panel small {
-  color: #6c737d;
-  font-size: 11px;
-}
-
-.workflow-panel {
-  min-width: 0;
-  padding: 22px;
-}
-
-.panel-heading {
-  display: flex;
-  align-items: end;
-  justify-content: space-between;
-  margin-bottom: 16px;
-}
-
-.panel-heading p,
-.panel-heading h1 {
-  margin: 0;
-}
-
-.panel-heading p {
-  color: #6c737d;
-  font-size: 11px;
-  text-transform: uppercase;
-}
-
-.panel-heading h1 {
-  margin-top: 3px;
-  font-size: 20px;
-}
-
-.canvas-placeholder {
-  display: grid;
-  min-height: 480px;
-  place-content: center;
-  justify-items: center;
-  gap: 10px;
-  border: 1px solid #d9dee2;
-  border-radius: 6px;
-  color: #77808b;
-  background-color: #ffffff;
-  background-image: radial-gradient(#dfe4e7 1px, transparent 1px);
-  background-size: 20px 20px;
-}
-
-.canvas-placeholder p {
-  margin: 0;
-  font-size: 13px;
-}
-
-.activity-bar {
-  grid-column: 1 / -1;
-  padding: 0 18px;
-  border-top: 1px solid #d9dee2;
-  color: #5d6570;
-  background: #ffffff;
-  font-size: 12px;
-}
-
-@media (max-width: 720px) {
-  .app-shell {
-    grid-template-columns: 1fr;
-    grid-template-rows: 52px auto minmax(0, 1fr) 40px;
-  }
-
-  .agent-panel {
-    border-right: 0;
-    border-bottom: 1px solid #d9dee2;
-  }
-
-  .agent-panel ul {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .workflow-panel {
-    padding: 16px;
-  }
-
-  .canvas-placeholder {
-    min-height: 360px;
-  }
+.react-flow__node small { display: block; margin-top: 3px; color: #445f69; }
+.react-flow__node.selected { border-color: #0d6a57; background: #effbf5; }
+.inspector { padding: 16px; border-left: 1px solid #d7e1e5; background: #fff; min-width: 0; }
+.inspector > * + * { margin-top: 12px; }
+fieldset { border: 0; padding: 0; margin-inline: 0; display: grid; gap: 12px; min-width: 0; }
+.check { display: flex; align-items: center; }
+.muted { font-size: 13px; color: #49616b; }
+.notice { background: #fff2d9; border-bottom: 1px solid #e3bd7a; padding: 10px 24px; }
+.notice button { margin-left: 10px; }
+.run-area { border-top: 1px solid #d7e1e5; background: #fff; }
+.run-area > * + * { margin-top: 12px; }
+.run-summary code, .session-summary code, .paths { overflow-wrap: anywhere; }
+.approval { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-block: 8px; }
+pre { background: #172b33; color: #e4f3ed; padding: 12px; max-height: 300px; overflow: auto; border-radius: 5px; }
+.decision { padding: 0; }
+@media (max-width: 700px) {
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .inspector { border-left: 0; border-top: 1px solid #d7e1e5; }
+  .canvas { height: 290px; }
+  .token { margin-left: 0; }
 }
